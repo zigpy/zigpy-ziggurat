@@ -1,17 +1,14 @@
 import asyncio
 import json
-import itertools
-import pathlib
 import logging
+import pathlib
 import time
 
-import zigpy.serial
 import zigpy.application
 import zigpy.backups
-import zigpy.types as t
-import zigpy.zdo.types as zdo_t
 from zigpy.exceptions import DeliveryError
-from zigpy.state import NetworkInfo, NodeInfo, Key
+import zigpy.serial
+import zigpy.types as t
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -329,6 +326,7 @@ async def main(host, port):
 
 if __name__ == "__main__":
     import sys
+
     import coloredlogs
 
     coloredlogs.install(level=logging.DEBUG)
