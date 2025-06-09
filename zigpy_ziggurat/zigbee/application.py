@@ -183,7 +183,6 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         try:
             # Use the most recent backup from the zigpy database, if supported
             latest_backup = self.backups[-1]
-            raise IndexError()
         except IndexError:
             latest_backup = FALLBACK_NETWORK_SETTINGS.replace(
                 network_info=FALLBACK_NETWORK_SETTINGS.network_info.replace(
