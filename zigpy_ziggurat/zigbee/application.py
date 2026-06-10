@@ -1,13 +1,12 @@
 import asyncio
 import json
 import logging
-import pathlib
-import time
 
 import zigpy.application
 import zigpy.backups
 from zigpy.exceptions import DeliveryError
 import zigpy.serial
+import zigpy.state
 import zigpy.types as t
 
 _LOGGER = logging.getLogger(__name__)
@@ -15,18 +14,18 @@ _LOGGER = logging.getLogger(__name__)
 FALLBACK_NETWORK_SETTINGS = zigpy.backups.NetworkBackup.from_dict(
     {
         "version": 1,
-        "backup_time": "2025-05-18T15:53:33.000847+00:00",
+        "backup_time": "2025-06-29T03:35:11.850787+00:00",
         "network_info": {
             "extended_pan_id": "3a:9f:44:01:0b:3c:cb:93",
             "pan_id": "4072",
             "nwk_update_id": 0,
             "nwk_manager_id": "0000",
-            "channel": 20,
-            "channel_mask": [20],
+            "channel": 11,
+            "channel_mask": [11],
             "security_level": 5,
             "network_key": {
                 "key": "ee:83:0c:e4:85:57:9c:8c:b1:3f:87:00:b6:5d:4b:e8",
-                "tx_counter": 28673,
+                "tx_counter": 0,
                 "rx_counter": 0,
                 "seq": 0,
                 "partner_ieee": "ff:ff:ff:ff:ff:ff:ff:ff",
@@ -64,7 +63,7 @@ class ZigguratProtocol(zigpy.serial.SerialProtocol):
         self.on_async_event = on_async_event
         self.on_disconnect = on_disconnect
         self.tid = 1
-        self.pending_requests: Dict[int, asyncio.Future] = {}
+        self.pending_requests: dict[int, asyncio.Future] = {}
 
     def data_received(self, data: bytes):
         super().data_received(data)
@@ -110,7 +109,7 @@ class ZigguratProtocol(zigpy.serial.SerialProtocol):
     def connection_lost(self, exc):
         self.on_disconnect(exc)
 
-        for tid, fut in self.pending_requests.items():
+        for fut in self.pending_requests.values():
             if not fut.done():
                 fut.set_exception(ConnectionError("Connection lost"))
 
@@ -137,18 +136,14 @@ class ZigguratProtocol(zigpy.serial.SerialProtocol):
         rsp = await fut
 
         if rsp["data"]["status"] == "error":
-            raise DeliveryError(
-                f"Error sending command: {rsp.get('error', 'unknown error')}"
-            )
+            reason = rsp["data"].get("reason") or "unknown error"
+            raise DeliveryError(f"Error sending command: {reason}")
 
         return rsp
 
 
 class ControllerApplication(zigpy.application.ControllerApplication):
     def __init__(self, config):
-        if not config["device"]["path"].startswith("socket://"):
-            config["device"]["path"] = "socket://127.0.0.1:9999"
-
         super().__init__(config)
         self._api = None
 
@@ -171,7 +166,12 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 self._api = None
 
     async def start_network(self):
-        self._get_network_settings()
+        backup = self._get_network_settings()
+
+        # Our frame counter shouldn't be off by more than 100. Keep it in sync.
+        backup.network_info.network_key.tx_counter += 500
+        self.backups.add_backup(backup)
+
         await self.write_network_info(
             network_info=self.state.network_info, node_info=self.state.node_info
         )
@@ -184,26 +184,14 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             # Use the most recent backup from the zigpy database, if supported
             latest_backup = self.backups[-1]
         except IndexError:
-            latest_backup = FALLBACK_NETWORK_SETTINGS.replace(
-                network_info=FALLBACK_NETWORK_SETTINGS.network_info.replace(
-                    network_key=FALLBACK_NETWORK_SETTINGS.network_info.network_key.replace(
-                        tx_counter=((int(time.time()) - 1748316500) * 1000)
-                    )
-                )
-            )
+            latest_backup = FALLBACK_NETWORK_SETTINGS
         else:
-            latest_backup = latest_backup.replace(
-                network_info=latest_backup.network_info.replace(
-                    network_key=latest_backup.network_info.network_key.replace(
-                        tx_counter=(
-                            latest_backup.network_info.network_key.tx_counter + 100000
-                        )
-                    )
-                )
-            )
+            latest_backup = latest_backup
 
         self.state.network_info = latest_backup.network_info
         self.state.node_info = latest_backup.node_info
+
+        return latest_backup
 
     async def force_remove(self, dev):
         _LOGGER.debug("Not implemented")
@@ -212,7 +200,12 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         _LOGGER.debug("Not implemented")
 
     async def permit_ncp(self, time_s: int = 60):
-        _LOGGER.debug("Not implemented")
+        await self._api.send_command(
+            "permit_joins",
+            {
+                "duration": time_s,
+            },
+        )
 
     async def permit_with_link_key(self, node, link_key, time_s: int = 60):
         _LOGGER.debug("Not implemented")
@@ -232,6 +225,15 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 # To avoid persisting state while also preventing counter rollback,
                 # just base the counter on the current time
                 "network_key_tx_counter": network_info.network_key.tx_counter,
+                "tc_link_key": str(network_info.tc_link_key.key),
+                # Unique trust center link keys negotiated in earlier sessions
+                "key_table": [
+                    {
+                        "partner_ieee": str(key.partner_ieee),
+                        "key": str(key.key),
+                    }
+                    for key in network_info.key_table
+                ],
             },
         )
 
@@ -240,26 +242,79 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
     def on_async_event(self, event):
         if event["cmd"] == "received_aps_command":
+            data = event["data"]
+
+            if data.get("group") is not None:
+                dst = t.AddrModeAddress(
+                    addr_mode=t.AddrMode.Group,
+                    address=t.Group(data["group"]),
+                )
+            else:
+                dst_nwk, _ = t.NWK.deserialize(bytes.fromhex(data["destination"]))
+
+                if dst_nwk >= 0xFFF8:
+                    dst = t.AddrModeAddress(
+                        addr_mode=t.AddrMode.Broadcast,
+                        address=t.BroadcastAddress(dst_nwk),
+                    )
+                else:
+                    dst = t.AddrModeAddress(
+                        addr_mode=t.AddrMode.NWK,
+                        address=dst_nwk,
+                    )
+
             packet = t.ZigbeePacket(
                 src=t.AddrModeAddress(
                     addr_mode=t.AddrMode.NWK,
-                    address=t.NWK.deserialize(bytes.fromhex(event["data"]["source"]))[
-                        0
-                    ],
+                    address=t.NWK.deserialize(bytes.fromhex(data["source"]))[0],
                 ),
-                dst=t.AddrModeAddress(
-                    addr_mode=t.AddrMode.NWK,
-                    address=t.NWK(0x0000),
-                ),
-                src_ep=event["data"]["src_ep"],
-                dst_ep=event["data"]["dst_ep"],
-                profile_id=event["data"]["profile_id"],
-                cluster_id=event["data"]["cluster_id"],
-                lqi=event["data"]["lqi"],
-                rssi=event["data"]["rssi"],
-                data=t.SerializableBytes(bytes.fromhex(event["data"]["data"])),
+                dst=dst,
+                src_ep=data["src_ep"],
+                dst_ep=data["dst_ep"],
+                profile_id=data["profile_id"],
+                cluster_id=data["cluster_id"],
+                lqi=data["lqi"],
+                rssi=data["rssi"],
+                data=t.SerializableBytes(bytes.fromhex(data["data"])),
             )
             self.packet_received(packet)
+        elif event["cmd"] == "frame_counter_update":
+            self.state.network_info.network_key.tx_counter = event["data"][
+                "frame_counter"
+            ]
+            _LOGGER.debug(
+                "Frame counter updated to %d",
+                self.state.network_info.network_key.tx_counter,
+            )
+            self.backups.add_backup(
+                zigpy.backups.NetworkBackup(
+                    network_info=self.state.network_info,
+                    node_info=self.state.node_info,
+                )
+            )
+        elif event["cmd"] == "link_key_update":
+            key = zigpy.state.Key.from_dict(
+                {
+                    "key": event["data"]["key"],
+                    "tx_counter": 0,
+                    "rx_counter": 0,
+                    "seq": 0,
+                    "partner_ieee": event["data"]["ieee"],
+                }
+            )
+            _LOGGER.debug("Link key updated for %s", key.partner_ieee)
+
+            self.state.network_info.key_table = [
+                k
+                for k in self.state.network_info.key_table
+                if k.partner_ieee != key.partner_ieee
+            ] + [key]
+            self.backups.add_backup(
+                zigpy.backups.NetworkBackup(
+                    network_info=self.state.network_info,
+                    node_info=self.state.node_info,
+                )
+            )
 
     async def send_packet(self, packet):
         profile_id = 0x0000
@@ -267,16 +322,23 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         if packet.src_ep != 0 or packet.dst_ep != 0:
             profile_id = 0x0104
 
+        if packet.dst.addr_mode == t.AddrMode.IEEE:
+            # The server resolves the EUI64 to a network address
+            addressing = {"destination_eui64": str(packet.dst.address)}
+            delivery_mode = "unicast"
+        else:
+            addressing = {"destination": packet.dst.address.serialize()[::-1].hex()}
+            delivery_mode = {
+                t.AddrMode.NWK: "unicast",
+                t.AddrMode.Group: "multicast",
+                t.AddrMode.Broadcast: "broadcast",
+            }[packet.dst.addr_mode]
+
         await self._api.send_command(
             "send_aps_command",
             {
-                "delivery_mode": {
-                    t.AddrMode.NWK: "unicast",
-                    t.AddrMode.Group: "multicast",
-                    t.AddrMode.Broadcast: "broadcast",
-                }[packet.dst.addr_mode],
-                "destination": packet.dst.address.serialize()[::-1].hex(),
-                # "destination_eui64": "00:0d:6f:ff:fe:a4:f1:0b",
+                "delivery_mode": delivery_mode,
+                **addressing,
                 "profile_id": profile_id,
                 "cluster_id": packet.cluster_id or 0x0000,
                 "src_ep": packet.src_ep,
@@ -287,51 +349,3 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 "data": packet.data.serialize().hex(),
             },
         )
-
-
-async def main(host, port):
-    loop = asyncio.get_running_loop()
-
-    app = ControllerApplication(
-        {
-            "device": {"path": f"socket://{host}:{port}"},
-            "backup_enabled": False,
-            "startup_energy_scan": False,
-            "use_thread": False,
-            "database_path": str(
-                pathlib.Path(__file__).parent.parent.parent.parent.parent / "zigbee.db"
-            ),
-        }
-    )
-    await app._load_db()
-
-    await app.connect()
-    await app.start_network()
-
-    await asyncio.sleep(100000)
-
-    """
-    dev = app.add_device(nwk=0x26F4, ieee=t.EUI64.convert("00:0d:6f:ff:fe:a4:f1:0b"))
-    await dev.schedule_initialize()
-
-    while True:
-        try:
-            async with asyncio.timeout(1):
-                await dev.endpoints[1].on_off.off()
-        except asyncio.TimeoutError:
-            _LOGGER.warning("Timed out...")
-    """
-
-
-if __name__ == "__main__":
-    import sys
-
-    import coloredlogs
-
-    coloredlogs.install(level=logging.DEBUG)
-    logging.getLogger("aiosqlite").setLevel(logging.INFO)
-
-    host, port = sys.argv[1].split(":")
-    port = int(port)
-
-    asyncio.run(main(host, port))
