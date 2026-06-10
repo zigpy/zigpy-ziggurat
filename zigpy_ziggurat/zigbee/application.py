@@ -4,12 +4,13 @@ import logging
 import math
 import statistics
 
+import aiohttp
 import zigpy.application
 import zigpy.backups
+import zigpy.config
 import zigpy.device
 import zigpy.endpoint
 from zigpy.exceptions import DeliveryError
-import zigpy.serial
 import zigpy.state
 import zigpy.types as t
 import zigpy.zdo.types as zdo_t
@@ -27,6 +28,8 @@ DEVICE_JOIN_MAX_DELAY = 5
 # aBaseSuperframeDuration * (2^n + 1) symbols, at 16 us per symbol
 SYMBOL_PERIOD_MS = 0.016
 BASE_SUPERFRAME_DURATION_SYMBOLS = 960
+
+WEBSOCKET_HEARTBEAT = 15
 
 
 def logistic(x: float, *, L: float = 1, x_0: float = 0, k: float = 1) -> float:
@@ -89,90 +92,167 @@ FALLBACK_NETWORK_SETTINGS = zigpy.backups.NetworkBackup.from_dict(
 )
 
 
-class ZigguratProtocol(zigpy.serial.SerialProtocol):
-    def __init__(self, on_async_event, on_disconnect):
-        super().__init__()
+class PendingRequest:
+    """The in-flight state of one request: an optional `transmitted` stage future and
+    the terminal `response` future."""
 
-        self.on_async_event = on_async_event
-        self.on_disconnect = on_disconnect
-        self.tid = 1
-        self.pending_requests: dict[int, asyncio.Future] = {}
-
-    def data_received(self, data: bytes):
-        super().data_received(data)
-
-        while b"\n" in self._buffer:
-            line, self._buffer = self._buffer.split(b"\n", 1)
-            line = line.strip()
-            if not line:
-                continue
-
-            # Parse JSON
-            try:
-                msg = json.loads(line.decode("utf-8"))
-            except json.JSONDecodeError as e:
-                _LOGGER.debug("Failed to parse line as JSON: %r: %r", line, e)
-                continue
-
-            try:
-                self.handle_message(msg)
-            except Exception:
-                _LOGGER.exception("Failed to handle message: %r", msg)
-                continue
-
-    def handle_message(self, message: dict):
-        tid = message.get("tid", 0)
-        _LOGGER.debug("Received: %r", message)
-
-        if tid == 0:
-            # Asynchronous event
-            self.on_async_event(message)
-            return
-
-        # Response to a pending request
-        fut = self.pending_requests.pop(tid, None)
-        if not fut or fut.done():
-            _LOGGER.debug(
-                f"Received response for unknown or finished TID={tid}: {message}"
-            )
-            return
-
-        fut.set_result(message)
-
-    def connection_lost(self, exc):
-        self.on_disconnect(exc)
-
-        for fut in self.pending_requests.values():
-            if not fut.done():
-                fut.set_exception(ConnectionError("Connection lost"))
-
-        self.pending_requests.clear()
-        super().connection_lost(exc)
-
-    async def send_command(self, cmd: str, data: dict) -> dict:
-        tid = self.tid
-        self.tid = (self.tid + 1) & 0xFFFFFFFF
-
+    def __init__(self, *, want_transmitted: bool) -> None:
         loop = asyncio.get_running_loop()
-        fut = loop.create_future()
-        self.pending_requests[tid] = fut
+        self.response: asyncio.Future = loop.create_future()
+        self.transmitted: asyncio.Future | None = (
+            loop.create_future() if want_transmitted else None
+        )
 
-        message = {
-            "tid": tid,
-            "cmd": cmd,
-            "data": data,
-        }
-        line = json.dumps(message) + "\n"
-        _LOGGER.debug("Sending: %r", line)
-        self._transport.write(line.encode("utf-8"))
+    def fail(self, exc: BaseException) -> None:
+        if self.transmitted is not None and not self.transmitted.done():
+            self.transmitted.set_exception(exc)
 
-        rsp = await fut
+        if not self.response.done():
+            self.response.set_exception(exc)
 
-        if rsp["data"]["status"] == "error":
-            reason = rsp["data"].get("reason") or "unknown error"
-            raise DeliveryError(f"Error sending command: {reason}")
 
-        return rsp
+def _make_late_failure_logger(pending: "PendingRequest"):
+    """Consume the terminal result of a request that already resolved at the
+    `transmitted` stage, so delivery failures are visible but not raised. Failures
+    from before transmission were already raised to the caller and are not logged."""
+
+    def log_late_failure(fut: asyncio.Future) -> None:
+        if fut.cancelled():
+            return
+
+        exc = fut.exception()
+        if exc is None:
+            return
+
+        transmitted = (
+            pending.transmitted is not None
+            and pending.transmitted.done()
+            and pending.transmitted.exception() is None
+        )
+
+        if transmitted:
+            _LOGGER.warning("Delivery failed after transmission: %s", exc)
+
+    return log_late_failure
+
+
+class ZigguratApi:
+    """The Ziggurat WebSocket API: concurrent requests correlated by id, with
+    lifecycle events (`accepted`, `transmitted`) preceding each terminal response."""
+
+    def __init__(self, url: str, on_notification, on_disconnect) -> None:
+        self._url = url
+        self._on_notification = on_notification
+        self._on_disconnect = on_disconnect
+
+        self._session: aiohttp.ClientSession | None = None
+        self._websocket: aiohttp.ClientWebSocketResponse | None = None
+        self._receiver_task: asyncio.Task | None = None
+        self._request_id = 1
+        self._pending: dict[int, PendingRequest] = {}
+
+    async def connect(self) -> None:
+        self._session = aiohttp.ClientSession()
+        self._websocket = await self._session.ws_connect(
+            self._url, heartbeat=WEBSOCKET_HEARTBEAT
+        )
+
+        hello = json.loads(await self._websocket.receive_str())
+        _LOGGER.debug("Connected to ziggurat: %r", hello)
+
+        self._receiver_task = asyncio.create_task(self._receive_loop())
+
+    async def disconnect(self) -> None:
+        if self._receiver_task is not None:
+            self._receiver_task.cancel()
+            self._receiver_task = None
+
+        if self._websocket is not None:
+            await self._websocket.close()
+            self._websocket = None
+
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
+
+    async def _receive_loop(self) -> None:
+        exc: BaseException | None = None
+
+        try:
+            async for msg in self._websocket:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        self._handle_message(json.loads(msg.data))
+                    except Exception:
+                        _LOGGER.exception("Failed to handle message: %r", msg.data)
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    exc = self._websocket.exception()
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            exc = e
+        finally:
+            self._fail_pending(ConnectionError("Connection lost"))
+            self._on_disconnect(exc)
+
+    def _fail_pending(self, exc: BaseException) -> None:
+        for pending in self._pending.values():
+            pending.response.add_done_callback(_make_late_failure_logger(pending))
+            pending.fail(exc)
+
+        self._pending.clear()
+
+    def _handle_message(self, msg: dict) -> None:
+        _LOGGER.debug("Received: %r", msg)
+        msg_type = msg["type"]
+
+        if msg_type == "notification":
+            self._on_notification(msg["event"], msg["data"])
+        elif msg_type == "event":
+            pending = self._pending.get(msg["id"])
+
+            if (
+                pending is not None
+                and msg["event"] == "transmitted"
+                and pending.transmitted is not None
+                and not pending.transmitted.done()
+            ):
+                pending.transmitted.set_result(None)
+        elif msg_type == "response":
+            pending = self._pending.pop(msg["id"], None)
+
+            if pending is None:
+                _LOGGER.debug("Response for unknown request: %r", msg)
+                return
+
+            if "error" in msg:
+                error = msg["error"]
+                pending.fail(DeliveryError(f"{error['code']}: {error['message']}"))
+            elif not pending.response.done():
+                pending.response.set_result(msg["result"])
+
+    async def request(
+        self, method: str, params: dict, *, resolve_on: str = "response"
+    ) -> dict | None:
+        request_id = self._request_id
+        self._request_id = (self._request_id + 1) % 2**32 or 1
+
+        pending = PendingRequest(want_transmitted=(resolve_on == "transmitted"))
+        self._pending[request_id] = pending
+
+        message = {"id": request_id, "method": method, "params": params}
+        _LOGGER.debug("Sending: %r", message)
+        await self._websocket.send_str(json.dumps(message))
+
+        if resolve_on == "transmitted":
+            # The terminal response continues in the background; an end-to-end
+            # delivery failure after transmission is logged, not raised
+            pending.response.add_done_callback(_make_late_failure_logger(pending))
+            await pending.transmitted
+            return None
+
+        return await pending.response
 
 
 class ZigguratCoordinator(zigpy.device.Device):
@@ -202,14 +282,15 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         self._api = None
 
     async def connect(self):
-        _, api = await zigpy.serial.create_serial_connection(
-            loop=asyncio.get_running_loop(),
-            protocol_factory=lambda: ZigguratProtocol(
-                self.on_async_event, self.connection_lost
-            ),
-            url=self._config[zigpy.config.CONF_DEVICE][zigpy.config.CONF_DEVICE_PATH],
-        )
-        await api.wait_until_connected()
+        device_path = self._config[zigpy.config.CONF_DEVICE][
+            zigpy.config.CONF_DEVICE_PATH
+        ]
+
+        # ZHA entries predating the WebSocket API use `socket://host:port`
+        url = device_path.replace("socket://", "ws://", 1)
+
+        api = ZigguratApi(url, self.on_notification, self.connection_lost)
+        await api.connect()
         self._api = api
 
     async def disconnect(self):
@@ -275,8 +356,6 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             latest_backup = self.backups[-1]
         except IndexError:
             latest_backup = FALLBACK_NETWORK_SETTINGS
-        else:
-            latest_backup = latest_backup
 
         self.state.network_info = latest_backup.network_info
         self.state.node_info = latest_backup.node_info
@@ -301,7 +380,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             endpoint.add_output_cluster(cluster_id)
 
     async def permit_ncp(self, time_s: int = 60):
-        await self._api.send_command(
+        await self._api.request(
             "permit_joins",
             {
                 "duration": time_s,
@@ -321,7 +400,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         all_results: dict[int, list[float]] = {}
 
         for _ in range(count):
-            rsp = await self._api.send_command(
+            result = await self._api.request(
                 "energy_scan",
                 {
                     "channels": list(channels),
@@ -329,7 +408,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 },
             )
 
-            for channel, rssi in rsp["data"]["results"].items():
+            for channel, rssi in result["results"].items():
                 all_results.setdefault(int(channel), []).append(rssi)
 
         return {
@@ -338,8 +417,8 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         }
 
     async def write_network_info(self, *, network_info, node_info):
-        await self._api.send_command(
-            "set_network_settings",
+        await self._api.request(
+            "configure",
             {
                 "channel": network_info.channel,
                 "nwk_update_id": network_info.nwk_update_id,
@@ -477,10 +556,8 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             DEVICE_JOIN_MAX_DELAY, join_if_still_unannounced
         )
 
-    def on_async_event(self, event):
-        if event["cmd"] == "received_aps_command":
-            data = event["data"]
-
+    def on_notification(self, event: str, data: dict):
+        if event == "received_aps_command":
             if data.get("group") is not None:
                 dst = t.AddrModeAddress(
                     addr_mode=t.AddrMode.Group,
@@ -515,10 +592,8 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 data=t.SerializableBytes(bytes.fromhex(data["data"])),
             )
             self.packet_received(packet)
-        elif event["cmd"] == "frame_counter_update":
-            self.state.network_info.network_key.tx_counter = event["data"][
-                "frame_counter"
-            ]
+        elif event == "frame_counter_update":
+            self.state.network_info.network_key.tx_counter = data["frame_counter"]
             _LOGGER.debug(
                 "Frame counter updated to %d",
                 self.state.network_info.network_key.tx_counter,
@@ -529,16 +604,16 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     node_info=self.state.node_info,
                 )
             )
-        elif event["cmd"] == "device_joined":
-            nwk, _ = t.NWK.deserialize(bytes.fromhex(event["data"]["nwk"]))
-            ieee = t.EUI64.convert(event["data"]["ieee"])
-            parent_nwk, _ = t.NWK.deserialize(bytes.fromhex(event["data"]["parent"]))
+        elif event == "device_joined":
+            nwk, _ = t.NWK.deserialize(bytes.fromhex(data["nwk"]))
+            ieee = t.EUI64.convert(data["ieee"])
+            parent_nwk, _ = t.NWK.deserialize(bytes.fromhex(data["parent"]))
             self._handle_device_joined(nwk, ieee, parent_nwk)
-        elif event["cmd"] == "device_left":
-            nwk, _ = t.NWK.deserialize(bytes.fromhex(event["data"]["nwk"]))
+        elif event == "device_left":
+            nwk, _ = t.NWK.deserialize(bytes.fromhex(data["nwk"]))
 
-            if event["data"]["ieee"] is not None:
-                ieee = t.EUI64.convert(event["data"]["ieee"])
+            if data["ieee"] is not None:
+                ieee = t.EUI64.convert(data["ieee"])
             else:
                 try:
                     ieee = self.get_device(nwk=nwk).ieee
@@ -546,14 +621,14 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     return
 
             self.handle_leave(nwk=nwk, ieee=ieee)
-        elif event["cmd"] == "link_key_update":
+        elif event == "link_key_update":
             key = zigpy.state.Key.from_dict(
                 {
-                    "key": event["data"]["key"],
+                    "key": data["key"],
                     "tx_counter": 0,
                     "rx_counter": 0,
                     "seq": 0,
-                    "partner_ieee": event["data"]["ieee"],
+                    "partner_ieee": data["ieee"],
                 }
             )
             _LOGGER.debug("Link key updated for %s", key.partner_ieee)
@@ -588,8 +663,10 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 t.AddrMode.Broadcast: "broadcast",
             }[packet.dst.addr_mode]
 
-        await self._api.send_command(
-            "send_aps_command",
+        # Resolves once the frame is on the air (EZSP `messageSent` parity); the
+        # APS-ack delivery result arrives later and is logged by the API layer
+        await self._api.request(
+            "send_aps",
             {
                 "delivery_mode": delivery_mode,
                 **addressing,
@@ -602,4 +679,5 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 "aps_seq": packet.tsn,
                 "data": packet.data.serialize().hex(),
             },
+            resolve_on="transmitted",
         )
