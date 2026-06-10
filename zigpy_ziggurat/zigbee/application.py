@@ -19,6 +19,10 @@ _LOGGER = logging.getLogger(__name__)
 RSSI_MIN = -92
 RSSI_MAX = -5
 
+# How long a freshly-joined device gets to announce itself before zigpy is told about
+# the join. Some devices do not tolerate being interviewed mid-join (see zigpy-znp).
+DEVICE_JOIN_MAX_DELAY = 5
+
 # 802.15.4 6.3.1: time spent scanning each channel is
 # aBaseSuperframeDuration * (2^n + 1) symbols, at 16 us per symbol
 SYMBOL_PERIOD_MS = 0.016
@@ -448,6 +452,31 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 )
             )
 
+    def _handle_device_joined(
+        self, nwk: t.NWK, ieee: t.EUI64, parent_nwk: t.NWK
+    ) -> None:
+        try:
+            self.get_device(ieee=ieee)
+        except KeyError:
+            pass
+        else:
+            # A known device rejoined, possibly with a new network address
+            self.handle_join(nwk=nwk, ieee=ieee, parent_nwk=parent_nwk)
+            return
+
+        # Give a new device a chance to announce itself before the join starts the
+        # interview: the announcement creates the device through `packet_received`
+        # and a later `handle_join` would cancel and restart the interview
+        def join_if_still_unannounced() -> None:
+            try:
+                self.get_device(ieee=ieee)
+            except KeyError:
+                self.handle_join(nwk=nwk, ieee=ieee, parent_nwk=parent_nwk)
+
+        asyncio.get_running_loop().call_later(
+            DEVICE_JOIN_MAX_DELAY, join_if_still_unannounced
+        )
+
     def on_async_event(self, event):
         if event["cmd"] == "received_aps_command":
             data = event["data"]
@@ -500,6 +529,23 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     node_info=self.state.node_info,
                 )
             )
+        elif event["cmd"] == "device_joined":
+            nwk, _ = t.NWK.deserialize(bytes.fromhex(event["data"]["nwk"]))
+            ieee = t.EUI64.convert(event["data"]["ieee"])
+            parent_nwk, _ = t.NWK.deserialize(bytes.fromhex(event["data"]["parent"]))
+            self._handle_device_joined(nwk, ieee, parent_nwk)
+        elif event["cmd"] == "device_left":
+            nwk, _ = t.NWK.deserialize(bytes.fromhex(event["data"]["nwk"]))
+
+            if event["data"]["ieee"] is not None:
+                ieee = t.EUI64.convert(event["data"]["ieee"])
+            else:
+                try:
+                    ieee = self.get_device(nwk=nwk).ieee
+                except KeyError:
+                    return
+
+            self.handle_leave(nwk=nwk, ieee=ieee)
         elif event["cmd"] == "link_key_update":
             key = zigpy.state.Key.from_dict(
                 {
