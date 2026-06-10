@@ -1,15 +1,44 @@
 import asyncio
 import json
 import logging
+import math
+import statistics
 
 import zigpy.application
 import zigpy.backups
+import zigpy.device
+import zigpy.endpoint
 from zigpy.exceptions import DeliveryError
 import zigpy.serial
 import zigpy.state
 import zigpy.types as t
+import zigpy.zdo.types as zdo_t
 
 _LOGGER = logging.getLogger(__name__)
+
+RSSI_MIN = -92
+RSSI_MAX = -5
+
+# 802.15.4 6.3.1: time spent scanning each channel is
+# aBaseSuperframeDuration * (2^n + 1) symbols, at 16 us per symbol
+SYMBOL_PERIOD_MS = 0.016
+BASE_SUPERFRAME_DURATION_SYMBOLS = 960
+
+
+def logistic(x: float, *, L: float = 1, x_0: float = 0, k: float = 1) -> float:
+    """Logistic function."""
+    return L / (1 + math.exp(-k * (x - x_0)))
+
+
+def map_rssi_to_energy(rssi: float) -> float:
+    """Remaps RSSI (in dBm) to Energy (0-255), same curve as bellows."""
+    return logistic(
+        x=rssi,
+        L=255,
+        x_0=RSSI_MIN + 0.45 * (RSSI_MAX - RSSI_MIN),
+        k=0.13,
+    )
+
 
 FALLBACK_NETWORK_SETTINGS = zigpy.backups.NetworkBackup.from_dict(
     {
@@ -142,6 +171,27 @@ class ZigguratProtocol(zigpy.serial.SerialProtocol):
         return rsp
 
 
+class ZigguratCoordinator(zigpy.device.Device):
+    """Zigpy device representing the coordinator. Ziggurat has no loopback ZDO, so the
+    device is constructed statically instead of being interviewed over the air."""
+
+    @property
+    def manufacturer(self) -> str:
+        return "Ziggurat"
+
+    @manufacturer.setter
+    def manufacturer(self, value) -> None:
+        pass
+
+    @property
+    def model(self) -> str:
+        return "Coordinator"
+
+    @model.setter
+    def model(self, value) -> None:
+        pass
+
+
 class ControllerApplication(zigpy.application.ControllerApplication):
     def __init__(self, config):
         super().__init__(config)
@@ -176,6 +226,42 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             network_info=self.state.network_info, node_info=self.state.node_info
         )
 
+        self._register_coordinator_device()
+        await self.register_endpoints()
+
+    def _register_coordinator_device(self):
+        coordinator = ZigguratCoordinator(
+            self, self.state.node_info.ieee, self.state.node_info.nwk
+        )
+
+        # Remote devices read this via ZDO Node_Desc_req, which zigpy answers with the
+        # device's node descriptor. The server mask advertises a primary trust center
+        # with stack compliance revision 22: joiners check it to decide whether to
+        # perform the trust center link key exchange.
+        coordinator.node_desc = zdo_t.NodeDescriptor(
+            logical_type=zdo_t.LogicalType.Coordinator,
+            complex_descriptor_available=0,
+            user_descriptor_available=0,
+            reserved=0,
+            aps_flags=0,
+            frequency_band=zdo_t.NodeDescriptor.FrequencyBand.Freq2400MHz,
+            mac_capability_flags=(
+                zdo_t.NodeDescriptor.MACCapabilityFlags.FullFunctionDevice
+                | zdo_t.NodeDescriptor.MACCapabilityFlags.MainsPowered
+                | zdo_t.NodeDescriptor.MACCapabilityFlags.RxOnWhenIdle
+                | zdo_t.NodeDescriptor.MACCapabilityFlags.AllocateAddress
+            ),
+            manufacturer_code=0xFFFF,
+            maximum_buffer_size=82,
+            maximum_incoming_transfer_size=128,
+            server_mask=0x2C01,  # Primary Trust Center, revision 22
+            maximum_outgoing_transfer_size=128,
+            descriptor_capability_field=zdo_t.NodeDescriptor.DescriptorCapability.NONE,
+        )
+        coordinator.status = zigpy.device.Status.ENDPOINTS_INIT
+
+        self.devices[self.state.node_info.ieee] = coordinator
+
     async def load_network_info(self, *, load_devices=False):
         self._get_network_settings()
 
@@ -196,8 +282,19 @@ class ControllerApplication(zigpy.application.ControllerApplication):
     async def force_remove(self, dev):
         _LOGGER.debug("Not implemented")
 
-    async def add_endpoint(self, descriptor):
-        _LOGGER.debug("Not implemented")
+    async def add_endpoint(self, descriptor: zdo_t.SimpleDescriptor) -> None:
+        # There is no firmware to register the endpoint with: it exists only on the
+        # static coordinator device, which ZDO requests are answered from
+        endpoint = self._device.add_endpoint(descriptor.endpoint)
+        endpoint.status = zigpy.endpoint.Status.ZDO_INIT
+        endpoint.profile_id = descriptor.profile
+        endpoint.device_type = descriptor.device_type
+
+        for cluster_id in descriptor.input_clusters:
+            endpoint.add_input_cluster(cluster_id)
+
+        for cluster_id in descriptor.output_clusters:
+            endpoint.add_output_cluster(cluster_id)
 
     async def permit_ncp(self, time_s: int = 60):
         await self._api.send_command(
@@ -209,6 +306,32 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
     async def permit_with_link_key(self, node, link_key, time_s: int = 60):
         _LOGGER.debug("Not implemented")
+
+    async def energy_scan(
+        self, channels: t.Channels, duration_exp: int, count: int
+    ) -> dict[int, float]:
+        duration_per_channel_ms = round(
+            SYMBOL_PERIOD_MS * BASE_SUPERFRAME_DURATION_SYMBOLS * (2**duration_exp + 1)
+        )
+
+        all_results: dict[int, list[float]] = {}
+
+        for _ in range(count):
+            rsp = await self._api.send_command(
+                "energy_scan",
+                {
+                    "channels": list(channels),
+                    "duration_per_channel_ms": duration_per_channel_ms,
+                },
+            )
+
+            for channel, rssi in rsp["data"]["results"].items():
+                all_results.setdefault(int(channel), []).append(rssi)
+
+        return {
+            channel: map_rssi_to_energy(statistics.mean(all_results[channel]))
+            for channel in list(channels)
+        }
 
     async def write_network_info(self, *, network_info, node_info):
         await self._api.send_command(
@@ -239,6 +362,91 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
     async def reset_network_info(self):
         pass
+
+    def packet_received(self, packet):
+        # ZDO requests addressed to the coordinator have to be answered here: there is
+        # no firmware ZDO underneath Ziggurat, and zigpy itself only handles a subset
+        # (NWK_addr_req, IEEE_addr_req, Match_Desc_req)
+        if (
+            packet.profile_id == 0x0000
+            and packet.src_ep == 0
+            and packet.dst_ep == 0
+            and packet.src.addr_mode == t.AddrMode.NWK
+        ):
+            self._maybe_handle_local_zdo_request(packet)
+
+        super().packet_received(packet)
+
+    def _maybe_handle_local_zdo_request(self, packet):
+        try:
+            device = self.get_device(nwk=packet.src.address)
+        except KeyError:
+            return
+
+        try:
+            hdr, args = device.zdo.deserialize(
+                packet.cluster_id, packet.data.serialize()
+            )
+        except (ValueError, KeyError):
+            return
+
+        if hdr.command_id not in (
+            zdo_t.ZDOCmd.Node_Desc_req,
+            zdo_t.ZDOCmd.Active_EP_req,
+            zdo_t.ZDOCmd.Simple_Desc_req,
+        ):
+            return
+
+        # The address of interest must be us
+        if args[0] != self.state.node_info.nwk:
+            return
+
+        coordinator = self._device
+        nwk = self.state.node_info.nwk
+
+        if hdr.command_id == zdo_t.ZDOCmd.Node_Desc_req:
+            # Joining devices read our node descriptor to learn the trust center's
+            # stack compliance revision before attempting the link key exchange
+            device.zdo.create_catching_task(
+                device.zdo.Node_Desc_rsp(
+                    zdo_t.Status.SUCCESS,
+                    nwk,
+                    coordinator.node_desc,
+                    tsn=hdr.tsn,
+                )
+            )
+        elif hdr.command_id == zdo_t.ZDOCmd.Active_EP_req:
+            endpoints = [t.uint8_t(ep) for ep in coordinator.endpoints if ep != 0]
+            device.zdo.create_catching_task(
+                device.zdo.Active_EP_rsp(
+                    zdo_t.Status.SUCCESS,
+                    nwk,
+                    endpoints,
+                    tsn=hdr.tsn,
+                )
+            )
+        elif hdr.command_id == zdo_t.ZDOCmd.Simple_Desc_req:
+            endpoint = coordinator.endpoints.get(args[1])
+
+            if endpoint is None or args[1] == 0:
+                return
+
+            descriptor = zdo_t.SizePrefixedSimpleDescriptor(
+                endpoint=endpoint.endpoint_id,
+                profile=endpoint.profile_id,
+                device_type=endpoint.device_type,
+                device_version=1,
+                input_clusters=list(endpoint.in_clusters),
+                output_clusters=list(endpoint.out_clusters),
+            )
+            device.zdo.create_catching_task(
+                device.zdo.Simple_Desc_rsp(
+                    zdo_t.Status.SUCCESS,
+                    nwk,
+                    descriptor,
+                    tsn=hdr.tsn,
+                )
+            )
 
     def on_async_event(self, event):
         if event["cmd"] == "received_aps_command":
