@@ -428,9 +428,27 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         }
 
     async def write_network_info(self, *, network_info, node_info):
+        # A TCLK seed carried over from a microcontroller stack: ziggurat derives the
+        # unique link keys the previous stack issued to devices from it. Both stacks
+        # already store the seed as a plain hex string.
+        stack_specific = network_info.stack_specific
+        tclk = {}
+
+        if "zstack" in stack_specific and "tclk_seed" in stack_specific["zstack"]:
+            tclk = {
+                "tclk_seed": stack_specific["zstack"]["tclk_seed"],
+                "tclk_flavor": "zstack",
+            }
+        elif "ezsp" in stack_specific and "hashed_tclk" in stack_specific["ezsp"]:
+            tclk = {
+                "tclk_seed": stack_specific["ezsp"]["hashed_tclk"],
+                "tclk_flavor": "ezsp",
+            }
+
         await self._api.request(
             "configure",
             {
+                **tclk,
                 "channel": network_info.channel,
                 "nwk_update_id": network_info.nwk_update_id,
                 "pan_id": network_info.pan_id.serialize()[::-1].hex(),
@@ -663,6 +681,8 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         if packet.src_ep != 0 or packet.dst_ep != 0:
             profile_id = 0x0104
 
+        aps_encryption = t.TransmitOptions.APS_Encryption in packet.tx_options
+
         if packet.dst.addr_mode == t.AddrMode.IEEE:
             # The server resolves the EUI64 to a network address
             addressing = {"destination_eui64": str(packet.dst.address)}
@@ -674,6 +694,12 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 t.AddrMode.Group: "multicast",
                 t.AddrMode.Broadcast: "broadcast",
             }[packet.dst.addr_mode]
+
+            if aps_encryption:
+                # The server selects the link key by EUI64
+                addressing["destination_eui64"] = str(
+                    self.get_device(nwk=packet.dst.address).ieee
+                )
 
         # Resolves once the frame is on the air (EZSP `messageSent` parity); the
         # APS-ack delivery result arrives later and is logged by the API layer
@@ -687,6 +713,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 "src_ep": packet.src_ep,
                 "dst_ep": packet.dst_ep or 0,
                 "aps_ack": t.TransmitOptions.ACK in packet.tx_options,
+                "aps_encryption": aps_encryption,
                 "radius": packet.radius or 30,
                 "aps_seq": packet.tsn,
                 "data": packet.data.serialize().hex(),
