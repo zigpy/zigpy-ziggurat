@@ -382,6 +382,17 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         for cluster_id in descriptor.output_clusters:
             endpoint.add_output_cluster(cluster_id)
 
+    async def _move_network_to_channel(
+        self, new_channel: int, new_nwk_update_id: int
+    ) -> None:
+        # zigpy has already broadcast the migration to the network; this is the
+        # coordinator's own move. The update id goes first so no beacon on the new
+        # channel ever advertises the old network instance.
+        await self._api.request(
+            "set_nwk_update_id", {"nwk_update_id": new_nwk_update_id}
+        )
+        await self._api.request("set_channel", {"channel": new_channel})
+
     async def permit_ncp(self, time_s: int = 60):
         await self._api.request(
             "permit_joins",
