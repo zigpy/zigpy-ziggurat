@@ -18,6 +18,9 @@ dependencies = [
     "aiohttp",
 ]
 
+[project.entry-points."zigpy.radio"]
+ziggurat = "zigpy_ziggurat.zigbee.application:ControllerApplication"
+
 [tool.setuptools.packages.find]
 exclude = ["tests", "tests.*"]
 

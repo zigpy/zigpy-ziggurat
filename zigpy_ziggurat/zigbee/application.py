@@ -277,6 +277,9 @@ class ZigguratCoordinator(zigpy.device.Device):
 
 
 class ControllerApplication(zigpy.application.ControllerApplication):
+    DISPLAY_NAME = "Ziggurat"
+    DESCRIPTION = "Ziggurat: An open source, host-side Zigbee stack in Rust"
+
     def __init__(self, config):
         super().__init__(config)
         self._api = None
