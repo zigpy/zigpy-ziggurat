@@ -391,7 +391,15 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         )
 
     async def permit_with_link_key(self, node, link_key, time_s: int = 60):
-        _LOGGER.debug("Not implemented")
+        await self._api.request(
+            "set_provisional_key",
+            {
+                "ieee": str(node),
+                "key": str(link_key),
+            },
+        )
+
+        await super().permit(time_s)
 
     async def energy_scan(
         self, channels: t.Channels, duration_exp: int, count: int
@@ -431,6 +439,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 "ieee_address": str(node_info.ieee),
                 "network_key": str(network_info.network_key.key),
                 "network_key_seq": network_info.network_key.seq,
+                "source_routing": self.config[zigpy.config.CONF_SOURCE_ROUTING],
                 # To avoid persisting state while also preventing counter rollback,
                 # just base the counter on the current time
                 "network_key_tx_counter": network_info.network_key.tx_counter,
