@@ -10,7 +10,7 @@ import zigpy.backups
 import zigpy.config
 import zigpy.device
 import zigpy.endpoint
-from zigpy.exceptions import DeliveryError
+from zigpy.exceptions import DeliveryError, NetworkNotFormed
 import zigpy.state
 import zigpy.types as t
 import zigpy.zdo.types as zdo_t
@@ -45,51 +45,6 @@ def map_rssi_to_energy(rssi: float) -> float:
         x_0=RSSI_MIN + 0.45 * (RSSI_MAX - RSSI_MIN),
         k=0.13,
     )
-
-
-FALLBACK_NETWORK_SETTINGS = zigpy.backups.NetworkBackup.from_dict(
-    {
-        "version": 1,
-        "backup_time": "2025-06-29T03:35:11.850787+00:00",
-        "network_info": {
-            "extended_pan_id": "3a:9f:44:01:0b:3c:cb:93",
-            "pan_id": "4072",
-            "nwk_update_id": 0,
-            "nwk_manager_id": "0000",
-            "channel": 11,
-            "channel_mask": [11],
-            "security_level": 5,
-            "network_key": {
-                "key": "ee:83:0c:e4:85:57:9c:8c:b1:3f:87:00:b6:5d:4b:e8",
-                "tx_counter": 0,
-                "rx_counter": 0,
-                "seq": 0,
-                "partner_ieee": "ff:ff:ff:ff:ff:ff:ff:ff",
-            },
-            "tc_link_key": {
-                "key": "5a:69:67:42:65:65:41:6c:6c:69:61:6e:63:65:30:39",
-                "tx_counter": 0,
-                "rx_counter": 0,
-                "seq": 0,
-                "partner_ieee": "bc:02:6e:ff:fe:24:db:90",
-            },
-            "key_table": [],
-            "children": [],
-            "nwk_addresses": {},
-            "stack_specific": {},
-            "metadata": {},
-            "source": None,
-        },
-        "node_info": {
-            "nwk": "0000",
-            "ieee": "bc:02:6e:ff:fe:24:db:90",
-            "logical_type": "coordinator",
-            "model": None,
-            "manufacturer": None,
-            "version": None,
-        },
-    }
-)
 
 
 class PendingRequest:
@@ -189,12 +144,14 @@ class ZigguratApi:
                     exc = self._websocket.exception()
                     break
         except asyncio.CancelledError:
+            # A deliberate `disconnect()`, not a connection loss
+            self._fail_pending(ConnectionError("Connection closed"))
             raise
         except Exception as e:
             exc = e
-        finally:
-            self._fail_pending(ConnectionError("Connection lost"))
-            self._on_disconnect(exc)
+
+        self._fail_pending(ConnectionError("Connection lost"))
+        self._on_disconnect(exc)
 
     def _fail_pending(self, exc: BaseException) -> None:
         for pending in self._pending.values():
@@ -285,12 +242,8 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         self._api = None
 
     async def connect(self):
-        device_path = self._config[zigpy.config.CONF_DEVICE][
-            zigpy.config.CONF_DEVICE_PATH
-        ]
-
-        # ZHA entries predating the WebSocket API use `socket://host:port`
-        url = device_path.replace("socket://", "ws://", 1)
+        # The device path is the WebSocket URL of the ziggurat server
+        url = self._config[zigpy.config.CONF_DEVICE][zigpy.config.CONF_DEVICE_PATH]
 
         api = ZigguratApi(url, self.on_notification, self.connection_lost)
         await api.connect()
@@ -304,12 +257,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 self._api = None
 
     async def start_network(self):
-        backup = self._get_network_settings()
-
-        # Our frame counter shouldn't be off by more than 100. Keep it in sync.
-        backup.network_info.network_key.tx_counter += 500
-        self.backups.add_backup(backup)
-
+        await self.load_network_info()
         await self.write_network_info(
             network_info=self.state.network_info, node_info=self.state.node_info
         )
@@ -351,19 +299,71 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         self.devices[self.state.node_info.ieee] = coordinator
 
     async def load_network_info(self, *, load_devices=False):
-        self._get_network_settings()
+        try:
+            info = await self._api.request("get_network_info", {})
+        except DeliveryError as exc:
+            if not str(exc).startswith("not_configured"):
+                raise
+
+            # The server is stateless and has no network running (e.g. it just
+            # restarted): the most recent zigpy database backup is authoritative
+            self._get_network_settings()
+            return
+
+        stack_specific = {}
+        if info["tclk_seed"] is not None:
+            if info["tclk_flavor"] == "zstack":
+                stack_specific = {"zstack": {"tclk_seed": info["tclk_seed"]}}
+            else:
+                stack_specific = {"ezsp": {"hashed_tclk": info["tclk_seed"]}}
+
+        self.state.node_info = zigpy.state.NodeInfo(
+            nwk=t.NWK(int(info["nwk_address"], 16)),
+            ieee=t.EUI64.convert(info["ieee_address"]),
+            logical_type=zdo_t.LogicalType.Coordinator,
+            manufacturer="Ziggurat",
+            model="Coordinator",
+        )
+        self.state.network_info = zigpy.state.NetworkInfo(
+            extended_pan_id=t.ExtendedPanId.convert(info["extended_pan_id"]),
+            pan_id=t.PanId(int(info["pan_id"], 16)),
+            nwk_update_id=info["nwk_update_id"],
+            nwk_manager_id=t.NWK(0x0000),
+            channel=info["channel"],
+            channel_mask=t.Channels.from_channel_list([info["channel"]]),
+            security_level=5,
+            network_key=zigpy.state.Key(
+                key=t.KeyData.convert(info["network_key"]),
+                seq=info["network_key_seq"],
+                tx_counter=info["network_key_tx_counter"],
+            ),
+            tc_link_key=zigpy.state.Key(
+                key=t.KeyData.convert(info["tc_link_key"]),
+                partner_ieee=self.state.node_info.ieee,
+            ),
+            key_table=[
+                zigpy.state.Key(
+                    key=t.KeyData.convert(entry["key"]),
+                    partner_ieee=t.EUI64.convert(entry["partner_ieee"]),
+                )
+                for entry in info["key_table"]
+            ],
+            stack_specific=stack_specific,
+        )
 
     def _get_network_settings(self):
         try:
-            # Use the most recent backup from the zigpy database, if supported
             latest_backup = self.backups[-1]
-        except IndexError:
-            latest_backup = FALLBACK_NETWORK_SETTINGS
+        except IndexError as exc:
+            raise NetworkNotFormed() from exc
 
-        self.state.network_info = latest_backup.network_info
+        # The backup's frame counter trails the radio's true counter by however many
+        # frames were sent after the last counter update notification: jump past it
+        network_key = latest_backup.network_info.network_key
+        self.state.network_info = latest_backup.network_info.replace(
+            network_key=network_key.replace(tx_counter=network_key.tx_counter + 500)
+        )
         self.state.node_info = latest_backup.node_info
-
-        return latest_backup
 
     async def force_remove(self, dev):
         _LOGGER.debug("Not implemented")
@@ -445,32 +445,45 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 "tclk_flavor": "ezsp",
             }
 
+        params = {
+            **tclk,
+            "channel": network_info.channel,
+            "nwk_update_id": network_info.nwk_update_id,
+            "pan_id": t.PanId(network_info.pan_id).serialize()[::-1].hex(),
+            "extended_pan_id": str(network_info.extended_pan_id),
+            "nwk_address": t.NWK(node_info.nwk).serialize()[::-1].hex(),
+            "network_key": str(network_info.network_key.key),
+            "network_key_seq": network_info.network_key.seq,
+            "source_routing": self.config[zigpy.config.CONF_SOURCE_ROUTING],
+            "network_key_tx_counter": network_info.network_key.tx_counter,
+            "tc_link_key": str(network_info.tc_link_key.key),
+            # Unique trust center link keys negotiated in earlier sessions
+            "key_table": [
+                {
+                    "partner_ieee": str(key.partner_ieee),
+                    "key": str(key.key),
+                }
+                for key in network_info.key_table
+            ],
+        }
+
+        if node_info.ieee == t.EUI64.UNKNOWN:
+            # zigpy leaves the IEEE address unspecified when forming a new network,
+            # deferring to the radio's hardware address
+            rsp = await self._api.request("get_hw_address", {})
+            node_info = node_info.replace(ieee=t.EUI64.convert(rsp["ieee_address"]))
+
         await self._api.request(
-            "configure",
-            {
-                **tclk,
-                "channel": network_info.channel,
-                "nwk_update_id": network_info.nwk_update_id,
-                "pan_id": network_info.pan_id.serialize()[::-1].hex(),
-                "extended_pan_id": str(network_info.extended_pan_id),
-                "nwk_address": node_info.nwk.serialize()[::-1].hex(),
-                "ieee_address": str(node_info.ieee),
-                "network_key": str(network_info.network_key.key),
-                "network_key_seq": network_info.network_key.seq,
-                "source_routing": self.config[zigpy.config.CONF_SOURCE_ROUTING],
-                # To avoid persisting state while also preventing counter rollback,
-                # just base the counter on the current time
-                "network_key_tx_counter": network_info.network_key.tx_counter,
-                "tc_link_key": str(network_info.tc_link_key.key),
-                # Unique trust center link keys negotiated in earlier sessions
-                "key_table": [
-                    {
-                        "partner_ieee": str(key.partner_ieee),
-                        "key": str(key.key),
-                    }
-                    for key in network_info.key_table
-                ],
-            },
+            "configure", {**params, "ieee_address": str(node_info.ieee)}
+        )
+
+        # Ziggurat has no persistent storage of its own: zigpy's backup database is
+        # the network's NVRAM, so the settings just written are recorded there for
+        # `start_network` to find
+        self.state.network_info = network_info
+        self.state.node_info = node_info
+        self.backups.add_backup(
+            zigpy.backups.NetworkBackup(network_info=network_info, node_info=node_info)
         )
 
     async def reset_network_info(self):
