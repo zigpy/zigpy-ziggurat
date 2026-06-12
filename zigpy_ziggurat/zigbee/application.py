@@ -503,6 +503,9 @@ class ControllerApplication(zigpy.application.ControllerApplication):
     async def reset_network_info(self):
         pass
 
+    async def _watchdog_feed(self) -> None:
+        await self._api.request("ping", {})
+
     def packet_received(self, packet):
         # ZDO requests addressed to the coordinator have to be answered here: there is
         # no firmware ZDO underneath Ziggurat, and zigpy itself only handles a subset
