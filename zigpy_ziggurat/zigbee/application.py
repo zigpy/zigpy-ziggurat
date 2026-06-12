@@ -107,9 +107,17 @@ class ZigguratApi:
         self._pending: dict[int, PendingRequest] = {}
 
     async def connect(self) -> None:
-        self._session = aiohttp.ClientSession()
+        if self._url.startswith("ws+unix://"):
+            # The URL's path is the socket path; the HTTP-level host is a placeholder
+            connector = aiohttp.UnixConnector(path=self._url.removeprefix("ws+unix://"))
+            url = "ws://localhost/"
+        else:
+            connector = None
+            url = self._url
+
+        self._session = aiohttp.ClientSession(connector=connector)
         self._websocket = await self._session.ws_connect(
-            self._url, heartbeat=WEBSOCKET_HEARTBEAT
+            url, heartbeat=WEBSOCKET_HEARTBEAT
         )
 
         hello = json.loads(await self._websocket.receive_str())
