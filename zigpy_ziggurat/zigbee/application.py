@@ -1,8 +1,10 @@
 import asyncio
+from collections.abc import Callable
 import json
 import logging
 import math
 import statistics
+from typing import Any, Literal, overload
 
 import aiohttp
 import zigpy.application
@@ -53,8 +55,8 @@ class PendingRequest:
 
     def __init__(self, *, want_transmitted: bool) -> None:
         loop = asyncio.get_running_loop()
-        self.response: asyncio.Future = loop.create_future()
-        self.transmitted: asyncio.Future | None = (
+        self.response: asyncio.Future[dict[str, Any]] = loop.create_future()
+        self.transmitted: asyncio.Future[None] | None = (
             loop.create_future() if want_transmitted else None
         )
 
@@ -66,12 +68,14 @@ class PendingRequest:
             self.response.set_exception(exc)
 
 
-def _make_late_failure_logger(pending: "PendingRequest"):
+def _make_late_failure_logger(
+    pending: "PendingRequest",
+) -> Callable[[asyncio.Future[dict[str, Any]]], None]:
     """Consume the terminal result of a request that already resolved at the
     `transmitted` stage, so delivery failures are visible but not raised. Failures
     from before transmission were already raised to the caller and are not logged."""
 
-    def log_late_failure(fut: asyncio.Future) -> None:
+    def log_late_failure(fut: asyncio.Future[dict[str, Any]]) -> None:
         if fut.cancelled():
             return
 
@@ -95,14 +99,19 @@ class ZigguratApi:
     """The Ziggurat WebSocket API: concurrent requests correlated by id, with
     lifecycle events (`accepted`, `transmitted`) preceding each terminal response."""
 
-    def __init__(self, url: str, on_notification, on_disconnect) -> None:
+    def __init__(
+        self,
+        url: str,
+        on_notification: Callable[[str, dict[str, Any]], None],
+        on_disconnect: Callable[[BaseException | None], None],
+    ) -> None:
         self._url = url
         self._on_notification = on_notification
         self._on_disconnect = on_disconnect
 
         self._session: aiohttp.ClientSession | None = None
         self._websocket: aiohttp.ClientWebSocketResponse | None = None
-        self._receiver_task: asyncio.Task | None = None
+        self._receiver_task: asyncio.Task[None] | None = None
         self._request_id = 1
         self._pending: dict[int, PendingRequest] = {}
 
@@ -139,17 +148,20 @@ class ZigguratApi:
             self._session = None
 
     async def _receive_loop(self) -> None:
+        websocket = self._websocket
+        assert websocket is not None
+
         exc: BaseException | None = None
 
         try:
-            async for msg in self._websocket:
+            async for msg in websocket:
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     try:
                         self._handle_message(json.loads(msg.data))
                     except Exception:
                         _LOGGER.exception("Failed to handle message: %r", msg.data)
                 elif msg.type == aiohttp.WSMsgType.ERROR:
-                    exc = self._websocket.exception()
+                    exc = websocket.exception()
                     break
         except asyncio.CancelledError:
             # A deliberate `disconnect()`, not a connection loss
@@ -168,7 +180,7 @@ class ZigguratApi:
 
         self._pending.clear()
 
-    def _handle_message(self, msg: dict) -> None:
+    def _handle_message(self, msg: dict[str, Any]) -> None:
         _LOGGER.debug("Received: %r", msg)
         msg_type = msg["type"]
 
@@ -197,9 +209,17 @@ class ZigguratApi:
             elif not pending.response.done():
                 pending.response.set_result(msg["result"])
 
+    @overload
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]: ...
+
+    @overload
     async def request(
-        self, method: str, params: dict, *, resolve_on: str = "response"
-    ) -> dict | None:
+        self, method: str, params: dict[str, Any], *, resolve_on: Literal["transmitted"]
+    ) -> None: ...
+
+    async def request(
+        self, method: str, params: dict[str, Any], *, resolve_on: str = "response"
+    ) -> dict[str, Any] | None:
         request_id = self._request_id
         self._request_id = (self._request_id + 1) % 2**32 or 1
 
@@ -208,12 +228,14 @@ class ZigguratApi:
 
         message = {"id": request_id, "method": method, "params": params}
         _LOGGER.debug("Sending: %r", message)
+        assert self._websocket is not None
         await self._websocket.send_str(json.dumps(message))
 
         if resolve_on == "transmitted":
             # The terminal response continues in the background; an end-to-end
             # delivery failure after transmission is logged, not raised
             pending.response.add_done_callback(_make_late_failure_logger(pending))
+            assert pending.transmitted is not None
             await pending.transmitted
             return None
 
@@ -229,7 +251,7 @@ class ZigguratCoordinator(zigpy.device.Device):
         return "Ziggurat"
 
     @manufacturer.setter
-    def manufacturer(self, value) -> None:
+    def manufacturer(self, value: str) -> None:
         pass
 
     @property
@@ -237,7 +259,7 @@ class ZigguratCoordinator(zigpy.device.Device):
         return "Coordinator"
 
     @model.setter
-    def model(self, value) -> None:
+    def model(self, value: str) -> None:
         pass
 
 
@@ -245,26 +267,31 @@ class ControllerApplication(zigpy.application.ControllerApplication):
     DISPLAY_NAME = "Ziggurat"
     DESCRIPTION = "Ziggurat: An open source, host-side Zigbee stack in Rust"
 
-    def __init__(self, config):
+    def __init__(self, config: dict[str, Any]) -> None:
         super().__init__(config)
-        self._api = None
+        self._api: ZigguratApi | None = None
 
-    async def connect(self):
+    async def connect(self) -> None:
         # The device path is the WebSocket URL of the ziggurat server
         url = self._config[zigpy.config.CONF_DEVICE][zigpy.config.CONF_DEVICE_PATH]
 
-        api = ZigguratApi(url, self.on_notification, self.connection_lost)
+        # zigpy types `connection_lost` as Exception-only but handles None fine
+        api = ZigguratApi(
+            url,
+            self.on_notification,
+            self.connection_lost,  # type: ignore[arg-type]
+        )
         await api.connect()
         self._api = api
 
-    async def disconnect(self):
+    async def disconnect(self) -> None:
         if self._api is not None:
             try:
                 await self._api.disconnect()
             finally:
                 self._api = None
 
-    async def start_network(self):
+    async def start_network(self) -> None:
         await self.load_network_info()
         await self.write_network_info(
             network_info=self.state.network_info, node_info=self.state.node_info
@@ -273,7 +300,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         self._register_coordinator_device()
         await self.register_endpoints()
 
-    def _register_coordinator_device(self):
+    def _register_coordinator_device(self) -> None:
         coordinator = ZigguratCoordinator(
             self, self.state.node_info.ieee, self.state.node_info.nwk
         )
@@ -306,7 +333,9 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
         self.devices[self.state.node_info.ieee] = coordinator
 
-    async def load_network_info(self, *, load_devices=False):
+    async def load_network_info(self, *, load_devices: bool = False) -> None:
+        assert self._api is not None
+
         try:
             info = await self._api.request("get_network_info", {})
         except DeliveryError as exc:
@@ -333,14 +362,16 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             model="Coordinator",
         )
         self.state.network_info = zigpy.state.NetworkInfo(
-            extended_pan_id=t.ExtendedPanId.convert(info["extended_pan_id"]),
+            # `EUI64.convert` is typed without `Self`, losing the subclass
+            extended_pan_id=t.ExtendedPanId(t.EUI64.convert(info["extended_pan_id"])),
             pan_id=t.PanId(int(info["pan_id"], 16)),
             nwk_update_id=info["nwk_update_id"],
             nwk_manager_id=t.NWK(0x0000),
             channel=info["channel"],
             tx_power=info["tx_power"],
-            channel_mask=t.Channels.from_channel_list([info["channel"]]),
-            security_level=5,
+            # zigpy mis-annotates the classmethod's `cls` as an instance
+            channel_mask=t.Channels.from_channel_list([info["channel"]]),  # type: ignore[misc]
+            security_level=t.uint8_t(5),
             network_key=zigpy.state.Key(
                 key=t.KeyData.convert(info["network_key"]),
                 seq=info["network_key_seq"],
@@ -360,7 +391,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             stack_specific=stack_specific,
         )
 
-    def _get_network_settings(self):
+    def _get_network_settings(self) -> None:
         try:
             latest_backup = self.backups[-1]
         except IndexError as exc:
@@ -374,7 +405,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         )
         self.state.node_info = latest_backup.node_info
 
-    async def force_remove(self, dev):
+    async def force_remove(self, dev: zigpy.device.Device) -> None:
         _LOGGER.debug("Not implemented")
 
     async def add_endpoint(self, descriptor: zdo_t.SimpleDescriptor) -> None:
@@ -383,7 +414,8 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         endpoint = self._device.add_endpoint(descriptor.endpoint)
         endpoint.status = zigpy.endpoint.Status.ZDO_INIT
         endpoint.profile_id = descriptor.profile
-        endpoint.device_type = descriptor.device_type
+        # zigpy stores the raw value too, converting to the profile's enum lazily
+        endpoint.device_type = descriptor.device_type  # type: ignore[assignment]
 
         for cluster_id in descriptor.input_clusters:
             endpoint.add_input_cluster(cluster_id)
@@ -397,12 +429,14 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         # zigpy has already broadcast the migration to the network; this is the
         # coordinator's own move. The update id goes first so no beacon on the new
         # channel ever advertises the old network instance.
+        assert self._api is not None
         await self._api.request(
             "set_nwk_update_id", {"nwk_update_id": new_nwk_update_id}
         )
         await self._api.request("set_channel", {"channel": new_channel})
 
-    async def permit_ncp(self, time_s: int = 60):
+    async def permit_ncp(self, time_s: int = 60) -> None:
+        assert self._api is not None
         await self._api.request(
             "permit_joins",
             {
@@ -410,7 +444,10 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             },
         )
 
-    async def permit_with_link_key(self, node, link_key, time_s: int = 60):
+    async def permit_with_link_key(
+        self, node: t.EUI64, link_key: t.KeyData, time_s: int = 60
+    ) -> None:
+        assert self._api is not None
         await self._api.request(
             "set_provisional_key",
             {
@@ -430,6 +467,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
         all_results: dict[int, list[float]] = {}
 
+        assert self._api is not None
         for _ in range(count):
             result = await self._api.request(
                 "energy_scan",
@@ -447,7 +485,12 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             for channel in list(channels)
         }
 
-    async def write_network_info(self, *, network_info, node_info):
+    async def write_network_info(
+        self,
+        *,
+        network_info: zigpy.state.NetworkInfo,
+        node_info: zigpy.state.NodeInfo,
+    ) -> None:
         # A TCLK seed carried over from a microcontroller stack: ziggurat derives the
         # unique link keys the previous stack issued to devices from it. Both stacks
         # already store the seed as a plain hex string.
@@ -489,7 +532,10 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             ],
         }
 
-        if node_info.ieee == t.EUI64.UNKNOWN:
+        assert self._api is not None
+
+        # `UNKNOWN` is assigned after the class body, where mypy cannot see it
+        if node_info.ieee == t.EUI64.UNKNOWN:  # type: ignore[attr-defined]
             # zigpy leaves the IEEE address unspecified when forming a new network,
             # deferring to the radio's hardware address
             rsp = await self._api.request("get_hw_address", {})
@@ -508,13 +554,14 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             zigpy.backups.NetworkBackup(network_info=network_info, node_info=node_info)
         )
 
-    async def reset_network_info(self):
+    async def reset_network_info(self) -> None:
         pass
 
     async def _watchdog_feed(self) -> None:
+        assert self._api is not None
         await self._api.request("ping", {})
 
-    def packet_received(self, packet):
+    def packet_received(self, packet: t.ZigbeePacket) -> None:
         # ZDO requests addressed to the coordinator have to be answered here: there is
         # no firmware ZDO underneath Ziggurat, and zigpy itself only handles a subset
         # (NWK_addr_req, IEEE_addr_req, Match_Desc_req)
@@ -522,15 +569,18 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             packet.profile_id == 0x0000
             and packet.src_ep == 0
             and packet.dst_ep == 0
+            and packet.src is not None
             and packet.src.addr_mode == t.AddrMode.NWK
         ):
             self._maybe_handle_local_zdo_request(packet)
 
         super().packet_received(packet)
 
-    def _maybe_handle_local_zdo_request(self, packet):
+    def _maybe_handle_local_zdo_request(self, packet: t.ZigbeePacket) -> None:
+        assert packet.src is not None
+
         try:
-            device = self.get_device(nwk=packet.src.address)
+            device = self.get_device(nwk=t.NWK(packet.src.address))
         except KeyError:
             return
 
@@ -624,7 +674,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             DEVICE_JOIN_MAX_DELAY, join_if_still_unannounced
         )
 
-    def on_notification(self, event: str, data: dict):
+    def on_notification(self, event: str, data: dict[str, Any]) -> None:
         if event == "received_aps_command":
             if data.get("group") is not None:
                 dst = t.AddrModeAddress(
@@ -713,7 +763,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 )
             )
 
-    async def send_packet(self, packet):
+    async def send_packet(self, packet: t.ZigbeePacket) -> None:
         profile_id = 0x0000
 
         if packet.src_ep != 0 or packet.dst_ep != 0:
@@ -721,26 +771,30 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
         aps_encryption = t.TransmitOptions.APS_Encryption in packet.tx_options
 
-        if packet.dst.addr_mode == t.AddrMode.IEEE:
+        dst = packet.dst
+        assert dst is not None and dst.address is not None
+
+        if dst.addr_mode == t.AddrMode.IEEE:
             # The server resolves the EUI64 to a network address
-            addressing = {"destination_eui64": str(packet.dst.address)}
+            addressing = {"destination_eui64": str(dst.address)}
             delivery_mode = "unicast"
         else:
-            addressing = {"destination": packet.dst.address.serialize()[::-1].hex()}
+            addressing = {"destination": dst.address.serialize()[::-1].hex()}
             delivery_mode = {
                 t.AddrMode.NWK: "unicast",
                 t.AddrMode.Group: "multicast",
                 t.AddrMode.Broadcast: "broadcast",
-            }[packet.dst.addr_mode]
+            }[dst.addr_mode]
 
             if aps_encryption:
                 # The server selects the link key by EUI64
                 addressing["destination_eui64"] = str(
-                    self.get_device(nwk=packet.dst.address).ieee
+                    self.get_device(nwk=t.NWK(dst.address)).ieee
                 )
 
         # Resolves once the frame is on the air (EZSP `messageSent` parity); the
         # APS-ack delivery result arrives later and is logged by the API layer
+        assert self._api is not None
         await self._api.request(
             "send_aps",
             {

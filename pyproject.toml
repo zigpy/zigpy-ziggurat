@@ -25,6 +25,9 @@ ziggurat = "zigpy_ziggurat.zigbee.application:ControllerApplication"
 exclude = ["tests", "tests.*"]
 
 [project.optional-dependencies]
+dev = [
+    "mypy>=2.1.0",
+]
 testing = [
     "tomli",
     "coverage[toml]",
@@ -81,11 +84,12 @@ quiet-level = 2
 
 [tool.mypy]
 strict = true
-install_types = true
-non_interactive = true
 show_error_codes = true
 show_error_context = true
 error_summary = true
+# zigpy's integer and struct constructors are unannotated, making nearly every
+# zigpy type construction an "untyped call"
+disallow_untyped_calls = false
 
 [tool.coverage.run]
 source = ["zigpy_ziggurat"]
