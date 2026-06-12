@@ -4,7 +4,7 @@ import json
 import logging
 import math
 import statistics
-from typing import Any, Literal, overload
+from typing import Any, cast
 
 import aiohttp
 import zigpy.application
@@ -16,6 +16,29 @@ from zigpy.exceptions import DeliveryError, NetworkNotFormed
 import zigpy.state
 import zigpy.types as t
 import zigpy.zdo.types as zdo_t
+
+from zigpy_ziggurat.zigbee.commands import (
+    NOTIFICATIONS,
+    RESPONSE_T,
+    Configure,
+    DeviceJoined,
+    DeviceLeft,
+    EnergyScan,
+    FrameCounterUpdate,
+    GetHwAddress,
+    GetNetworkInfo,
+    KeyTableEntry,
+    LinkKeyUpdate,
+    Notification,
+    PermitJoins,
+    Ping,
+    ReceivedApsCommand,
+    Request,
+    SendAps,
+    SetChannel,
+    SetNwkUpdateId,
+    SetProvisionalKey,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -102,7 +125,7 @@ class ZigguratApi:
     def __init__(
         self,
         url: str,
-        on_notification: Callable[[str, dict[str, Any]], None],
+        on_notification: Callable[[Notification], None],
         on_disconnect: Callable[[BaseException | None], None],
     ) -> None:
         self._url = url
@@ -185,7 +208,7 @@ class ZigguratApi:
         msg_type = msg["type"]
 
         if msg_type == "notification":
-            self._on_notification(msg["event"], msg["data"])
+            self._on_notification(NOTIFICATIONS[msg["event"]].from_dict(msg["data"]))
         elif msg_type == "event":
             pending = self._pending.get(msg["id"])
 
@@ -209,29 +232,36 @@ class ZigguratApi:
             elif not pending.response.done():
                 pending.response.set_result(msg["result"])
 
-    @overload
-    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]: ...
+    async def request(self, command: Request[RESPONSE_T]) -> RESPONSE_T:
+        result = await self._send_request(command, want_transmitted=False)
+        assert result is not None
 
-    @overload
-    async def request(
-        self, method: str, params: dict[str, Any], *, resolve_on: Literal["transmitted"]
-    ) -> None: ...
+        # `response_type` is a plain ClassVar: it cannot carry the type variable
+        return cast(RESPONSE_T, command.response_type.from_dict(result))
 
-    async def request(
-        self, method: str, params: dict[str, Any], *, resolve_on: str = "response"
+    async def request_transmitted(self, command: Request[Any]) -> None:
+        """Resolve once the frame is on the air instead of waiting for delivery."""
+        await self._send_request(command, want_transmitted=True)
+
+    async def _send_request(
+        self, command: Request[Any], *, want_transmitted: bool
     ) -> dict[str, Any] | None:
         request_id = self._request_id
         self._request_id = (self._request_id + 1) % 2**32 or 1
 
-        pending = PendingRequest(want_transmitted=(resolve_on == "transmitted"))
+        pending = PendingRequest(want_transmitted=want_transmitted)
         self._pending[request_id] = pending
 
-        message = {"id": request_id, "method": method, "params": params}
+        message = {
+            "id": request_id,
+            "method": command.method,
+            "params": command.to_dict(),
+        }
         _LOGGER.debug("Sending: %r", message)
         assert self._websocket is not None
         await self._websocket.send_str(json.dumps(message))
 
-        if resolve_on == "transmitted":
+        if want_transmitted:
             # The terminal response continues in the background; an end-to-end
             # delivery failure after transmission is logged, not raised
             pending.response.add_done_callback(_make_late_failure_logger(pending))
@@ -337,7 +367,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         assert self._api is not None
 
         try:
-            info = await self._api.request("get_network_info", {})
+            info = await self._api.request(GetNetworkInfo())
         except DeliveryError as exc:
             if not str(exc).startswith("not_configured"):
                 raise
@@ -348,45 +378,41 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             return
 
         stack_specific = {}
-        if info["tclk_seed"] is not None:
-            if info["tclk_flavor"] == "zstack":
-                stack_specific = {"zstack": {"tclk_seed": info["tclk_seed"]}}
+        if info.tclk_seed is not None:
+            if info.tclk_flavor == "zstack":
+                stack_specific = {"zstack": {"tclk_seed": info.tclk_seed}}
             else:
-                stack_specific = {"ezsp": {"hashed_tclk": info["tclk_seed"]}}
+                stack_specific = {"ezsp": {"hashed_tclk": info.tclk_seed}}
 
         self.state.node_info = zigpy.state.NodeInfo(
-            nwk=t.NWK(int(info["nwk_address"], 16)),
-            ieee=t.EUI64.convert(info["ieee_address"]),
+            nwk=info.nwk_address,
+            ieee=info.ieee_address,
             logical_type=zdo_t.LogicalType.Coordinator,
             manufacturer="Ziggurat",
             model="Coordinator",
         )
         self.state.network_info = zigpy.state.NetworkInfo(
-            # `EUI64.convert` is typed without `Self`, losing the subclass
-            extended_pan_id=t.ExtendedPanId(t.EUI64.convert(info["extended_pan_id"])),
-            pan_id=t.PanId(int(info["pan_id"], 16)),
-            nwk_update_id=info["nwk_update_id"],
+            extended_pan_id=info.extended_pan_id,
+            pan_id=info.pan_id,
+            nwk_update_id=info.nwk_update_id,
             nwk_manager_id=t.NWK(0x0000),
-            channel=info["channel"],
-            tx_power=info["tx_power"],
+            channel=info.channel,
+            tx_power=info.tx_power,
             # zigpy mis-annotates the classmethod's `cls` as an instance
-            channel_mask=t.Channels.from_channel_list([info["channel"]]),  # type: ignore[misc]
+            channel_mask=t.Channels.from_channel_list([info.channel]),  # type: ignore[misc]
             security_level=t.uint8_t(5),
             network_key=zigpy.state.Key(
-                key=t.KeyData.convert(info["network_key"]),
-                seq=info["network_key_seq"],
-                tx_counter=info["network_key_tx_counter"],
+                key=info.network_key,
+                seq=info.network_key_seq,
+                tx_counter=info.network_key_tx_counter,
             ),
             tc_link_key=zigpy.state.Key(
-                key=t.KeyData.convert(info["tc_link_key"]),
+                key=info.tc_link_key,
                 partner_ieee=self.state.node_info.ieee,
             ),
             key_table=[
-                zigpy.state.Key(
-                    key=t.KeyData.convert(entry["key"]),
-                    partner_ieee=t.EUI64.convert(entry["partner_ieee"]),
-                )
-                for entry in info["key_table"]
+                zigpy.state.Key(key=entry.key, partner_ieee=entry.partner_ieee)
+                for entry in info.key_table
             ],
             stack_specific=stack_specific,
         )
@@ -430,31 +456,18 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         # coordinator's own move. The update id goes first so no beacon on the new
         # channel ever advertises the old network instance.
         assert self._api is not None
-        await self._api.request(
-            "set_nwk_update_id", {"nwk_update_id": new_nwk_update_id}
-        )
-        await self._api.request("set_channel", {"channel": new_channel})
+        await self._api.request(SetNwkUpdateId(nwk_update_id=new_nwk_update_id))
+        await self._api.request(SetChannel(channel=new_channel))
 
     async def permit_ncp(self, time_s: int = 60) -> None:
         assert self._api is not None
-        await self._api.request(
-            "permit_joins",
-            {
-                "duration": time_s,
-            },
-        )
+        await self._api.request(PermitJoins(duration=time_s))
 
     async def permit_with_link_key(
         self, node: t.EUI64, link_key: t.KeyData, time_s: int = 60
     ) -> None:
         assert self._api is not None
-        await self._api.request(
-            "set_provisional_key",
-            {
-                "ieee": str(node),
-                "key": str(link_key),
-            },
-        )
+        await self._api.request(SetProvisionalKey(ieee=node, key=link_key))
 
         await super().permit(time_s)
 
@@ -470,15 +483,14 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         assert self._api is not None
         for _ in range(count):
             result = await self._api.request(
-                "energy_scan",
-                {
-                    "channels": list(channels),
-                    "duration_per_channel_ms": duration_per_channel_ms,
-                },
+                EnergyScan(
+                    channels=list(channels),
+                    duration_per_channel_ms=duration_per_channel_ms,
+                )
             )
 
-            for channel, rssi in result["results"].items():
-                all_results.setdefault(int(channel), []).append(rssi)
+            for channel, rssi in result.results.items():
+                all_results.setdefault(channel, []).append(rssi)
 
         return {
             channel: map_rssi_to_energy(statistics.mean(all_results[channel]))
@@ -495,42 +507,15 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         # unique link keys the previous stack issued to devices from it. Both stacks
         # already store the seed as a plain hex string.
         stack_specific = network_info.stack_specific
-        tclk = {}
+        tclk_seed = None
+        tclk_flavor = None
 
         if "zstack" in stack_specific and "tclk_seed" in stack_specific["zstack"]:
-            tclk = {
-                "tclk_seed": stack_specific["zstack"]["tclk_seed"],
-                "tclk_flavor": "zstack",
-            }
+            tclk_seed = stack_specific["zstack"]["tclk_seed"]
+            tclk_flavor = "zstack"
         elif "ezsp" in stack_specific and "hashed_tclk" in stack_specific["ezsp"]:
-            tclk = {
-                "tclk_seed": stack_specific["ezsp"]["hashed_tclk"],
-                "tclk_flavor": "ezsp",
-            }
-
-        params = {
-            **tclk,
-            "channel": network_info.channel,
-            # None means "pick automatically": the server applies its safe default
-            "tx_power": network_info.tx_power,
-            "nwk_update_id": network_info.nwk_update_id,
-            "pan_id": t.PanId(network_info.pan_id).serialize()[::-1].hex(),
-            "extended_pan_id": str(network_info.extended_pan_id),
-            "nwk_address": t.NWK(node_info.nwk).serialize()[::-1].hex(),
-            "network_key": str(network_info.network_key.key),
-            "network_key_seq": network_info.network_key.seq,
-            "source_routing": self.config[zigpy.config.CONF_SOURCE_ROUTING],
-            "network_key_tx_counter": network_info.network_key.tx_counter,
-            "tc_link_key": str(network_info.tc_link_key.key),
-            # Unique trust center link keys negotiated in earlier sessions
-            "key_table": [
-                {
-                    "partner_ieee": str(key.partner_ieee),
-                    "key": str(key.key),
-                }
-                for key in network_info.key_table
-            ],
-        }
+            tclk_seed = stack_specific["ezsp"]["hashed_tclk"]
+            tclk_flavor = "ezsp"
 
         assert self._api is not None
 
@@ -538,11 +523,32 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         if node_info.ieee == t.EUI64.UNKNOWN:  # type: ignore[attr-defined]
             # zigpy leaves the IEEE address unspecified when forming a new network,
             # deferring to the radio's hardware address
-            rsp = await self._api.request("get_hw_address", {})
-            node_info = node_info.replace(ieee=t.EUI64.convert(rsp["ieee_address"]))
+            rsp = await self._api.request(GetHwAddress())
+            node_info = node_info.replace(ieee=rsp.ieee_address)
 
         await self._api.request(
-            "configure", {**params, "ieee_address": str(node_info.ieee)}
+            Configure(
+                channel=network_info.channel,
+                # None means "pick automatically": the server applies its safe default
+                tx_power=network_info.tx_power,
+                nwk_update_id=network_info.nwk_update_id,
+                pan_id=network_info.pan_id,
+                extended_pan_id=network_info.extended_pan_id,
+                nwk_address=node_info.nwk,
+                ieee_address=node_info.ieee,
+                network_key=network_info.network_key.key,
+                network_key_seq=network_info.network_key.seq,
+                network_key_tx_counter=network_info.network_key.tx_counter,
+                tc_link_key=network_info.tc_link_key.key,
+                source_routing=self.config[zigpy.config.CONF_SOURCE_ROUTING],
+                # Unique trust center link keys negotiated in earlier sessions
+                key_table=[
+                    KeyTableEntry(partner_ieee=key.partner_ieee, key=key.key)
+                    for key in network_info.key_table
+                ],
+                tclk_seed=tclk_seed,
+                tclk_flavor=tclk_flavor,
+            )
         )
 
         # Ziggurat has no persistent storage of its own: zigpy's backup database is
@@ -559,7 +565,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
     async def _watchdog_feed(self) -> None:
         assert self._api is not None
-        await self._api.request("ping", {})
+        await self._api.request(Ping())
 
     def packet_received(self, packet: t.ZigbeePacket) -> None:
         # ZDO requests addressed to the coordinator have to be answered here: there is
@@ -674,94 +680,89 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             DEVICE_JOIN_MAX_DELAY, join_if_still_unannounced
         )
 
-    def on_notification(self, event: str, data: dict[str, Any]) -> None:
-        if event == "received_aps_command":
-            if data.get("group") is not None:
-                dst = t.AddrModeAddress(
-                    addr_mode=t.AddrMode.Group,
-                    address=t.Group(data["group"]),
+    def on_notification(self, notification: Notification) -> None:
+        match notification:
+            case ReceivedApsCommand():
+                self._handle_received_aps_command(notification)
+            case FrameCounterUpdate():
+                self.state.network_info.network_key.tx_counter = (
+                    notification.frame_counter
                 )
-            else:
-                dst_nwk, _ = t.NWK.deserialize(bytes.fromhex(data["destination"]))
-
-                if dst_nwk >= 0xFFF8:
-                    dst = t.AddrModeAddress(
-                        addr_mode=t.AddrMode.Broadcast,
-                        address=t.BroadcastAddress(dst_nwk),
+                _LOGGER.debug(
+                    "Frame counter updated to %d",
+                    self.state.network_info.network_key.tx_counter,
+                )
+                self.backups.add_backup(
+                    zigpy.backups.NetworkBackup(
+                        network_info=self.state.network_info,
+                        node_info=self.state.node_info,
                     )
+                )
+            case DeviceJoined():
+                self._handle_device_joined(
+                    notification.nwk, notification.ieee, notification.parent
+                )
+            case DeviceLeft():
+                if notification.ieee is not None:
+                    ieee = notification.ieee
                 else:
-                    dst = t.AddrModeAddress(
-                        addr_mode=t.AddrMode.NWK,
-                        address=dst_nwk,
+                    try:
+                        ieee = self.get_device(nwk=notification.nwk).ieee
+                    except KeyError:
+                        return
+
+                self.handle_leave(nwk=notification.nwk, ieee=ieee)
+            case LinkKeyUpdate():
+                key = zigpy.state.Key(
+                    key=notification.key,
+                    partner_ieee=notification.ieee,
+                )
+                _LOGGER.debug("Link key updated for %s", key.partner_ieee)
+
+                self.state.network_info.key_table = [
+                    k
+                    for k in self.state.network_info.key_table
+                    if k.partner_ieee != key.partner_ieee
+                ] + [key]
+                self.backups.add_backup(
+                    zigpy.backups.NetworkBackup(
+                        network_info=self.state.network_info,
+                        node_info=self.state.node_info,
                     )
-
-            packet = t.ZigbeePacket(
-                src=t.AddrModeAddress(
-                    addr_mode=t.AddrMode.NWK,
-                    address=t.NWK.deserialize(bytes.fromhex(data["source"]))[0],
-                ),
-                dst=dst,
-                src_ep=data["src_ep"],
-                dst_ep=data["dst_ep"],
-                profile_id=data["profile_id"],
-                cluster_id=data["cluster_id"],
-                lqi=data["lqi"],
-                rssi=data["rssi"],
-                data=t.SerializableBytes(bytes.fromhex(data["data"])),
-            )
-            self.packet_received(packet)
-        elif event == "frame_counter_update":
-            self.state.network_info.network_key.tx_counter = data["frame_counter"]
-            _LOGGER.debug(
-                "Frame counter updated to %d",
-                self.state.network_info.network_key.tx_counter,
-            )
-            self.backups.add_backup(
-                zigpy.backups.NetworkBackup(
-                    network_info=self.state.network_info,
-                    node_info=self.state.node_info,
                 )
-            )
-        elif event == "device_joined":
-            nwk, _ = t.NWK.deserialize(bytes.fromhex(data["nwk"]))
-            ieee = t.EUI64.convert(data["ieee"])
-            parent_nwk, _ = t.NWK.deserialize(bytes.fromhex(data["parent"]))
-            self._handle_device_joined(nwk, ieee, parent_nwk)
-        elif event == "device_left":
-            nwk, _ = t.NWK.deserialize(bytes.fromhex(data["nwk"]))
 
-            if data["ieee"] is not None:
-                ieee = t.EUI64.convert(data["ieee"])
-            else:
-                try:
-                    ieee = self.get_device(nwk=nwk).ieee
-                except KeyError:
-                    return
-
-            self.handle_leave(nwk=nwk, ieee=ieee)
-        elif event == "link_key_update":
-            key = zigpy.state.Key.from_dict(
-                {
-                    "key": data["key"],
-                    "tx_counter": 0,
-                    "rx_counter": 0,
-                    "seq": 0,
-                    "partner_ieee": data["ieee"],
-                }
+    def _handle_received_aps_command(self, command: ReceivedApsCommand) -> None:
+        if command.group is not None:
+            dst = t.AddrModeAddress(
+                addr_mode=t.AddrMode.Group,
+                address=t.Group(command.group),
             )
-            _LOGGER.debug("Link key updated for %s", key.partner_ieee)
-
-            self.state.network_info.key_table = [
-                k
-                for k in self.state.network_info.key_table
-                if k.partner_ieee != key.partner_ieee
-            ] + [key]
-            self.backups.add_backup(
-                zigpy.backups.NetworkBackup(
-                    network_info=self.state.network_info,
-                    node_info=self.state.node_info,
-                )
+        elif command.destination >= 0xFFF8:
+            dst = t.AddrModeAddress(
+                addr_mode=t.AddrMode.Broadcast,
+                address=t.BroadcastAddress(command.destination),
             )
+        else:
+            dst = t.AddrModeAddress(
+                addr_mode=t.AddrMode.NWK,
+                address=command.destination,
+            )
+
+        packet = t.ZigbeePacket(
+            src=t.AddrModeAddress(
+                addr_mode=t.AddrMode.NWK,
+                address=command.source,
+            ),
+            dst=dst,
+            src_ep=command.src_ep,
+            dst_ep=command.dst_ep,
+            profile_id=command.profile_id,
+            cluster_id=command.cluster_id,
+            lqi=command.lqi,
+            rssi=command.rssi,
+            data=t.SerializableBytes(command.data),
+        )
+        self.packet_received(packet)
 
     async def send_packet(self, packet: t.ZigbeePacket) -> None:
         profile_id = 0x0000
@@ -774,12 +775,15 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         dst = packet.dst
         assert dst is not None and dst.address is not None
 
+        destination: t.NWK | None = None
+        destination_eui64: t.EUI64 | None = None
+
         if dst.addr_mode == t.AddrMode.IEEE:
             # The server resolves the EUI64 to a network address
-            addressing = {"destination_eui64": str(dst.address)}
+            destination_eui64 = cast(t.EUI64, dst.address)
             delivery_mode = "unicast"
         else:
-            addressing = {"destination": dst.address.serialize()[::-1].hex()}
+            destination = t.NWK(dst.address)
             delivery_mode = {
                 t.AddrMode.NWK: "unicast",
                 t.AddrMode.Group: "multicast",
@@ -788,27 +792,24 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
             if aps_encryption:
                 # The server selects the link key by EUI64
-                addressing["destination_eui64"] = str(
-                    self.get_device(nwk=t.NWK(dst.address)).ieee
-                )
+                destination_eui64 = self.get_device(nwk=destination).ieee
 
         # Resolves once the frame is on the air (EZSP `messageSent` parity); the
         # APS-ack delivery result arrives later and is logged by the API layer
         assert self._api is not None
-        await self._api.request(
-            "send_aps",
-            {
-                "delivery_mode": delivery_mode,
-                **addressing,
-                "profile_id": profile_id,
-                "cluster_id": packet.cluster_id or 0x0000,
-                "src_ep": packet.src_ep,
-                "dst_ep": packet.dst_ep or 0,
-                "aps_ack": t.TransmitOptions.ACK in packet.tx_options,
-                "aps_encryption": aps_encryption,
-                "radius": packet.radius or 30,
-                "aps_seq": packet.tsn,
-                "data": packet.data.serialize().hex(),
-            },
-            resolve_on="transmitted",
+        await self._api.request_transmitted(
+            SendAps(
+                delivery_mode=delivery_mode,
+                destination_eui64=destination_eui64,
+                destination=destination,
+                profile_id=profile_id,
+                cluster_id=packet.cluster_id or 0x0000,
+                src_ep=packet.src_ep or 0,
+                dst_ep=packet.dst_ep or 0,
+                aps_ack=t.TransmitOptions.ACK in packet.tx_options,
+                aps_encryption=aps_encryption,
+                radius=packet.radius or 30,
+                aps_seq=packet.tsn,
+                data=packet.data.serialize(),
+            )
         )
