@@ -330,6 +330,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             nwk_update_id=info["nwk_update_id"],
             nwk_manager_id=t.NWK(0x0000),
             channel=info["channel"],
+            tx_power=info["tx_power"],
             channel_mask=t.Channels.from_channel_list([info["channel"]]),
             security_level=5,
             network_key=zigpy.state.Key(
@@ -459,6 +460,8 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         params = {
             **tclk,
             "channel": network_info.channel,
+            # None means "pick automatically": the server applies its safe default
+            "tx_power": network_info.tx_power,
             "nwk_update_id": network_info.nwk_update_id,
             "pan_id": t.PanId(network_info.pan_id).serialize()[::-1].hex(),
             "extended_pan_id": str(network_info.extended_pan_id),
