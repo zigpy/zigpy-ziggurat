@@ -328,7 +328,11 @@ async def test_energy_scan(
             t.TransmitOptions.NONE,
             0,
             0,
-            {"delivery_mode": "unicast", "profile_id": 0x0000, "aps_ack": False},
+            {
+                "delivery_mode": "unicast",
+                "profile_id": 0x0104,
+                "aps_ack": False,
+            },
         ),
         (
             t.AddrModeAddress(addr_mode=t.AddrMode.IEEE, address=DEVICE_IEEE),
@@ -346,7 +350,10 @@ async def test_energy_scan(
             t.TransmitOptions.NONE,
             1,
             255,
-            {"delivery_mode": "multicast", "destination": t.NWK(0x0002)},
+            {
+                "delivery_mode": "multicast",
+                "destination": t.NWK(0x0002),
+            },
         ),
         (
             t.AddrModeAddress(
@@ -356,7 +363,10 @@ async def test_energy_scan(
             t.TransmitOptions.NONE,
             1,
             255,
-            {"delivery_mode": "broadcast", "destination": t.NWK(0xFFFC)},
+            {
+                "delivery_mode": "broadcast",
+                "destination": t.NWK(0xFFFC),
+            },
         ),
         (
             t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=DEVICE_NWK),
