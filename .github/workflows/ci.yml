@@ -1,0 +1,13 @@
+name: CI
+
+on:
+  push:
+  pull_request: ~
+
+jobs:
+  shared-ci:
+    uses: zigpy/workflows/.github/workflows/ci.yml@main
+    with:
+      CODE_FOLDER: zigpy_ziggurat
+      CACHE_VERSION: 2
+      MINIMUM_COVERAGE_PERCENTAGE: 100

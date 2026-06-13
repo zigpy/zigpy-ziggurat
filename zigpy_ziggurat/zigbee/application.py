@@ -190,7 +190,9 @@ class ZigguratApi:
             # A deliberate `disconnect()`, not a connection loss
             self._fail_pending(ConnectionError("Connection closed"))
             raise
-        except Exception as e:
+        except Exception as e:  # pragma: no cover
+            # aiohttp surfaces connection failures as `ERROR` messages or by ending
+            # the iterator, never by raising; kept as a guard for other versions
             exc = e
 
         self._fail_pending(ConnectionError("Connection lost"))
