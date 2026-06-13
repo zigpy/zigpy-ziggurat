@@ -11,3 +11,5 @@ jobs:
       CODE_FOLDER: zigpy_ziggurat
       CACHE_VERSION: 2
       MINIMUM_COVERAGE_PERCENTAGE: 100
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
