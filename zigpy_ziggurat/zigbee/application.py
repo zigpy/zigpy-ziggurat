@@ -92,7 +92,7 @@ class PendingRequest:
 
 
 def _make_late_failure_logger(
-    pending: "PendingRequest",
+    pending: PendingRequest,
 ) -> Callable[[asyncio.Future[dict[str, Any]]], None]:
     """Consume the terminal result of a request that already resolved at the
     `transmitted` stage, so delivery failures are visible but not raised. Failures
@@ -767,11 +767,6 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         self.packet_received(packet)
 
     async def send_packet(self, packet: t.ZigbeePacket) -> None:
-        profile_id = 0x0000
-
-        if packet.src_ep != 0 or packet.dst_ep != 0:
-            profile_id = 0x0104
-
         aps_encryption = t.TransmitOptions.APS_Encryption in packet.tx_options
 
         dst = packet.dst
@@ -804,7 +799,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 delivery_mode=delivery_mode,
                 destination_eui64=destination_eui64,
                 destination=destination,
-                profile_id=profile_id,
+                profile_id=packet.profile_id,
                 cluster_id=packet.cluster_id or 0x0000,
                 src_ep=packet.src_ep or 0,
                 dst_ep=packet.dst_ep or 0,
