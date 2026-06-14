@@ -22,8 +22,9 @@ SEND_APS = commands.SendAps(
     aps_ack=True,
     aps_seq=55,
     radius=30,
-    data=b"\x01\x02",
     aps_encryption=False,
+    priority=0,
+    data=b"\x01\x02",
 )
 
 

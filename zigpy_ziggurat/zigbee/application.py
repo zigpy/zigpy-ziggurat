@@ -807,6 +807,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 aps_encryption=aps_encryption,
                 radius=packet.radius or 30,
                 aps_seq=packet.tsn,
+                priority=packet.priority if packet.priority is not None else 0,
                 data=packet.data.serialize(),
             )
         )

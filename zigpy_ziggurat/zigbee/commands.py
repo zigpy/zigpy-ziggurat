@@ -219,8 +219,9 @@ class SendAps(Request[Status]):
     aps_ack: bool
     aps_seq: int
     radius: int
-    data: bytes
     aps_encryption: bool
+    priority: int
+    data: bytes
 
 
 @dataclass
