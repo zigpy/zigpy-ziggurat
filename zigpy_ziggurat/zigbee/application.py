@@ -20,6 +20,7 @@ import zigpy.zdo.types as zdo_t
 from zigpy_ziggurat.zigbee.commands import (
     NOTIFICATIONS,
     RESPONSE_T,
+    ApsDecryptionFailure,
     Configure,
     DeviceJoined,
     DeviceLeft,
@@ -731,6 +732,13 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                         network_info=self.state.network_info,
                         node_info=self.state.node_info,
                     )
+                )
+            case ApsDecryptionFailure():
+                _LOGGER.warning(
+                    "Could not decrypt an APS command from %s (%s): its trust center "
+                    "link key is wrong or missing.",
+                    notification.source_ieee,
+                    notification.source,
                 )
 
     def _handle_received_aps_command(self, command: ReceivedApsCommand) -> None:

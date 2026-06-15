@@ -315,10 +315,22 @@ class DeviceLeft(Notification):
     ieee: t.EUI64 | None
 
 
+@dataclass
+class ApsDecryptionFailure(Notification):
+    # An APS command frame from this device could not be decrypted with any key the
+    # server holds. Its link key is almost certainly wrong or missing, which also
+    # blocks joins routed through it (the trust center can't read its Update-Device).
+    source: t.NWK
+    source_ieee: t.EUI64
+    frame_counter: t.uint32_t
+    key_id: str
+
+
 NOTIFICATIONS: dict[str, type[Notification]] = {
     "received_aps_command": ReceivedApsCommand,
     "frame_counter_update": FrameCounterUpdate,
     "link_key_update": LinkKeyUpdate,
     "device_joined": DeviceJoined,
     "device_left": DeviceLeft,
+    "aps_decryption_failure": ApsDecryptionFailure,
 }
