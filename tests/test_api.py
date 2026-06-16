@@ -9,7 +9,7 @@ import zigpy.types as t
 
 from tests.common import RpcError, SyntheticZiggurat, server
 from zigpy_ziggurat.zigbee import commands
-from zigpy_ziggurat.zigbee.application import ZigguratApi
+from zigpy_ziggurat.zigbee.application import WebSocketTransport, ZigguratApi
 
 SEND_APS = commands.SendAps(
     delivery_mode="unicast",
@@ -34,7 +34,11 @@ class RecordingApi(ZigguratApi):
     def __init__(self, url: str) -> None:
         self.notifications: list[commands.Notification] = []
         self.disconnects: list[BaseException | None] = []
-        super().__init__(url, self.notifications.append, self.disconnects.append)
+        super().__init__(
+            WebSocketTransport(url),
+            self.notifications.append,
+            self.disconnects.append,
+        )
 
 
 @pytest.fixture
