@@ -122,12 +122,22 @@ class Status(Response):
 
 
 RESPONSE_T = TypeVar("RESPONSE_T", bound=Response)
+EVENT_T = TypeVar("EVENT_T", bound=Response)
 
 
 @dataclass
 class Request(WireModel, Generic[RESPONSE_T]):
     method: ClassVar[str]
     response_type: ClassVar[type[Response]]
+
+
+@dataclass
+class StreamingRequest(Request[RESPONSE_T], Generic[RESPONSE_T, EVENT_T]):
+    """A request answered by a stream of `event_name` events (each an `event_type`)
+    before the terminal `response_type`."""
+
+    event_type: ClassVar[type[Response]]
+    event_name: ClassVar[str]
 
 
 @dataclass
@@ -226,14 +236,46 @@ class SendAps(Request[Status]):
 
 
 @dataclass
-class EnergyScanResults(Response):
-    results: dict[int, float]
+class EnergyScanResult(Response):
+    channel: t.uint8_t
+    rssi: t.int8s
 
 
 @dataclass
-class EnergyScan(Request[EnergyScanResults]):
+class EnergyScan(StreamingRequest[Status, EnergyScanResult]):
     method = "energy_scan"
-    response_type = EnergyScanResults
+    response_type = Status
+    event_type = EnergyScanResult
+    event_name = "energy_result"
+
+    channels: list[int]
+    duration_per_channel_ms: int
+
+
+@dataclass
+class NetworkBeaconEvent(Response):
+    channel: t.uint8_t
+    # Absent when the beacon's MAC source was not a short address
+    source: t.NWK | None
+    pan_id: t.PanId
+    extended_pan_id: t.ExtendedPanId
+    permit_joining: bool
+    stack_profile: t.uint8_t
+    protocol_version: t.uint8_t
+    router_capacity: bool
+    end_device_capacity: bool
+    device_depth: t.uint8_t
+    update_id: t.uint8_t
+    lqi: t.uint8_t
+    rssi: t.int8s
+
+
+@dataclass
+class NetworkScan(StreamingRequest[Status, NetworkBeaconEvent]):
+    method = "network_scan"
+    response_type = Status
+    event_type = NetworkBeaconEvent
+    event_name = "network_found"
 
     channels: list[int]
     duration_per_channel_ms: int

@@ -17,9 +17,21 @@ import zigpy.types as t
 from zigpy_ziggurat.zigbee import commands
 from zigpy_ziggurat.zigbee.application import ControllerApplication
 
-REQUEST_TYPES: dict[str, type[commands.Request[Any]]] = {
-    cls.method: cls for cls in commands.Request.__subclasses__()
-}
+
+def _request_types() -> dict[str, type[commands.Request[Any]]]:
+    """Every concrete request, walking past intermediate bases like
+    `StreamingRequest` that declare `method` without assigning it."""
+    result: dict[str, type[commands.Request[Any]]] = {}
+    stack = list(commands.Request.__subclasses__())
+    while stack:
+        cls = stack.pop()
+        stack.extend(cls.__subclasses__())
+        if "method" in cls.__dict__:
+            result[cls.method] = cls
+    return result
+
+
+REQUEST_TYPES: dict[str, type[commands.Request[Any]]] = _request_types()
 NOTIFICATION_EVENTS: dict[type[commands.Notification], str] = {
     cls: name for name, cls in commands.NOTIFICATIONS.items()
 }
@@ -77,6 +89,7 @@ class SyntheticZiggurat:
             "get_hw_address": self.on_get_hw_address,
             "send_aps": self.on_send_aps,
             "energy_scan": self.on_energy_scan,
+            "network_scan": self.on_network_scan,
             "permit_joins": self.on_status,
             "set_provisional_key": self.on_status,
             "set_channel": self.on_status,
@@ -139,6 +152,13 @@ class SyntheticZiggurat:
     async def send_event(self, request_id: int, event: str) -> None:
         await self.ws.send_json({"type": "event", "id": request_id, "event": event})
 
+    async def send_event_data(
+        self, request_id: int, event: str, data: dict[str, Any]
+    ) -> None:
+        await self.ws.send_json(
+            {"type": "event", "id": request_id, "event": event, "data": data}
+        )
+
     async def send_notification(self, notification: commands.Notification) -> None:
         await self.ws.send_json(
             {
@@ -193,10 +213,21 @@ class SyntheticZiggurat:
 
     async def on_energy_scan(
         self, command: commands.EnergyScan, request_id: int
-    ) -> commands.EnergyScanResults:
-        return commands.EnergyScanResults(
-            results={channel: -85.0 for channel in command.channels}
-        )
+    ) -> commands.Status:
+        for channel in command.channels:
+            await self.send_event_data(
+                request_id,
+                "energy_result",
+                commands.EnergyScanResult(
+                    channel=t.uint8_t(channel), rssi=t.int8s(-85)
+                ).to_dict(),
+            )
+        return commands.Status(status="complete")
+
+    async def on_network_scan(
+        self, command: commands.NetworkScan, request_id: int
+    ) -> commands.Status:
+        return commands.Status(status="complete")
 
 
 def make_app_config(url: str) -> dict[str, Any]:

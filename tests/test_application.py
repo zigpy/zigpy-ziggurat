@@ -294,15 +294,19 @@ async def test_permit_with_link_key(
 async def test_energy_scan(
     app: ControllerApplication, server: SyntheticZiggurat
 ) -> None:
-    rssis = iter([-90.0, -80.0, -70.0])
+    rssis = iter([-90, -80, -70])
 
-    async def scan(
-        command: commands.EnergyScan, request_id: int
-    ) -> commands.EnergyScanResults:
+    async def scan(command: commands.EnergyScan, request_id: int) -> commands.Status:
         rssi = next(rssis)
-        return commands.EnergyScanResults(
-            results={channel: rssi for channel in command.channels}
-        )
+        for channel in command.channels:
+            await server.send_event_data(
+                request_id,
+                "energy_result",
+                commands.EnergyScanResult(
+                    channel=t.uint8_t(channel), rssi=t.int8s(rssi)
+                ).to_dict(),
+            )
+        return commands.Status(status="complete")
 
     server.handlers["energy_scan"] = scan
 
@@ -325,6 +329,99 @@ async def test_energy_scan(
         15: pytest.approx(map_rssi_to_energy(-80.0)),
     }
     assert 0 < energies[11] < 255
+
+
+async def test_network_scan(
+    app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    beacons = [
+        commands.NetworkBeaconEvent(
+            channel=t.uint8_t(11),
+            source=t.NWK(0x0000),
+            pan_id=t.PanId(0x1A2B),
+            extended_pan_id=t.ExtendedPanId(t.EUI64.convert("aa:bb:cc:dd:ee:ff:00:11")),
+            permit_joining=True,
+            stack_profile=t.uint8_t(2),
+            protocol_version=t.uint8_t(2),
+            router_capacity=True,
+            end_device_capacity=True,
+            device_depth=t.uint8_t(0),
+            update_id=t.uint8_t(0),
+            lqi=t.uint8_t(200),
+            rssi=t.int8s(-60),
+        ),
+        # A beacon whose MAC source was not a short address
+        commands.NetworkBeaconEvent(
+            channel=t.uint8_t(15),
+            source=None,
+            pan_id=t.PanId(0x4C5D),
+            extended_pan_id=t.ExtendedPanId(t.EUI64.convert("01:02:03:04:05:06:07:08")),
+            permit_joining=False,
+            stack_profile=t.uint8_t(2),
+            protocol_version=t.uint8_t(2),
+            router_capacity=False,
+            end_device_capacity=False,
+            device_depth=t.uint8_t(2),
+            update_id=t.uint8_t(1),
+            lqi=t.uint8_t(120),
+            rssi=t.int8s(-80),
+        ),
+    ]
+
+    async def scan(command: commands.NetworkScan, request_id: int) -> commands.Status:
+        for beacon in beacons:
+            await server.send_event_data(request_id, "network_found", beacon.to_dict())
+        return commands.Status(status="complete")
+
+    server.handlers["network_scan"] = scan
+
+    found = [
+        beacon
+        async for beacon in app.network_scan(
+            # zigpy mis-annotates the classmethod's `cls` as an instance
+            channels=t.Channels.from_channel_list([11, 15]),  # type: ignore[misc]
+            duration_exp=2,
+        )
+    ]
+
+    scans = server.sent(commands.NetworkScan)
+    assert len(scans) == 1
+    assert scans[0].channels == [11, 15]
+    # 0.016 ms/symbol * 960 symbols * (2**2 + 1)
+    assert scans[0].duration_per_channel_ms == 77
+
+    assert found == [
+        t.NetworkBeacon(
+            pan_id=t.PanId(0x1A2B),
+            extended_pan_id=t.ExtendedPanId(t.EUI64.convert("aa:bb:cc:dd:ee:ff:00:11")),
+            channel=t.uint8_t(11),
+            permit_joining=True,
+            stack_profile=t.uint8_t(2),
+            nwk_update_id=t.uint8_t(0),
+            lqi=t.uint8_t(200),
+            src=t.NWK(0x0000),
+            rssi=t.int8s(-60),
+            depth=t.uint8_t(0),
+            router_capacity=True,
+            device_capacity=True,
+            protocol_version=t.uint8_t(2),
+        ),
+        t.NetworkBeacon(
+            pan_id=t.PanId(0x4C5D),
+            extended_pan_id=t.ExtendedPanId(t.EUI64.convert("01:02:03:04:05:06:07:08")),
+            channel=t.uint8_t(15),
+            permit_joining=False,
+            stack_profile=t.uint8_t(2),
+            nwk_update_id=t.uint8_t(1),
+            lqi=t.uint8_t(120),
+            src=None,
+            rssi=t.int8s(-80),
+            depth=t.uint8_t(2),
+            router_capacity=False,
+            device_capacity=False,
+            protocol_version=t.uint8_t(2),
+        ),
+    ]
 
 
 @pytest.mark.parametrize(

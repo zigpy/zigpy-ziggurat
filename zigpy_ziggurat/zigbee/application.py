@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Callable
 import json
 import logging
 import math
@@ -18,6 +18,7 @@ import zigpy.types as t
 import zigpy.zdo.types as zdo_t
 
 from zigpy_ziggurat.zigbee.commands import (
+    EVENT_T,
     NOTIFICATIONS,
     RESPONSE_T,
     ApsDecryptionFailure,
@@ -30,6 +31,7 @@ from zigpy_ziggurat.zigbee.commands import (
     GetNetworkInfo,
     KeyTableEntry,
     LinkKeyUpdate,
+    NetworkScan,
     Notification,
     PermitJoins,
     Ping,
@@ -39,6 +41,7 @@ from zigpy_ziggurat.zigbee.commands import (
     SetChannel,
     SetNwkUpdateId,
     SetProvisionalKey,
+    StreamingRequest,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -77,11 +80,19 @@ class PendingRequest:
     """The in-flight state of one request: an optional `transmitted` stage future and
     the terminal `response` future."""
 
-    def __init__(self, *, want_transmitted: bool) -> None:
+    def __init__(
+        self, *, want_transmitted: bool, stream_event: str | None = None
+    ) -> None:
         loop = asyncio.get_running_loop()
         self.response: asyncio.Future[dict[str, Any]] = loop.create_future()
         self.transmitted: asyncio.Future[None] | None = (
             loop.create_future() if want_transmitted else None
+        )
+        # For a streaming request: the event name carrying results, and a queue those
+        # results land in. `None` enqueued by the terminal response marks the end.
+        self.stream_event = stream_event
+        self.events: asyncio.Queue[dict[str, Any] | None] | None = (
+            asyncio.Queue() if stream_event is not None else None
         )
 
     def fail(self, exc: BaseException) -> None:
@@ -215,13 +226,16 @@ class ZigguratApi:
         elif msg_type == "event":
             pending = self._pending.get(msg["id"])
 
-            if (
-                pending is not None
-                and msg["event"] == "transmitted"
+            if pending is None:
+                pass
+            elif (
+                msg["event"] == "transmitted"
                 and pending.transmitted is not None
                 and not pending.transmitted.done()
             ):
                 pending.transmitted.set_result(None)
+            elif pending.events is not None and msg["event"] == pending.stream_event:
+                pending.events.put_nowait(msg["data"])
         elif msg_type == "response":
             pending = self._pending.pop(msg["id"], None)
 
@@ -273,6 +287,45 @@ class ZigguratApi:
             return None
 
         return await pending.response
+
+    async def request_stream(
+        self, command: StreamingRequest[Any, EVENT_T]
+    ) -> AsyncGenerator[EVENT_T, None]:
+        """Issue a request that streams `event_type` results until its terminal
+        response, yielding each result. An error response (or a disconnect) raised once
+        the stream is exhausted."""
+        request_id = self._request_id
+        self._request_id = (self._request_id + 1) % 2**32 or 1
+
+        pending = PendingRequest(
+            want_transmitted=False, stream_event=command.event_name
+        )
+        self._pending[request_id] = pending
+
+        message = {
+            "id": request_id,
+            "method": command.method,
+            "params": command.to_dict(),
+        }
+        _LOGGER.debug("Sending: %r", message)
+        assert self._websocket is not None
+        await self._websocket.send_str(json.dumps(message))
+
+        assert pending.events is not None
+        events = pending.events
+
+        # The terminal response (success, error, or disconnect) ends the stream. Results
+        # are enqueued ahead of it in receive order, so the queue drains fully first.
+        pending.response.add_done_callback(lambda _: events.put_nowait(None))
+
+        try:
+            while (item := await events.get()) is not None:
+                yield cast(EVENT_T, command.event_type.from_dict(item))
+
+            # Surface an error response or disconnect; a success carries only a status
+            await pending.response
+        finally:
+            self._pending.pop(request_id, None)
 
 
 class ZigguratCoordinator(zigpy.device.Device):
@@ -502,20 +555,48 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
         assert self._api is not None
         for _ in range(count):
-            result = await self._api.request(
+            async for result in self._api.request_stream(
                 EnergyScan(
                     channels=list(channels),
                     duration_per_channel_ms=duration_per_channel_ms,
                 )
-            )
-
-            for channel, rssi in result.results.items():
-                all_results.setdefault(channel, []).append(rssi)
+            ):
+                all_results.setdefault(result.channel, []).append(result.rssi)
 
         return {
             channel: map_rssi_to_energy(statistics.mean(all_results[channel]))
             for channel in list(channels)
         }
+
+    async def _network_scan(
+        self, channels: t.Channels, duration_exp: int
+    ) -> AsyncGenerator[t.NetworkBeacon, None]:
+        duration_per_channel_ms = round(
+            SYMBOL_PERIOD_MS * BASE_SUPERFRAME_DURATION_SYMBOLS * (2**duration_exp + 1)
+        )
+
+        assert self._api is not None
+        async for beacon in self._api.request_stream(
+            NetworkScan(
+                channels=list(channels),
+                duration_per_channel_ms=duration_per_channel_ms,
+            )
+        ):
+            yield t.NetworkBeacon(
+                pan_id=beacon.pan_id,
+                extended_pan_id=beacon.extended_pan_id,
+                channel=beacon.channel,
+                permit_joining=beacon.permit_joining,
+                stack_profile=beacon.stack_profile,
+                nwk_update_id=beacon.update_id,
+                lqi=beacon.lqi,
+                src=beacon.source,
+                rssi=beacon.rssi,
+                depth=beacon.device_depth,
+                router_capacity=beacon.router_capacity,
+                device_capacity=beacon.end_device_capacity,
+                protocol_version=beacon.protocol_version,
+            )
 
     async def write_network_info(
         self,
