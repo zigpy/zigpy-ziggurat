@@ -152,6 +152,12 @@ async def test_notifications(api: RecordingApi, server: SyntheticZiggurat) -> No
             router=t.NWK(0x0000),
             router_ieee=t.EUI64.convert("aa:aa:aa:aa:aa:aa:aa:aa"),
         ),
+        commands.ApsDecryptionFailure(
+            source=t.NWK(0x1234),
+            source_ieee=t.EUI64.convert("aa:aa:aa:aa:aa:aa:aa:aa"),
+            frame_counter=t.uint32_t(42),
+            key_id="tc_link_key",
+        ),
     ]
 
     for notification in sent:

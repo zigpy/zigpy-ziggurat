@@ -2,6 +2,7 @@
 against the synthetic websocket server."""
 
 import asyncio
+import logging
 import os
 from typing import Any
 
@@ -730,6 +731,27 @@ async def test_on_notification_device_left(
     )
     await flush(app)
     assert left == [device, device]
+
+
+async def test_on_notification_aps_decryption_failure(
+    app: ControllerApplication,
+    server: SyntheticZiggurat,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    source_ieee = t.EUI64.convert("aa:aa:aa:aa:aa:aa:aa:aa")
+    with caplog.at_level(logging.WARNING):
+        await server.send_notification(
+            commands.ApsDecryptionFailure(
+                source=t.NWK(0x1234),
+                source_ieee=source_ieee,
+                frame_counter=t.uint32_t(42),
+                key_id="tc_link_key",
+            )
+        )
+        await flush(app)
+
+    assert "Could not decrypt an APS command" in caplog.text
+    assert str(source_ieee) in caplog.text
 
 
 async def test_connection_lost(
