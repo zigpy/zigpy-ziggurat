@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 from typing import Any
+from unittest.mock import AsyncMock
 
 from aiohttp import web
 import pytest
@@ -252,7 +253,26 @@ async def test_permit_ncp(
     app: ControllerApplication, server: SyntheticZiggurat
 ) -> None:
     await app.permit_ncp(42)
-    assert server.sent(commands.PermitJoins)[-1].duration == 42
+    permit = server.sent(commands.PermitJoins)[-1]
+    assert permit.duration == 42
+    # Permitting on the coordinator opens its own beacon for direct joins
+    assert permit.accept_direct_joins is True
+
+
+async def test_permit_steered_to_router(
+    app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    device = app.add_device(DEVICE_IEEE, DEVICE_NWK)
+    # The unicast Mgmt_Permit_Joining_req awaits a ZDO reply no synthetic device sends
+    device.zdo.permit = AsyncMock()  # type: ignore[method-assign]
+
+    await app.permit(time_s=30, node=DEVICE_IEEE)
+
+    assert device.zdo.permit.mock_calls == [((30,), {})]
+    # The trust center window opens without advertising the coordinator as a parent
+    permit = server.sent(commands.PermitJoins)[-1]
+    assert permit.duration == 30
+    assert permit.accept_direct_joins is False
 
 
 async def test_permit_with_link_key(

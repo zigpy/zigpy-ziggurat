@@ -462,9 +462,26 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         await self._api.request(SetNwkUpdateId(nwk_update_id=new_nwk_update_id))
         await self._api.request(SetChannel(channel=new_channel))
 
+    async def permit(self, time_s: int = 60, node: t.EUI64 | str | None = None) -> None:
+        if node is not None:
+            if not isinstance(node, t.EUI64):
+                node = t.EUI64([t.uint8_t(p) for p in node])
+            if node != self.state.node_info.ieee:
+                # The base sends a unicast Mgmt_Permit_Joining_req to the target
+                # router to steer joins through it. Open our trust center window too,
+                # without advertising the coordinator itself as a join target.
+                await super().permit(time_s, node=node)
+                assert self._api is not None
+                await self._api.request(
+                    PermitJoins(duration=time_s, accept_direct_joins=False)
+                )
+                return
+
+        await super().permit(time_s, node=node)
+
     async def permit_ncp(self, time_s: int = 60) -> None:
         assert self._api is not None
-        await self._api.request(PermitJoins(duration=time_s))
+        await self._api.request(PermitJoins(duration=time_s, accept_direct_joins=True))
 
     async def permit_with_link_key(
         self, node: t.EUI64, link_key: t.KeyData, time_s: int = 60

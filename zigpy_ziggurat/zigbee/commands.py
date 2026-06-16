@@ -245,6 +245,9 @@ class PermitJoins(Request[Status]):
     response_type = Status
 
     duration: int
+    # Whether the coordinator also opens its own beacon for direct joins. False opens
+    # only the trust center's authorization window, steering joins through routers.
+    accept_direct_joins: bool = True
 
 
 @dataclass
