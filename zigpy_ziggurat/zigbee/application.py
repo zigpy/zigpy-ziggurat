@@ -518,7 +518,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
     async def permit(self, time_s: int = 60, node: t.EUI64 | str | None = None) -> None:
         if node is not None:
             if not isinstance(node, t.EUI64):
-                node = t.EUI64([t.uint8_t(p) for p in node])
+                node = t.EUI64.convert(node)
             if node != self.state.node_info.ieee:
                 # The base sends a unicast Mgmt_Permit_Joining_req to the target
                 # router to steer joins through it. Open our trust center window too,

@@ -291,6 +291,21 @@ async def test_permit_with_link_key(
     assert server.sent(commands.PermitJoins)[-1].duration == 12
 
 
+async def test_permit_node_conversion_and_all_routers(
+    app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    await app.permit(time_s=20, node="aa:bb:cc:dd:11:22:33:44")
+    steered = server.sent(commands.PermitJoins)[-1]
+    assert steered.duration == 20
+    assert steered.accept_direct_joins is False
+
+    # No node falls through to the base broadcast, which opens the coordinator too
+    await app.permit(time_s=30)
+    opened = server.sent(commands.PermitJoins)[-1]
+    assert opened.duration == 30
+    assert opened.accept_direct_joins is True
+
+
 async def test_energy_scan(
     app: ControllerApplication, server: SyntheticZiggurat
 ) -> None:
