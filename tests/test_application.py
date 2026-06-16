@@ -816,6 +816,40 @@ async def test_on_notification_device_joined(
     assert app.get_device(ieee=ieee3).nwk == t.NWK(0x9AAA)
 
 
+async def test_packet_received_aqara_node_desc_override(
+    app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    our_nwk = t.NWK(0x0000).serialize()
+    coordinator = app.get_device(nwk=t.NWK(0x0000))
+    assert coordinator.node_desc is not None
+    assert coordinator.node_desc.manufacturer_code == application_module.DEFAULT_MFG_ID
+
+    def reported_mfg_code(reply: commands.SendAps) -> int:
+        node_desc, _ = zdo_t.NodeDescriptor.deserialize(bytes(reply.data[4:]))
+        return node_desc.manufacturer_code
+
+    # A Lumi/Aqara device is answered with the Xiaomi manufacturer code so it pairs
+    aqara_nwk = t.NWK(0x1234)
+    add_initialized_device(
+        app, ieee=t.EUI64.convert("54:ef:44:00:00:00:00:01"), nwk=aqara_nwk
+    )
+    app.packet_received(
+        zdo_packet(zdo_t.ZDOCmd.Node_Desc_req, b"\x20" + our_nwk, src=aqara_nwk)
+    )
+    reply = await server.wait_for(commands.SendAps)
+    assert reply.cluster_id == zdo_t.ZDOCmd.Node_Desc_rsp
+    assert reported_mfg_code(reply) == 0x115F
+
+    # The coordinator's stored descriptor is untouched; other devices see the default
+    assert coordinator.node_desc.manufacturer_code == application_module.DEFAULT_MFG_ID
+    add_initialized_device(app)
+    app.packet_received(
+        zdo_packet(zdo_t.ZDOCmd.Node_Desc_req, b"\x21" + our_nwk, src=DEVICE_NWK)
+    )
+    reply = await server.wait_for(commands.SendAps, count=2)
+    assert reported_mfg_code(reply) == application_module.DEFAULT_MFG_ID
+
+
 async def test_on_notification_device_left(
     app: ControllerApplication, server: SyntheticZiggurat
 ) -> None:

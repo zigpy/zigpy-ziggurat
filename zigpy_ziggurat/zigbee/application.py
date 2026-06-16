@@ -53,6 +53,12 @@ RSSI_MAX = -5
 # the join. Some devices do not tolerate being interviewed mid-join (see zigpy-znp).
 DEVICE_JOIN_MAX_DELAY = 5
 
+DEFAULT_MFG_ID = 0x134B  # Open Home Foundation
+MFG_ID_OVERRIDES = {
+    "04:CF:8C": 0x115F,  # Xiaomi
+    "54:EF:44": 0x115F,  # Lumi
+}
+
 # 802.15.4 6.3.1: time spent scanning each channel is
 # aBaseSuperframeDuration * (2^n + 1) symbols, at 16 us per symbol
 SYMBOL_PERIOD_MS = 0.016
@@ -408,7 +414,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 | zdo_t.NodeDescriptor.MACCapabilityFlags.RxOnWhenIdle
                 | zdo_t.NodeDescriptor.MACCapabilityFlags.AllocateAddress
             ),
-            manufacturer_code=0xFFFF,
+            manufacturer_code=DEFAULT_MFG_ID,
             maximum_buffer_size=82,
             maximum_incoming_transfer_size=128,
             server_mask=0x2C01,  # Primary Trust Center, revision 22
@@ -715,11 +721,23 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         if hdr.command_id == zdo_t.ZDOCmd.Node_Desc_req:
             # Joining devices read our node descriptor to learn the trust center's
             # stack compliance revision before attempting the link key exchange
+            node_desc = coordinator.node_desc
+            assert node_desc is not None
+
+            # Aqara/Xiaomi/Lumi devices only finish joining if we report the Xiaomi
+            # manufacturer code; answer the requester with the code its OUI expects
+            mfg_id = MFG_ID_OVERRIDES.get(str(device.ieee)[:8].upper())
+            if mfg_id is not None:
+                node_desc = cast(
+                    zdo_t.NodeDescriptor,
+                    node_desc.replace(manufacturer_code=t.uint16_t(mfg_id)),  # type: ignore[arg-type]
+                )
+
             device.zdo.create_catching_task(
                 device.zdo.Node_Desc_rsp(
                     zdo_t.Status.SUCCESS,
                     nwk,
-                    coordinator.node_desc,
+                    node_desc,
                     tsn=hdr.tsn,
                 )
             )
