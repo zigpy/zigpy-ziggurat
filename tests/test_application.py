@@ -695,20 +695,39 @@ async def test_on_notification_device_left(
     app.add_listener(Listener())
     device = app.add_device(DEVICE_IEEE, DEVICE_NWK)
 
-    # With the IEEE address known
+    # The device announced its own departure
     await server.send_notification(
-        commands.DeviceLeft(nwk=DEVICE_NWK, ieee=DEVICE_IEEE)
+        commands.DeviceLeft(
+            nwk=DEVICE_NWK,
+            ieee=DEVICE_IEEE,
+            reason=commands.DeviceLeaveReason.ANNOUNCED,
+            rejoin=False,
+        )
     )
     await flush(app)
     assert left == [device]
 
-    # Resolved through the device registry when the server never learned it
-    await server.send_notification(commands.DeviceLeft(nwk=DEVICE_NWK, ieee=None))
+    # A parent router relayed the leave; the IEEE is resolved through the registry
+    await server.send_notification(
+        commands.DeviceLeft(
+            nwk=DEVICE_NWK,
+            ieee=None,
+            reason=commands.DeviceLeaveReason.ROUTER_REPORTED,
+            router=t.NWK(0x1234),
+            router_ieee=t.EUI64.convert("bb:bb:bb:bb:bb:bb:bb:bb"),
+        )
+    )
     await flush(app)
     assert left == [device, device]
 
     # An entirely unknown device is dropped
-    await server.send_notification(commands.DeviceLeft(nwk=t.NWK(0xBEEF), ieee=None))
+    await server.send_notification(
+        commands.DeviceLeft(
+            nwk=t.NWK(0xBEEF),
+            ieee=None,
+            reason=commands.DeviceLeaveReason.KEEPALIVE_TIMEOUT,
+        )
+    )
     await flush(app)
     assert left == [device, device]
 

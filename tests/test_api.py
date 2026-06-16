@@ -145,7 +145,13 @@ async def test_notifications(api: RecordingApi, server: SyntheticZiggurat) -> No
             ieee=t.EUI64.convert("aa:aa:aa:aa:aa:aa:aa:aa"),
             parent=t.NWK(0x0000),
         ),
-        commands.DeviceLeft(nwk=t.NWK(0xAB12), ieee=None),
+        commands.DeviceLeft(
+            nwk=t.NWK(0xAB12),
+            ieee=None,
+            reason=commands.DeviceLeaveReason.ROUTER_REPORTED,
+            router=t.NWK(0x0000),
+            router_ieee=t.EUI64.convert("aa:aa:aa:aa:aa:aa:aa:aa"),
+        ),
     ]
 
     for notification in sent:

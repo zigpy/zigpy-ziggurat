@@ -3,6 +3,7 @@ serde types. Requests and responses share one set of wire formats; notifications
 encode network addresses little-endian."""
 
 from dataclasses import dataclass
+import enum
 from typing import ClassVar, Generic, TypeVar
 
 from mashumaro import DataClassDictMixin
@@ -308,11 +309,31 @@ class DeviceJoined(Notification):
     parent: t.NWK
 
 
+class DeviceLeaveReason(enum.StrEnum):
+    """How the server learned that a device left the network."""
+
+    # The device itself broadcast a NWK Leave announcement (`rejoin` is set)
+    ANNOUNCED = "announced"
+    # A parent router relayed an APS Update-Device "Device Left" (`router`/
+    # `router_ieee` are set)
+    ROUTER_REPORTED = "router_reported"
+    # A sleepy child aged out of the neighbor table without a keepalive
+    KEEPALIVE_TIMEOUT = "keepalive_timeout"
+
+
 @dataclass
 class DeviceLeft(Notification):
     nwk: t.NWK
     # Unknown when the leaving device never made it into the server's address map
     ieee: t.EUI64 | None
+    # How the server learned of the departure
+    reason: DeviceLeaveReason
+    # Set only for ANNOUNCED: whether the device intends to rejoin
+    rejoin: bool | None = None
+    # Set only for ROUTER_REPORTED: the router that relayed the leave. The EUI64 is
+    # unknown when the server could not resolve it from its address map.
+    router: t.NWK | None = None
+    router_ieee: t.EUI64 | None = None
 
 
 @dataclass

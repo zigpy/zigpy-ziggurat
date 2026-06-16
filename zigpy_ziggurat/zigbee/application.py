@@ -714,6 +714,12 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     except KeyError:
                         return
 
+                _LOGGER.debug(
+                    "Device %s (%s) left the network: %s",
+                    notification.nwk,
+                    ieee,
+                    notification.reason.value,
+                )
                 self.handle_leave(nwk=notification.nwk, ieee=ieee)
             case LinkKeyUpdate():
                 key = zigpy.state.Key(
