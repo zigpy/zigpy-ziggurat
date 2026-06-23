@@ -11,8 +11,8 @@ jobs:
       CODE_FOLDER: zigpy_ziggurat
       CACHE_VERSION: 2
       MINIMUM_COVERAGE_PERCENTAGE: 100
-      # The package requires Python >=3.13
-      PYTHON_VERSION_DEFAULT: "3.13"
-      PYTHON_MATRIX: '"3.13", "3.14"'
+      # The package requires Python >=3.12
+      PYTHON_VERSION_DEFAULT: "3.12"
+      PYTHON_MATRIX: '"3.12", "3.13", "3.14"'
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
