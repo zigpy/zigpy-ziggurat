@@ -270,6 +270,7 @@ class ZigguratApi:
 
         if self._serial is not None:
             self._serial.close()
+            await self._serial.wait_until_closed()
             self._serial = None
 
     def on_transport_lost(self, exc: BaseException | None) -> None:
