@@ -47,12 +47,21 @@ from zigpy_ziggurat.zigbee.commands import (
     ResetType,
     SendAps,
     SetChannel,
+    SetLogLevel,
     SetNwkUpdateId,
     SetProvisionalKey,
     StreamingRequest,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+_RUST_LOG_LEVELS = {
+    "ERROR": logging.ERROR,
+    "WARN": logging.WARNING,
+    "INFO": logging.INFO,
+    "DEBUG": logging.DEBUG,
+    "TRACE": 5,
+}
 
 RSSI_MIN = -92
 RSSI_MAX = -5
@@ -210,6 +219,8 @@ class ZigguratApi:
         else:
             await self._connect_serial()
 
+        await self.request(SetLogLevel(level="debug"))
+
     async def _connect_websocket(self) -> None:
         if self._url.startswith("ws+unix://"):
             # The URL's path is the socket path; the HTTP-level host is a placeholder
@@ -317,7 +328,12 @@ class ZigguratApi:
         msg_type = msg["type"]
 
         if msg_type == "notification":
-            self._on_notification(NOTIFICATIONS[msg["event"]].from_dict(msg["data"]))
+            if msg["event"] == "log":
+                self._handle_log(msg["data"])
+            else:
+                self._on_notification(
+                    NOTIFICATIONS[msg["event"]].from_dict(msg["data"])
+                )
         elif msg_type == "event":
             pending = self._pending.get(msg["id"])
 
@@ -343,6 +359,12 @@ class ZigguratApi:
                 pending.fail(DeliveryError(f"{error['code']}: {error['message']}"))
             elif not pending.response.done():
                 pending.response.set_result(msg["result"])
+
+    def _handle_log(self, data: dict[str, Any]) -> None:
+        """Tunnel a firmware `log` notification."""
+        level = _RUST_LOG_LEVELS.get(data["level"], logging.INFO)
+        logger = logging.getLogger("ziggurat.fw." + data["target"].replace("::", "."))
+        logger.log(level, "%s", data["message"])
 
     async def request(self, command: Request[RESPONSE_T]) -> RESPONSE_T:
         result = await self._send_request(command, want_transmitted=False)
