@@ -301,9 +301,52 @@ class SetProvisionalKey(Request[Status]):
     key: t.KeyData
 
 
+class ResetType(enum.StrEnum):
+    # Stop transient radio activity (packet capture) and return to idle, leaving any
+    # configured network running. Sent by the client on connect as a session reset.
+    SOFT = "soft"
+    # Reboot/reset the radio.
+    HARD = "hard"
+
+
+@dataclass
+class Reset(Request[Status]):
+    method = "reset"
+    response_type = Status
+
+    reset_type: ResetType
+
+
 @dataclass
 class SetChannel(Request[Status]):
     method = "set_channel"
+    response_type = Status
+
+    channel: int
+
+
+@dataclass
+class CapturedPacketEvent(Response):
+    channel: t.uint8_t
+    rssi: t.int8s
+    lqi: t.uint8_t
+    # Hex-encoded 802.15.4 MAC frame (FCS stripped)
+    data: str
+
+
+@dataclass
+class PacketCapture(StreamingRequest[Status, CapturedPacketEvent]):
+    method = "packet_capture"
+    response_type = Status
+    event_type = CapturedPacketEvent
+    event_name = "captured_packet"
+
+    channel: int
+
+
+@dataclass
+class PacketCaptureChangeChannel(Request[Status]):
+    method = "packet_capture_change_channel"
     response_type = Status
 
     channel: int

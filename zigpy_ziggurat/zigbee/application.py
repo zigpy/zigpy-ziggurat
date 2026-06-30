@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import asyncio
 from collections.abc import AsyncGenerator, Callable
+from datetime import datetime, timezone
 import json
 import logging
 import math
@@ -13,6 +16,7 @@ import zigpy.config
 import zigpy.device
 import zigpy.endpoint
 from zigpy.exceptions import DeliveryError, NetworkNotFormed
+import zigpy.serial
 import zigpy.state
 import zigpy.types as t
 import zigpy.zdo.types as zdo_t
@@ -33,10 +37,14 @@ from zigpy_ziggurat.zigbee.commands import (
     LinkKeyUpdate,
     NetworkScan,
     Notification,
+    PacketCapture,
+    PacketCaptureChangeChannel,
     PermitJoins,
     Ping,
     ReceivedApsCommand,
     Request,
+    Reset,
+    ResetType,
     SendAps,
     SetChannel,
     SetNwkUpdateId,
@@ -136,27 +144,73 @@ def _make_late_failure_logger(
     return log_late_failure
 
 
+class ZigguratSerialProtocol(zigpy.serial.SerialProtocol):
+    """The serial half of the line-delimited JSON transport."""
+
+    def __init__(self, api: ZigguratApi) -> None:
+        super().__init__()
+        self._api = api
+
+    def connection_lost(self, exc: BaseException | None) -> None:
+        super().connection_lost(exc)
+        self._api.on_transport_lost(exc)
+
+    def data_received(self, data: bytes) -> None:
+        super().data_received(data)
+
+        while (newline := self._buffer.find(b"\n")) >= 0:
+            line = bytes(self._buffer[:newline]).strip()
+            del self._buffer[: newline + 1]
+
+            if not line:
+                continue
+
+            try:
+                self._api.handle_message(json.loads(line))
+            except Exception:
+                _LOGGER.exception("Failed to handle message: %r", line)
+
+    def send_line(self, text: str) -> None:
+        assert self._transport is not None
+        self._transport.write((text + "\n").encode())
+
+
 class ZigguratApi:
-    """The Ziggurat WebSocket API: concurrent requests correlated by id, with
-    lifecycle events (`accepted`, `transmitted`) preceding each terminal response."""
+    """The Ziggurat JSON-RPC API: concurrent requests correlated by id, with lifecycle
+    events (`accepted`, `transmitted`) preceding each terminal response. The transport
+    is a WebSocket (`ws://`/`ws+unix://`) or a serial port (any other device path)
+    speaking the same newline-delimited JSON protocol."""
 
     def __init__(
         self,
         url: str,
         on_notification: Callable[[Notification], None],
         on_disconnect: Callable[[BaseException | None], None],
+        *,
+        baudrate: int = 115200,
+        flow_control: str | None = None,
     ) -> None:
         self._url = url
         self._on_notification = on_notification
         self._on_disconnect = on_disconnect
+        self._baudrate = baudrate
+        self._flow_control = flow_control
 
         self._session: aiohttp.ClientSession | None = None
         self._websocket: aiohttp.ClientWebSocketResponse | None = None
+        self._serial: ZigguratSerialProtocol | None = None
         self._receiver_task: asyncio.Task[None] | None = None
+        self._closing = False
         self._request_id = 1
         self._pending: dict[int, PendingRequest] = {}
 
     async def connect(self) -> None:
+        if self._url.startswith(("ws://", "wss://", "ws+unix://")):
+            await self._connect_websocket()
+        else:
+            await self._connect_serial()
+
+    async def _connect_websocket(self) -> None:
         if self._url.startswith("ws+unix://"):
             # The URL's path is the socket path; the HTTP-level host is a placeholder
             connector = aiohttp.UnixConnector(path=self._url.removeprefix("ws+unix://"))
@@ -175,7 +229,22 @@ class ZigguratApi:
 
         self._receiver_task = asyncio.create_task(self._receive_loop())
 
+    async def _connect_serial(self) -> None:
+        _LOGGER.debug("Connecting to ziggurat over serial: %s", self._url)
+
+        _, protocol = await zigpy.serial.create_serial_connection(
+            loop=asyncio.get_running_loop(),
+            protocol_factory=lambda: ZigguratSerialProtocol(self),
+            url=self._url,
+            baudrate=self._baudrate,
+            flow_control=cast(Any, self._flow_control),
+        )
+        self._serial = cast(ZigguratSerialProtocol, protocol)
+        await self._serial.wait_until_connected()
+
     async def disconnect(self) -> None:
+        self._closing = True
+
         if self._receiver_task is not None:
             self._receiver_task.cancel()
             self._receiver_task = None
@@ -188,6 +257,26 @@ class ZigguratApi:
             await self._session.close()
             self._session = None
 
+        if self._serial is not None:
+            self._serial.close()
+            self._serial = None
+
+    def on_transport_lost(self, exc: BaseException | None) -> None:
+        """The serial transport closed; fail in-flight requests and, unless this was a
+        deliberate `disconnect()`, notify the application."""
+        self._fail_pending(ConnectionError("Connection lost"))
+
+        if not self._closing:
+            self._on_disconnect(exc)
+
+    async def _send_line(self, text: str) -> None:
+        if self._websocket is not None:
+            await self._websocket.send_str(text)
+        elif self._serial is not None:
+            self._serial.send_line(text)
+        else:
+            raise ConnectionError("Not connected")
+
     async def _receive_loop(self) -> None:
         websocket = self._websocket
         assert websocket is not None
@@ -198,7 +287,7 @@ class ZigguratApi:
             async for msg in websocket:
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     try:
-                        self._handle_message(json.loads(msg.data))
+                        self.handle_message(json.loads(msg.data))
                     except Exception:
                         _LOGGER.exception("Failed to handle message: %r", msg.data)
                 elif msg.type == aiohttp.WSMsgType.ERROR:
@@ -223,7 +312,7 @@ class ZigguratApi:
 
         self._pending.clear()
 
-    def _handle_message(self, msg: dict[str, Any]) -> None:
+    def handle_message(self, msg: dict[str, Any]) -> None:
         _LOGGER.debug("Received: %r", msg)
         msg_type = msg["type"]
 
@@ -281,8 +370,7 @@ class ZigguratApi:
             "params": command.to_dict(),
         }
         _LOGGER.debug("Sending: %r", message)
-        assert self._websocket is not None
-        await self._websocket.send_str(json.dumps(message))
+        await self._send_line(json.dumps(message))
 
         if want_transmitted:
             # The terminal response continues in the background; an end-to-end
@@ -314,8 +402,7 @@ class ZigguratApi:
             "params": command.to_dict(),
         }
         _LOGGER.debug("Sending: %r", message)
-        assert self._websocket is not None
-        await self._websocket.send_str(json.dumps(message))
+        await self._send_line(json.dumps(message))
 
         assert pending.events is not None
         events = pending.events
@@ -364,17 +451,25 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         self._api: ZigguratApi | None = None
 
     async def connect(self) -> None:
-        # The device path is the WebSocket URL of the ziggurat server
-        url = self._config[zigpy.config.CONF_DEVICE][zigpy.config.CONF_DEVICE_PATH]
+        # The device path is either the WebSocket URL of a ziggurat server or the serial
+        # port of a ziggurat firmware (e.g. an ESP32-C6 over USB-Serial-JTAG)
+        device = self._config[zigpy.config.CONF_DEVICE]
+        url = device[zigpy.config.CONF_DEVICE_PATH]
 
         # zigpy types `connection_lost` as Exception-only but handles None fine
         api = ZigguratApi(
             url,
             self.on_notification,
             self.connection_lost,  # type: ignore[arg-type]
+            baudrate=device[zigpy.config.CONF_DEVICE_BAUDRATE],
+            flow_control=device[zigpy.config.CONF_DEVICE_FLOW_CONTROL],
         )
         await api.connect()
         self._api = api
+
+        # Clear any transient radio state left by a previous client (e.g. a packet
+        # capture still streaming on the firmware) so this session starts from idle.
+        await api.request(Reset(reset_type=ResetType.SOFT))
 
     async def disconnect(self) -> None:
         if self._api is not None:
@@ -603,6 +698,23 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 device_capacity=beacon.end_device_capacity,
                 protocol_version=beacon.protocol_version,
             )
+
+    async def _packet_capture(
+        self, channel: int
+    ) -> AsyncGenerator[t.CapturedPacket, None]:
+        assert self._api is not None
+        async for packet in self._api.request_stream(PacketCapture(channel=channel)):
+            yield t.CapturedPacket(
+                timestamp=datetime.now(timezone.utc),
+                rssi=packet.rssi,
+                lqi=packet.lqi,
+                channel=packet.channel,
+                data=bytes.fromhex(packet.data),
+            )
+
+    async def _packet_capture_change_channel(self, channel: int) -> None:
+        assert self._api is not None
+        await self._api.request(PacketCaptureChangeChannel(channel=channel))
 
     async def write_network_info(
         self,
