@@ -487,6 +487,12 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         self._register_coordinator_device()
         await self.register_endpoints()
 
+        url = self._config[zigpy.config.CONF_DEVICE][zigpy.config.CONF_DEVICE_PATH]
+        if not url.startswith(("ws://", "wss://", "ws+unix://")):
+            self._concurrent_requests_semaphore.max_concurrency = 32
+        else:
+            self._concurrent_requests_semaphore.max_concurrency = 128
+
     def _register_coordinator_device(self) -> None:
         coordinator = ZigguratCoordinator(
             self, self.state.node_info.ieee, self.state.node_info.nwk
@@ -1036,20 +1042,21 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         # Resolves once the frame is on the air (EZSP `messageSent` parity); the
         # APS-ack delivery result arrives later and is logged by the API layer
         assert self._api is not None
-        await self._api.request_transmitted(
-            SendAps(
-                delivery_mode=delivery_mode,
-                destination_eui64=destination_eui64,
-                destination=destination,
-                profile_id=packet.profile_id,
-                cluster_id=packet.cluster_id or 0x0000,
-                src_ep=packet.src_ep or 0,
-                dst_ep=packet.dst_ep or 0,
-                aps_ack=t.TransmitOptions.ACK in packet.tx_options,
-                aps_encryption=aps_encryption,
-                radius=packet.radius or 30,
-                aps_seq=packet.tsn,
-                priority=packet.priority if packet.priority is not None else 0,
-                data=packet.data.serialize(),
+        async with self._limit_concurrency(priority=packet.priority):
+            await self._api.request_transmitted(
+                SendAps(
+                    delivery_mode=delivery_mode,
+                    destination_eui64=destination_eui64,
+                    destination=destination,
+                    profile_id=packet.profile_id,
+                    cluster_id=packet.cluster_id or 0x0000,
+                    src_ep=packet.src_ep or 0,
+                    dst_ep=packet.dst_ep or 0,
+                    aps_ack=t.TransmitOptions.ACK in packet.tx_options,
+                    aps_encryption=aps_encryption,
+                    radius=packet.radius or 30,
+                    aps_seq=packet.tsn,
+                    priority=packet.priority if packet.priority is not None else 0,
+                    data=packet.data.serialize(),
+                )
             )
-        )
