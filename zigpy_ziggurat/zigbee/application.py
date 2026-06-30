@@ -376,7 +376,8 @@ class ZigguratApi:
 
     async def request_transmitted(self, command: Request[Any]) -> None:
         """Resolve once the frame is on the air instead of waiting for delivery."""
-        await self._send_request(command, want_transmitted=True)
+        async with asyncio.timeout(30):
+            await self._send_request(command, want_transmitted=True)
 
     async def _send_request(
         self, command: Request[Any], *, want_transmitted: bool
