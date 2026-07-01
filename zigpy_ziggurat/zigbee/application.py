@@ -149,11 +149,7 @@ class ZigguratSerialProtocol(zigpy.serial.SerialProtocol):
 
 
 class ZigguratApi:
-    """The Ziggurat JSON-RPC API: concurrent requests correlated by id, each answered
-    with a terminal response. A send is confirmed in three stages — enqueue, the stack's
-    accept/reject response, then a `send_confirm` notification keyed by the request id.
-    The transport is a WebSocket (`ws://`/`ws+unix://`) or a serial port (any other
-    device path) speaking the same newline-delimited JSON protocol."""
+    """The Ziggurat JSON-RPC API."""
 
     def __init__(
         self,
@@ -177,8 +173,6 @@ class ZigguratApi:
         self._closing = False
         self._request_id = 1
         self._pending: dict[int, PendingRequest] = {}
-        # Stage-three send confirmations, keyed by the request id (the send token). They
-        # arrive as `send_confirm` notifications, after the request's terminal response.
         self._pending_confirms: dict[int, asyncio.Future[dict[str, Any]]] = {}
 
     async def connect(self) -> None:
@@ -240,8 +234,7 @@ class ZigguratApi:
             self._serial = None
 
     def on_transport_lost(self, exc: BaseException | None) -> None:
-        """The serial transport closed; fail in-flight requests and, unless this was a
-        deliberate `disconnect()`, notify the application."""
+        """The serial transport closed."""
         self._fail_pending(ConnectionError("Connection lost"))
 
         if not self._closing:
@@ -334,9 +327,8 @@ class ZigguratApi:
         logger.log(level, "%s", data["message"])
 
     def _handle_send_confirm(self, data: dict[str, Any]) -> None:
-        """Resolve a send's stage-three confirmation. Unmatched tokens (a
-        fire-and-forget send, or one already timed out and cleaned up) are ignored."""
-        confirm = self._pending_confirms.get(data["token"])
+        """Resolve a send's confirmation."""
+        confirm = self._pending_confirms.get(data["id"])
         if confirm is not None and not confirm.done():
             confirm.set_result(data)
 

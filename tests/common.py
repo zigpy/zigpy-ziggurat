@@ -161,16 +161,16 @@ class SyntheticZiggurat:
         )
 
     async def send_confirm(
-        self, token: int, *, via: str = "next_hop", reason: str | None = None
+        self, request_id: int, *, via: str = "next_hop", reason: str | None = None
     ) -> None:
         if reason is not None:
             data: dict[str, Any] = {
-                "token": token,
+                "id": request_id,
                 "status": "failed",
                 "reason": reason,
             }
         else:
-            data = {"token": token, "status": "confirmed", "via": via}
+            data = {"id": request_id, "status": "confirmed", "via": via}
 
         await self.ws.send_json(
             {"type": "notification", "event": "send_confirm", "data": data}
