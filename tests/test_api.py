@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import AsyncIterator
+from dataclasses import replace
 
 import pytest
 from zigpy.exceptions import DeliveryError
@@ -62,43 +63,50 @@ async def test_error_response(api: RecordingApi, server: SyntheticZiggurat) -> N
         await api.request(commands.Ping())
 
 
-async def test_request_transmitted(
-    api: RecordingApi, server: SyntheticZiggurat
-) -> None:
-    await api.request_transmitted(SEND_APS)
+async def test_request_confirmed(api: RecordingApi, server: SyntheticZiggurat) -> None:
+    """An APS-ack send is confirmed end-to-end; the trigger names the APS ack."""
+    via = await api.request_confirmed(SEND_APS)
+    assert via == "aps_ack"
     assert server.sent(commands.SendAps)[-1].aps_seq == 55
 
 
-async def test_request_transmitted_failure_before_transmission(
+async def test_request_confirmed_next_hop(
     api: RecordingApi, server: SyntheticZiggurat
 ) -> None:
+    """A no-ack unicast is confirmed by next-hop acceptance."""
+    via = await api.request_confirmed(replace(SEND_APS, aps_ack=False))
+    assert via == "next_hop"
+
+
+async def test_request_confirmed_rejected(
+    api: RecordingApi, server: SyntheticZiggurat
+) -> None:
+    """Stage two: the stack rejects the frame, so the send raises before any confirm."""
+
     async def fail(command: commands.SendAps, request_id: int) -> commands.Status:
         raise RpcError("transmit_failed", "channel busy")
 
     server.handlers["send_aps"] = fail
 
     with pytest.raises(DeliveryError, match="transmit_failed"):
-        await api.request_transmitted(SEND_APS)
+        await api.request_confirmed(SEND_APS)
 
 
-async def test_late_delivery_failure_is_logged(
-    api: RecordingApi, server: SyntheticZiggurat, caplog: pytest.LogCaptureFixture
+async def test_request_confirmed_failure(
+    api: RecordingApi, server: SyntheticZiggurat
 ) -> None:
+    """Stage three: the stack accepts the frame but the confirmation reports failure."""
+
     async def ack_timeout(
         command: commands.SendAps, request_id: int
     ) -> commands.Status:
-        await server.send_event(request_id, "transmitted")
-        raise RpcError("aps_ack_timeout", "no ack")
+        await server.send_confirm(request_id, reason="APS ack timed out")
+        return commands.Status(status="accepted")
 
     server.handlers["send_aps"] = ack_timeout
 
-    # Resolves at the `transmitted` stage; the terminal failure arrives later and is
-    # logged instead of raised
-    await api.request_transmitted(SEND_APS)
-
-    async with asyncio.timeout(1):
-        while "Delivery failed after transmission" not in caplog.text:
-            await asyncio.sleep(0.01)
+    with pytest.raises(DeliveryError, match="APS ack timed out"):
+        await api.request_confirmed(SEND_APS)
 
 
 async def test_unsolicited_messages_are_ignored(
@@ -106,11 +114,11 @@ async def test_unsolicited_messages_are_ignored(
 ) -> None:
     await server.send_raw("not json")
     await server.send_raw('{"type": "response", "id": 9999, "result": {}}')
-    await server.send_raw('{"type": "event", "id": 9999, "event": "transmitted"}')
+    await server.send_raw('{"type": "event", "id": 9999, "event": "spurious"}')
 
-    # A `transmitted` event for a request that did not ask for one
+    # An unknown event for an in-flight request is ignored (only stream results match)
     async def eager(command: commands.Ping, request_id: int) -> commands.Status:
-        await server.send_event(request_id, "transmitted")
+        await server.send_event(request_id, "spurious")
         return commands.Status(status="pong")
 
     server.handlers["ping"] = eager

@@ -84,6 +84,7 @@ class SyntheticZiggurat:
         self.hw_address = t.EUI64.convert("11:22:33:44:55:66:77:88")
         self.handlers: dict[str, Callable[[Any, int], Awaitable[Any]]] = {
             "ping": self.on_ping,
+            "reset": self.on_status,
             "configure": self.on_configure,
             "get_network_info": self.on_get_network_info,
             "get_hw_address": self.on_get_hw_address,
@@ -159,6 +160,22 @@ class SyntheticZiggurat:
             {"type": "event", "id": request_id, "event": event, "data": data}
         )
 
+    async def send_confirm(
+        self, token: int, *, via: str = "next_hop", reason: str | None = None
+    ) -> None:
+        if reason is not None:
+            data: dict[str, Any] = {
+                "token": token,
+                "status": "failed",
+                "reason": reason,
+            }
+        else:
+            data = {"token": token, "status": "confirmed", "via": via}
+
+        await self.ws.send_json(
+            {"type": "notification", "event": "send_confirm", "data": data}
+        )
+
     async def send_notification(self, notification: commands.Notification) -> None:
         await self.ws.send_json(
             {
@@ -208,8 +225,10 @@ class SyntheticZiggurat:
     async def on_send_aps(
         self, command: commands.SendAps, request_id: int
     ) -> commands.Status:
-        await self.send_event(request_id, "transmitted")
-        return commands.Status(status="delivered" if command.aps_ack else "sent")
+        await self.send_confirm(
+            request_id, via="aps_ack" if command.aps_ack else "next_hop"
+        )
+        return commands.Status(status="accepted")
 
     async def on_energy_scan(
         self, command: commands.EnergyScan, request_id: int

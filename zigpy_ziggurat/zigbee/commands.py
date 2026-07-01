@@ -318,16 +318,6 @@ class Reset(Request[Status]):
 
 
 @dataclass
-class SetLogLevel(Request[Status]):
-    """Adjust firmware log verbosity at runtime (off/error/warn/info/debug/trace)."""
-
-    method = "set_log_level"
-    response_type = Status
-
-    level: str
-
-
-@dataclass
 class SetChannel(Request[Status]):
     method = "set_channel"
     response_type = Status

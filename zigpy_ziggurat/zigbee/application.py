@@ -47,7 +47,6 @@ from zigpy_ziggurat.zigbee.commands import (
     ResetType,
     SendAps,
     SetChannel,
-    SetLogLevel,
     SetNwkUpdateId,
     SetProvisionalKey,
     StreamingRequest,
@@ -100,17 +99,12 @@ def map_rssi_to_energy(rssi: float) -> float:
 
 
 class PendingRequest:
-    """The in-flight state of one request: an optional `transmitted` stage future and
-    the terminal `response` future."""
+    """The in-flight state of one request: the terminal `response` future and, for a
+    streaming request, the queue its result events land in."""
 
-    def __init__(
-        self, *, want_transmitted: bool, stream_event: str | None = None
-    ) -> None:
+    def __init__(self, *, stream_event: str | None = None) -> None:
         loop = asyncio.get_running_loop()
         self.response: asyncio.Future[dict[str, Any]] = loop.create_future()
-        self.transmitted: asyncio.Future[None] | None = (
-            loop.create_future() if want_transmitted else None
-        )
         # For a streaming request: the event name carrying results, and a queue those
         # results land in. `None` enqueued by the terminal response marks the end.
         self.stream_event = stream_event
@@ -119,38 +113,8 @@ class PendingRequest:
         )
 
     def fail(self, exc: BaseException) -> None:
-        if self.transmitted is not None and not self.transmitted.done():
-            self.transmitted.set_exception(exc)
-
         if not self.response.done():
             self.response.set_exception(exc)
-
-
-def _make_late_failure_logger(
-    pending: PendingRequest,
-) -> Callable[[asyncio.Future[dict[str, Any]]], None]:
-    """Consume the terminal result of a request that already resolved at the
-    `transmitted` stage, so delivery failures are visible but not raised. Failures
-    from before transmission were already raised to the caller and are not logged."""
-
-    def log_late_failure(fut: asyncio.Future[dict[str, Any]]) -> None:
-        if fut.cancelled():
-            return
-
-        exc = fut.exception()
-        if exc is None:
-            return
-
-        transmitted = (
-            pending.transmitted is not None
-            and pending.transmitted.done()
-            and pending.transmitted.exception() is None
-        )
-
-        if transmitted:
-            _LOGGER.warning("Delivery failed after transmission: %s", exc)
-
-    return log_late_failure
 
 
 class ZigguratSerialProtocol(zigpy.serial.SerialProtocol):
@@ -185,10 +149,11 @@ class ZigguratSerialProtocol(zigpy.serial.SerialProtocol):
 
 
 class ZigguratApi:
-    """The Ziggurat JSON-RPC API: concurrent requests correlated by id, with lifecycle
-    events (`accepted`, `transmitted`) preceding each terminal response. The transport
-    is a WebSocket (`ws://`/`ws+unix://`) or a serial port (any other device path)
-    speaking the same newline-delimited JSON protocol."""
+    """The Ziggurat JSON-RPC API: concurrent requests correlated by id, each answered
+    with a terminal response. A send is confirmed in three stages — enqueue, the stack's
+    accept/reject response, then a `send_confirm` notification keyed by the request id.
+    The transport is a WebSocket (`ws://`/`ws+unix://`) or a serial port (any other
+    device path) speaking the same newline-delimited JSON protocol."""
 
     def __init__(
         self,
@@ -212,14 +177,15 @@ class ZigguratApi:
         self._closing = False
         self._request_id = 1
         self._pending: dict[int, PendingRequest] = {}
+        # Stage-three send confirmations, keyed by the request id (the send token). They
+        # arrive as `send_confirm` notifications, after the request's terminal response.
+        self._pending_confirms: dict[int, asyncio.Future[dict[str, Any]]] = {}
 
     async def connect(self) -> None:
         if self._url.startswith(("ws://", "wss://", "ws+unix://")):
             await self._connect_websocket()
         else:
             await self._connect_serial()
-
-        await self.request(SetLogLevel(level="debug"))
 
     async def _connect_websocket(self) -> None:
         if self._url.startswith("ws+unix://"):
@@ -319,33 +285,33 @@ class ZigguratApi:
 
     def _fail_pending(self, exc: BaseException) -> None:
         for pending in self._pending.values():
-            pending.response.add_done_callback(_make_late_failure_logger(pending))
             pending.fail(exc)
 
         self._pending.clear()
+
+        for confirm in self._pending_confirms.values():
+            if not confirm.done():
+                confirm.set_exception(exc)
+
+        self._pending_confirms.clear()
 
     def handle_message(self, msg: dict[str, Any]) -> None:
         _LOGGER.debug("Received: %r", msg)
         msg_type = msg["type"]
 
         if msg_type == "notification":
-            if msg["event"] == "log":
+            event = msg["event"]
+            if event == "log":
                 self._handle_log(msg["data"])
+            elif event == "send_confirm":
+                self._handle_send_confirm(msg["data"])
             else:
-                self._on_notification(
-                    NOTIFICATIONS[msg["event"]].from_dict(msg["data"])
-                )
+                self._on_notification(NOTIFICATIONS[event].from_dict(msg["data"]))
         elif msg_type == "event":
             pending = self._pending.get(msg["id"])
 
             if pending is None:
                 pass
-            elif (
-                msg["event"] == "transmitted"
-                and pending.transmitted is not None
-                and not pending.transmitted.done()
-            ):
-                pending.transmitted.set_result(None)
             elif pending.events is not None and msg["event"] == pending.stream_event:
                 pending.events.put_nowait(msg["data"])
         elif msg_type == "response":
@@ -367,26 +333,47 @@ class ZigguratApi:
         logger = logging.getLogger("ziggurat.fw." + data["target"].replace("::", "."))
         logger.log(level, "%s", data["message"])
 
+    def _handle_send_confirm(self, data: dict[str, Any]) -> None:
+        """Resolve a send's stage-three confirmation. Unmatched tokens (a
+        fire-and-forget send, or one already timed out and cleaned up) are ignored."""
+        confirm = self._pending_confirms.get(data["token"])
+        if confirm is not None and not confirm.done():
+            confirm.set_result(data)
+
     async def request(self, command: Request[RESPONSE_T]) -> RESPONSE_T:
-        result = await self._send_request(command, want_transmitted=False)
+        result = await self._send_request(command)
         assert result is not None
 
         # `response_type` is a plain ClassVar: it cannot carry the type variable
         return cast(RESPONSE_T, command.response_type.from_dict(result))
 
-    async def request_transmitted(self, command: Request[Any]) -> None:
-        """Resolve once the frame is on the air instead of waiting for delivery."""
+    async def request_confirmed(self, command: Request[Any]) -> str:
+        """Enqueue a send and resolve once its terminal confirmation arrives, returning
+        the trigger that fired (`quorum`, `next_hop`, or `aps_ack`). Raises
+        `DeliveryError` if the stack rejects the frame or the confirmation reports
+        failure."""
         async with asyncio.timeout(30):
-            await self._send_request(command, want_transmitted=True)
+            result = await self._send_request(command, want_confirm=True)
+        assert result is not None
+
+        if result["status"] == "failed":
+            raise DeliveryError(result["reason"])
+        return cast(str, result["via"])
 
     async def _send_request(
-        self, command: Request[Any], *, want_transmitted: bool
+        self, command: Request[Any], *, want_confirm: bool = False
     ) -> dict[str, Any] | None:
         request_id = self._request_id
         self._request_id = (self._request_id + 1) % 2**32 or 1
 
-        pending = PendingRequest(want_transmitted=want_transmitted)
+        pending = PendingRequest()
         self._pending[request_id] = pending
+
+        # Register the confirmation before sending so it cannot race the notification.
+        confirm: asyncio.Future[dict[str, Any]] | None = None
+        if want_confirm:
+            confirm = asyncio.get_running_loop().create_future()
+            self._pending_confirms[request_id] = confirm
 
         message = {
             "id": request_id,
@@ -396,15 +383,17 @@ class ZigguratApi:
         _LOGGER.debug("Sending: %r", message)
         await self._send_line(json.dumps(message))
 
-        if want_transmitted:
-            # The terminal response continues in the background; an end-to-end
-            # delivery failure after transmission is logged, not raised
-            pending.response.add_done_callback(_make_late_failure_logger(pending))
-            assert pending.transmitted is not None
-            await pending.transmitted
-            return None
+        if not want_confirm:
+            return await pending.response
 
-        return await pending.response
+        # Stage two: the stack accepts (a success response) or rejects (an error,
+        # raised here). Stage three: the `send_confirm` notification keyed by this id.
+        assert confirm is not None
+        try:
+            await pending.response
+            return await confirm
+        finally:
+            self._pending_confirms.pop(request_id, None)
 
     async def request_stream(
         self, command: StreamingRequest[Any, EVENT_T]
@@ -415,9 +404,7 @@ class ZigguratApi:
         request_id = self._request_id
         self._request_id = (self._request_id + 1) % 2**32 or 1
 
-        pending = PendingRequest(
-            want_transmitted=False, stream_event=command.event_name
-        )
+        pending = PendingRequest(stream_event=command.event_name)
         self._pending[request_id] = pending
 
         message = {
@@ -513,7 +500,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
         url = self._config[zigpy.config.CONF_DEVICE][zigpy.config.CONF_DEVICE_PATH]
         if not url.startswith(("ws://", "wss://", "ws+unix://")):
-            self._concurrent_requests_semaphore.max_concurrency = 32
+            self._concurrent_requests_semaphore.max_concurrency = 64
         else:
             self._concurrent_requests_semaphore.max_concurrency = 128
 
@@ -1063,11 +1050,12 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 # The server selects the link key by EUI64
                 destination_eui64 = self.get_device(nwk=destination).ieee
 
-        # Resolves once the frame is on the air (EZSP `messageSent` parity); the
-        # APS-ack delivery result arrives later and is logged by the API layer
+        # Resolves once the send is confirmed: passive-ack quorum for a broadcast,
+        # next-hop acceptance for a no-ack unicast, or the end-to-end APS ack. A
+        # rejected or failed send raises `DeliveryError`.
         assert self._api is not None
         async with self._limit_concurrency(priority=packet.priority):
-            await self._api.request_transmitted(
+            await self._api.request_confirmed(
                 SendAps(
                     delivery_mode=delivery_mode,
                     destination_eui64=destination_eui64,
