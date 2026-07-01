@@ -174,6 +174,7 @@ class ZigguratApi:
         self._request_id = 1
         self._pending: dict[int, PendingRequest] = {}
         self._pending_confirms: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self._awaiting_aps_ack: set[int] = set()
 
     async def connect(self) -> None:
         if self._url.startswith(("ws://", "wss://", "ws+unix://")):
@@ -287,6 +288,7 @@ class ZigguratApi:
                 confirm.set_exception(exc)
 
         self._pending_confirms.clear()
+        self._awaiting_aps_ack.clear()
 
     def handle_message(self, msg: dict[str, Any]) -> None:
         _LOGGER.debug("Received: %r", msg)
@@ -298,6 +300,8 @@ class ZigguratApi:
                 self._handle_log(msg["data"])
             elif event == "send_confirm":
                 self._handle_send_confirm(msg["data"])
+            elif event == "aps_ack_confirm":
+                self._handle_aps_ack_confirm(msg["data"])
             else:
                 self._on_notification(NOTIFICATIONS[event].from_dict(msg["data"]))
         elif msg_type == "event":
@@ -327,8 +331,22 @@ class ZigguratApi:
         logger.log(level, "%s", data["message"])
 
     def _handle_send_confirm(self, data: dict[str, Any]) -> None:
-        """Resolve a send's confirmation."""
-        confirm = self._pending_confirms.get(data["id"])
+        """Resolve a no-ack send, or an APS-ack send whose handoff failed."""
+        request_id = data["id"]
+        confirm = self._pending_confirms.get(request_id)
+        if confirm is None or confirm.done():
+            return
+        # A successful handoff is not final for an APS-ack send: its aps_ack_confirm is.
+        if data["status"] == "confirmed" and request_id in self._awaiting_aps_ack:
+            return
+        self._awaiting_aps_ack.discard(request_id)
+        confirm.set_result(data)
+
+    def _handle_aps_ack_confirm(self, data: dict[str, Any]) -> None:
+        """Resolve an APS-ack send with its end-to-end result."""
+        request_id = data["id"]
+        confirm = self._pending_confirms.get(request_id)
+        self._awaiting_aps_ack.discard(request_id)
         if confirm is not None and not confirm.done():
             confirm.set_result(data)
 
@@ -339,21 +357,26 @@ class ZigguratApi:
         # `response_type` is a plain ClassVar: it cannot carry the type variable
         return cast(RESPONSE_T, command.response_type.from_dict(result))
 
-    async def request_confirmed(self, command: Request[Any]) -> str:
-        """Enqueue a send and resolve once its terminal confirmation arrives, returning
-        the trigger that fired (`quorum`, `next_hop`, or `aps_ack`). Raises
-        `DeliveryError` if the stack rejects the frame or the confirmation reports
-        failure."""
+    async def request_confirmed(self, command: SendAps) -> None:
+        """Enqueue a send and resolve once its terminal confirmation arrives: the
+        end-to-end APS ack for an ack-requested unicast, otherwise the local handoff.
+        Raises `DeliveryError` if the stack rejects the frame or the confirmation
+        reports failure."""
         async with asyncio.timeout(30):
-            result = await self._send_request(command, want_confirm=True)
+            result = await self._send_request(
+                command, want_confirm=True, expect_aps_ack=command.aps_ack
+            )
         assert result is not None
 
         if result["status"] == "failed":
             raise DeliveryError(result["reason"])
-        return cast(str, result["via"])
 
     async def _send_request(
-        self, command: Request[Any], *, want_confirm: bool = False
+        self,
+        command: Request[Any],
+        *,
+        want_confirm: bool = False,
+        expect_aps_ack: bool = False,
     ) -> dict[str, Any] | None:
         request_id = self._request_id
         self._request_id = (self._request_id + 1) % 2**32 or 1
@@ -366,6 +389,8 @@ class ZigguratApi:
         if want_confirm:
             confirm = asyncio.get_running_loop().create_future()
             self._pending_confirms[request_id] = confirm
+            if expect_aps_ack:
+                self._awaiting_aps_ack.add(request_id)
 
         message = {
             "id": request_id,
@@ -386,6 +411,7 @@ class ZigguratApi:
             return await confirm
         finally:
             self._pending_confirms.pop(request_id, None)
+            self._awaiting_aps_ack.discard(request_id)
 
     async def request_stream(
         self, command: StreamingRequest[Any, EVENT_T]

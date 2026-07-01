@@ -64,18 +64,16 @@ async def test_error_response(api: RecordingApi, server: SyntheticZiggurat) -> N
 
 
 async def test_request_confirmed(api: RecordingApi, server: SyntheticZiggurat) -> None:
-    """An APS-ack send is confirmed end-to-end; the trigger names the APS ack."""
-    via = await api.request_confirmed(SEND_APS)
-    assert via == "aps_ack"
+    """An APS-ack send resolves once the end-to-end APS ack arrives."""
+    await api.request_confirmed(SEND_APS)
     assert server.sent(commands.SendAps)[-1].aps_seq == 55
 
 
 async def test_request_confirmed_next_hop(
     api: RecordingApi, server: SyntheticZiggurat
 ) -> None:
-    """A no-ack unicast is confirmed by next-hop acceptance."""
-    via = await api.request_confirmed(replace(SEND_APS, aps_ack=False))
-    assert via == "next_hop"
+    """A no-ack unicast resolves on the local handoff."""
+    await api.request_confirmed(replace(SEND_APS, aps_ack=False))
 
 
 async def test_request_confirmed_rejected(
@@ -95,12 +93,13 @@ async def test_request_confirmed_rejected(
 async def test_request_confirmed_failure(
     api: RecordingApi, server: SyntheticZiggurat
 ) -> None:
-    """Stage three: the stack accepts the frame but the confirmation reports failure."""
+    """The frame is handed off but the end-to-end APS ack never arrives."""
 
     async def ack_timeout(
         command: commands.SendAps, request_id: int
     ) -> commands.Status:
-        await server.send_confirm(request_id, reason="APS ack timed out")
+        await server.send_confirm(request_id)
+        await server.aps_ack_confirm(request_id, reason="APS ack timed out")
         return commands.Status(status="accepted")
 
     server.handlers["send_aps"] = ack_timeout
