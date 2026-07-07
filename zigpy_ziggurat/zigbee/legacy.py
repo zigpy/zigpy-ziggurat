@@ -1,6 +1,4 @@
-"""Typed models for the ziggurat JSON-RPC wire protocol, mirroring the server's
-serde types. Requests and responses share one set of wire formats; notifications
-encode network addresses little-endian."""
+"""Legacy JSON-RPC wire protocol for the WebSocket transport."""
 
 from dataclasses import dataclass
 import enum
@@ -177,6 +175,9 @@ class Configure(Request[Status]):
     tclk_seed: str | None
     tclk_flavor: str | None
 
+    aps_frame_counter: int = 0
+    started: bool = False
+
 
 @dataclass
 class NetworkInfo(Response):
@@ -194,6 +195,9 @@ class NetworkInfo(Response):
     tclk_seed: str | None
     tclk_flavor: str | None
     key_table: list[KeyTableEntry]
+
+    aps_frame_counter: int = 0
+    started: bool = False
 
 
 @dataclass

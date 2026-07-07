@@ -26,7 +26,7 @@ from tests.common import (
     make_app_config,
     server,
 )
-from zigpy_ziggurat.zigbee import application as application_module, commands
+from zigpy_ziggurat.zigbee import application as application_module, legacy as commands
 from zigpy_ziggurat.zigbee.application import (
     ControllerApplication,
     ZigguratCoordinator,

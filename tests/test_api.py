@@ -1,46 +1,182 @@
-"""Tests for the `ZigguratApi` request/response layer, against the synthetic server."""
+"""Tests for the `ZigguratApi` request/response layer against a fake transport."""
 
 import asyncio
-from collections.abc import AsyncIterator
-from dataclasses import replace
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import TypeVar, cast
 
 import pytest
 from zigpy.exceptions import DeliveryError
 import zigpy.types as t
 
-from tests.common import RpcError, SyntheticZiggurat, server
-from zigpy_ziggurat.zigbee import commands
-from zigpy_ziggurat.zigbee.application import ZigguratApi
+from zigpy_ziggurat.zigbee import api as api_module, protocol as p
+from zigpy_ziggurat.zigbee.api import ZigguratApi
 
-SEND_APS = commands.SendAps(
-    delivery_mode="unicast",
-    destination_eui64=None,
-    destination=t.NWK(0x1234),
-    profile_id=0x0104,
-    cluster_id=0x0006,
-    src_ep=1,
-    dst_ep=1,
-    aps_ack=True,
-    aps_seq=55,
-    radius=30,
-    aps_encryption=False,
-    priority=0,
-    data=b"\x01\x02",
-)
+_Bytes = t.LVList[t.uint8_t, t.uint16_t]
+RequestT = TypeVar("RequestT", bound=p.Request)
+Handler = Callable[[p.Request, int], Awaitable[None]]
+
+
+def _send_aps(*, aps_ack: bool) -> p.SendAps:
+    return p.SendAps.build(
+        delivery_mode=p.DeliveryMode.UNICAST,
+        destination=t.NWK(0x1234),
+        destination_eui64=None,
+        aps_ack=aps_ack,
+        aps_encryption=False,
+        profile_id=0x0104,
+        cluster_id=0x0006,
+        src_ep=1,
+        dst_ep=1,
+        aps_seq=55,
+        radius=30,
+        priority=0,
+        asdu=b"\x01\x02",
+    )
+
+
+class SyntheticBinaryTransport:
+    """A fake firmware: parses request frames, records them, and replies with the
+    binary frames its per-command handlers produce."""
+
+    def __init__(self) -> None:
+        self._on_frame: Callable[[bytes], None] = lambda frame: None
+        self._on_lost: Callable[[BaseException | None], None] = lambda exc: None
+        self.requests: list[p.Request] = []
+        self.hw_ieee = t.EUI64.convert("11:22:33:44:55:66:77:88")
+        self.handlers: dict[p.CommandId, Handler] = {
+            p.CommandId.PING: self._empty_ok,
+            p.CommandId.RESET: self._empty_ok,
+            p.CommandId.PERMIT_JOINS: self._empty_ok,
+            p.CommandId.GET_HW_ADDRESS: self._hw_address,
+            p.CommandId.SEND_APS: self._send_aps,
+            p.CommandId.ENERGY_SCAN: self._energy_scan,
+        }
+
+    def factory(
+        self,
+        url: str,
+        on_frame: Callable[[bytes], None],
+        on_lost: Callable[[BaseException | None], None],
+        *,
+        baudrate: int = 115200,
+        flow_control: str | None = None,
+    ) -> "SyntheticBinaryTransport":
+        self._on_frame = on_frame
+        self._on_lost = on_lost
+        return self
+
+    async def connect(self) -> None:
+        pass
+
+    async def disconnect(self) -> None:
+        pass
+
+    async def send_frame(self, frame: bytes) -> None:
+        command = p.CommandId(frame[0])
+        request_id = int.from_bytes(frame[1:3], "little")
+        request = p.REQUESTS[command].deserialize(frame[3:])[0]
+        self.requests.append(request)
+        await self.handlers[command](request, request_id)
+
+    def sent(self, request_type: type[RequestT]) -> list[RequestT]:
+        return [r for r in self.requests if isinstance(r, request_type)]
+
+    # -- frame injection -----------------------------------------------------------
+
+    def ok(
+        self, command: p.CommandId, request_id: int, payload: p.Response | None = None
+    ) -> None:
+        body = bytes([p.Status.OK]) + (payload.serialize() if payload else b"")
+        self._on_frame(p.encode_reply(p.FrameType.RESPONSE, command, request_id, body))
+
+    def error(
+        self, command: p.CommandId, request_id: int, status: p.Status, message: str = ""
+    ) -> None:
+        body = p.Error(status=status, message=_Bytes(message.encode())).serialize()
+        self._on_frame(p.encode_reply(p.FrameType.RESPONSE, command, request_id, body))
+
+    def event(self, command: p.CommandId, request_id: int, payload: p.Response) -> None:
+        self._on_frame(
+            p.encode_reply(p.FrameType.EVENT, command, request_id, payload.serialize())
+        )
+
+    def notify(
+        self, command: p.CommandId, request_id: int, payload: p.Notification
+    ) -> None:
+        self._on_frame(
+            p.encode_reply(
+                p.FrameType.NOTIFICATION, command, request_id, payload.serialize()
+            )
+        )
+
+    def send_confirm(
+        self, request_id: int, *, confirmed: bool = True, reason: str = ""
+    ) -> None:
+        self.notify(
+            p.CommandId.SEND_CONFIRM,
+            request_id,
+            p.SendConfirm(
+                confirmed=t.Bool(confirmed),
+                next_hop=t.NWK(0xFFFF),
+                reason=_Bytes(reason.encode()),
+            ),
+        )
+
+    def aps_ack_confirm(
+        self, request_id: int, *, acked: bool = True, reason: str = ""
+    ) -> None:
+        self.notify(
+            p.CommandId.APS_ACK_CONFIRM,
+            request_id,
+            p.ApsAckConfirm(acked=t.Bool(acked), reason=_Bytes(reason.encode())),
+        )
+
+    def lose(self, exc: BaseException | None = None) -> None:
+        self._on_lost(exc)
+
+    # -- default handlers ----------------------------------------------------------
+
+    async def _empty_ok(self, request: p.Request, request_id: int) -> None:
+        self.ok(request.command, request_id)
+
+    async def _hw_address(self, request: p.Request, request_id: int) -> None:
+        self.ok(request.command, request_id, p.HwAddress(ieee=self.hw_ieee))
+
+    async def _send_aps(self, request: p.Request, request_id: int) -> None:
+        self.ok(request.command, request_id)
+        self.send_confirm(request_id)
+        if request.aps_ack:  # type: ignore[attr-defined]
+            self.aps_ack_confirm(request_id)
+
+    async def _energy_scan(self, request: p.Request, request_id: int) -> None:
+        for channel in request.channels:  # type: ignore[attr-defined]
+            self.event(
+                p.CommandId.ENERGY_SCAN,
+                request_id,
+                p.EnergyResult(channel=t.uint8_t(channel), rssi=t.int8s(-85)),
+            )
+        self.ok(request.command, request_id)
 
 
 class RecordingApi(ZigguratApi):
     """A `ZigguratApi` whose callbacks record into plain lists."""
 
     def __init__(self, url: str) -> None:
-        self.notifications: list[commands.Notification] = []
+        self.notifications: list[p.Notification] = []
         self.disconnects: list[BaseException | None] = []
         super().__init__(url, self.notifications.append, self.disconnects.append)
 
 
 @pytest.fixture
-async def api(server: SyntheticZiggurat) -> AsyncIterator[RecordingApi]:
-    instance = RecordingApi(server.url)
+def transport(monkeypatch: pytest.MonkeyPatch) -> SyntheticBinaryTransport:
+    server = SyntheticBinaryTransport()
+    monkeypatch.setattr(api_module, "select_transport", lambda url: server.factory)
+    return server
+
+
+@pytest.fixture
+async def api(transport: SyntheticBinaryTransport) -> AsyncIterator[RecordingApi]:
+    instance = RecordingApi("binary://test")
     await instance.connect()
 
     yield instance
@@ -48,146 +184,158 @@ async def api(server: SyntheticZiggurat) -> AsyncIterator[RecordingApi]:
     await instance.disconnect()
 
 
-async def test_request(api: RecordingApi) -> None:
-    status = await api.request(commands.Ping())
-    assert status == commands.Status(status="pong")
+async def test_request(api: RecordingApi, transport: SyntheticBinaryTransport) -> None:
+    # An empty OK reply returns None
+    assert await api.request(p.Ping()) is None
+
+    hw = await api.request(p.GetHwAddress())
+    assert isinstance(hw, p.HwAddress)
+    assert hw.ieee == transport.hw_ieee
 
 
-async def test_error_response(api: RecordingApi, server: SyntheticZiggurat) -> None:
-    async def fail(command: commands.Ping, request_id: int) -> commands.Status:
-        raise RpcError("serial_port_error", "it burned down")
+async def test_error_response(
+    api: RecordingApi, transport: SyntheticBinaryTransport
+) -> None:
+    async def fail(request: p.Request, request_id: int) -> None:
+        transport.error(
+            request.command, request_id, p.Status.RADIO_ERROR, "it burned down"
+        )
 
-    server.handlers["ping"] = fail
+    transport.handlers[p.CommandId.PING] = fail
 
-    with pytest.raises(DeliveryError, match="serial_port_error: it burned down"):
-        await api.request(commands.Ping())
+    with pytest.raises(DeliveryError, match="radio_error: it burned down"):
+        await api.request(p.Ping())
 
 
-async def test_request_confirmed(api: RecordingApi, server: SyntheticZiggurat) -> None:
+async def test_request_confirmed(
+    api: RecordingApi, transport: SyntheticBinaryTransport
+) -> None:
     """An APS-ack send resolves once the end-to-end APS ack arrives."""
-    await api.request_confirmed(SEND_APS)
-    assert server.sent(commands.SendAps)[-1].aps_seq == 55
+    await api.request_confirmed(_send_aps(aps_ack=True))
+    assert transport.sent(p.SendAps)[-1].aps_seq == 55
 
 
 async def test_request_confirmed_next_hop(
-    api: RecordingApi, server: SyntheticZiggurat
+    api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:
     """A no-ack unicast resolves on the local handoff."""
-    await api.request_confirmed(replace(SEND_APS, aps_ack=False))
+    await api.request_confirmed(_send_aps(aps_ack=False))
 
 
 async def test_request_confirmed_rejected(
-    api: RecordingApi, server: SyntheticZiggurat
+    api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:
-    """Stage two: the stack rejects the frame, so the send raises before any confirm."""
+    """The stack rejects the frame, so the send raises before any confirm."""
 
-    async def fail(command: commands.SendAps, request_id: int) -> commands.Status:
-        raise RpcError("transmit_failed", "channel busy")
+    async def reject(request: p.Request, request_id: int) -> None:
+        transport.error(
+            request.command, request_id, p.Status.TRANSMIT_FAILED, "channel busy"
+        )
 
-    server.handlers["send_aps"] = fail
+    transport.handlers[p.CommandId.SEND_APS] = reject
 
     with pytest.raises(DeliveryError, match="transmit_failed"):
-        await api.request_confirmed(SEND_APS)
+        await api.request_confirmed(_send_aps(aps_ack=True))
 
 
 async def test_request_confirmed_failure(
-    api: RecordingApi, server: SyntheticZiggurat
+    api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:
     """The frame is handed off but the end-to-end APS ack never arrives."""
 
-    async def ack_timeout(
-        command: commands.SendAps, request_id: int
-    ) -> commands.Status:
-        await server.send_confirm(request_id)
-        await server.aps_ack_confirm(request_id, reason="APS ack timed out")
-        return commands.Status(status="accepted")
+    async def ack_timeout(request: p.Request, request_id: int) -> None:
+        transport.ok(request.command, request_id)
+        transport.send_confirm(request_id, confirmed=True)
+        transport.aps_ack_confirm(request_id, acked=False, reason="APS ack timed out")
 
-    server.handlers["send_aps"] = ack_timeout
+    transport.handlers[p.CommandId.SEND_APS] = ack_timeout
 
     with pytest.raises(DeliveryError, match="APS ack timed out"):
-        await api.request_confirmed(SEND_APS)
+        await api.request_confirmed(_send_aps(aps_ack=True))
 
 
-async def test_unsolicited_messages_are_ignored(
-    api: RecordingApi, server: SyntheticZiggurat, caplog: pytest.LogCaptureFixture
+async def test_request_stream(
+    api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:
-    await server.send_raw("not json")
-    await server.send_raw('{"type": "response", "id": 9999, "result": {}}')
-    await server.send_raw('{"type": "event", "id": 9999, "event": "spurious"}')
-
-    # An unknown event for an in-flight request is ignored (only stream results match)
-    async def eager(command: commands.Ping, request_id: int) -> commands.Status:
-        await server.send_event(request_id, "spurious")
-        return commands.Status(status="pong")
-
-    server.handlers["ping"] = eager
-
-    # The connection survives all of it
-    status = await api.request(commands.Ping())
-    assert status == commands.Status(status="pong")
-    assert "Failed to handle message" in caplog.text
+    results: list[p.EnergyResult] = []
+    async for item in api.request_stream(
+        p.EnergyScan(channels=_Bytes([15, 20]), duration_per_channel_ms=t.uint16_t(100))
+    ):
+        results.append(cast(p.EnergyResult, item))
+    assert [(r.channel, r.rssi) for r in results] == [(15, -85), (20, -85)]
 
 
-async def test_notifications(api: RecordingApi, server: SyntheticZiggurat) -> None:
-    sent: list[commands.Notification] = [
-        commands.ReceivedApsCommand(
+async def test_notifications(
+    api: RecordingApi, transport: SyntheticBinaryTransport
+) -> None:
+    transport.notify(
+        p.CommandId.RECEIVED_APS,
+        0,
+        p.ReceivedAps(
             source=t.NWK(0xAB12),
             destination=t.NWK(0x0000),
-            group=None,
+            has_group=t.Bool(False),
+            group=t.uint16_t(0),
             profile_id=t.uint16_t(0x0104),
             cluster_id=t.uint16_t(0x0006),
             src_ep=t.uint8_t(1),
             dst_ep=t.uint8_t(1),
             lqi=t.uint8_t(255),
             rssi=t.int8s(-40),
-            data=b"\x01\x02",
+            data=_Bytes(b"\x01\x02"),
         ),
-        commands.FrameCounterUpdate(frame_counter=t.uint32_t(1000)),
-        commands.LinkKeyUpdate(
-            ieee=t.EUI64.convert("aa:aa:aa:aa:aa:aa:aa:aa"),
-            key=t.KeyData.convert("00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff"),
-        ),
-        commands.DeviceJoined(
+    )
+    transport.notify(
+        p.CommandId.FRAME_COUNTER, 0, p.FrameCounter(frame_counter=t.uint32_t(1000))
+    )
+    transport.notify(
+        p.CommandId.DEVICE_JOINED,
+        0,
+        p.DeviceJoined(
             nwk=t.NWK(0xAB12),
             ieee=t.EUI64.convert("aa:aa:aa:aa:aa:aa:aa:aa"),
             parent=t.NWK(0x0000),
         ),
-        commands.DeviceLeft(
-            nwk=t.NWK(0xAB12),
-            ieee=None,
-            reason=commands.DeviceLeaveReason.ROUTER_REPORTED,
-            router=t.NWK(0x0000),
-            router_ieee=t.EUI64.convert("aa:aa:aa:aa:aa:aa:aa:aa"),
-        ),
-        commands.ApsDecryptionFailure(
-            source=t.NWK(0x1234),
-            source_ieee=t.EUI64.convert("aa:aa:aa:aa:aa:aa:aa:aa"),
-            frame_counter=t.uint32_t(42),
-            key_id="tc_link_key",
-        ),
+    )
+
+    assert [type(n) for n in api.notifications] == [
+        p.ReceivedAps,
+        p.FrameCounter,
+        p.DeviceJoined,
     ]
+    received = api.notifications[0]
+    assert isinstance(received, p.ReceivedAps)
+    assert received.data_bytes == b"\x01\x02"
 
-    for notification in sent:
-        await server.send_notification(notification)
 
-    async with asyncio.timeout(1):
-        while len(api.notifications) < len(sent):
-            await asyncio.sleep(0.01)
+async def test_unsolicited_frames_are_ignored(
+    api: RecordingApi, transport: SyntheticBinaryTransport
+) -> None:
+    # A response and an event for an unknown request id
+    transport.ok(p.CommandId.PING, 9999)
+    transport.event(
+        p.CommandId.ENERGY_SCAN,
+        9999,
+        p.EnergyResult(channel=t.uint8_t(1), rssi=t.int8s(-10)),
+    )
+    # A frame with an unknown command byte
+    transport._on_frame(bytes([p.FrameType.NOTIFICATION, 0xEE, 0x00, 0x00]))
 
-    assert api.notifications == sent
+    # The connection survives all of it
+    assert await api.request(p.Ping()) is None
 
 
 async def test_connection_lost_fails_pending_requests(
-    api: RecordingApi, server: SyntheticZiggurat
+    api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:
-    async def withhold(command: commands.Ping, request_id: int) -> None:
+    async def withhold(request: p.Request, request_id: int) -> None:
         return None
 
-    server.handlers["ping"] = withhold
+    transport.handlers[p.CommandId.PING] = withhold
 
-    request = asyncio.ensure_future(api.request(commands.Ping()))
-    await server.wait_for(commands.Ping)
-    await server.ws.close()
+    request = asyncio.ensure_future(api.request(p.Ping()))
+    await asyncio.sleep(0)
+    transport.lose(None)
 
     with pytest.raises(ConnectionError):
         await request
@@ -195,31 +343,18 @@ async def test_connection_lost_fails_pending_requests(
     assert api.disconnects == [None]
 
 
-async def test_protocol_error_disconnects(
-    api: RecordingApi, server: SyntheticZiggurat
-) -> None:
-    # A malformed frame (reserved opcode) surfaces as a websocket protocol error
-    server.transport.write(b"\x8f\x00")
-
-    async with asyncio.timeout(1):
-        while not api.disconnects:
-            await asyncio.sleep(0.01)
-
-    assert len(api.disconnects) == 1
-
-
 async def test_timed_out_request_failed_late(
-    api: RecordingApi, server: SyntheticZiggurat
+    api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:
-    async def withhold(command: commands.Ping, request_id: int) -> None:
+    async def withhold(request: p.Request, request_id: int) -> None:
         return None
 
-    server.handlers["ping"] = withhold
+    transport.handlers[p.CommandId.PING] = withhold
 
     # The caller gave up before any response arrived (zigpy wraps requests in
     # timeouts); disconnecting must tolerate the abandoned, cancelled future
     with pytest.raises(TimeoutError):
-        await asyncio.wait_for(api.request(commands.Ping()), 0.05)
+        await asyncio.wait_for(api.request(p.Ping()), 0.05)
 
     await api.disconnect()
     await asyncio.sleep(0)

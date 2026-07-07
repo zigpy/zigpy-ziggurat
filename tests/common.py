@@ -14,7 +14,7 @@ import pytest
 import zigpy.config
 import zigpy.types as t
 
-from zigpy_ziggurat.zigbee import commands
+from zigpy_ziggurat.zigbee import legacy as commands
 from zigpy_ziggurat.zigbee.application import ControllerApplication
 
 
