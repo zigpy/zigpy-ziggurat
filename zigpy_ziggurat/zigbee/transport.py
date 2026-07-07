@@ -20,6 +20,8 @@ _LOGGER = logging.getLogger(__name__)
 
 WEBSOCKET_HEARTBEAT = 15
 
+VENDOR_ZIGGURAT = aiospinel.PackedUInt21(0x3C20)
+
 # The callback the API installs to receive a device -> host binary frame.
 OnFrame = Callable[[bytes], None]
 OnLost = Callable[[BaseException | None], None]
@@ -63,9 +65,7 @@ class _SpinelProtocol(aiospinel.SpinelProtocol):
         super().__init__()
         self._on_frame = on_frame
         self._on_lost = on_lost
-        self.add_property_listener(
-            aiospinel.PropertyID.VENDOR_ZIGGURAT_STREAM, self._stream_frame_received
-        )
+        self.add_property_listener(VENDOR_ZIGGURAT, self._stream_frame_received)
 
     def connection_lost(self, exc: BaseException | None) -> None:
         super().connection_lost(exc)
@@ -82,44 +82,27 @@ class _SpinelProtocol(aiospinel.SpinelProtocol):
             _LOGGER.exception("Failed to handle frame: %r", data)
 
     async def start_ziggurat(self) -> None:
-        # No RCP reset here: a platform reset reboots the MCU and wipes the running
-        # Zigbee network, but the network must survive client reconnects. `enable` is
-        # idempotent (starts the stack on first call after boot, a no-op after).
         rsp = await self.send_command(
             aiospinel.CommandID.PROP_VALUE_GET,
-            aiospinel.PropertyID.VENDOR_ZIGGURAT_VERSION.serialize(),
+            VENDOR_ZIGGURAT.serialize(),
         )
-        prop_id, version = aiospinel.PropertyID.deserialize(rsp.data)
-        if prop_id != aiospinel.PropertyID.VENDOR_ZIGGURAT_VERSION:
+        prop_id, _ = aiospinel.PackedUInt21.deserialize(rsp.data)
+        if prop_id != VENDOR_ZIGGURAT:
             raise ConnectionError(
                 f"Firmware does not embed the Ziggurat stack: {rsp!r}"
             )
-        _LOGGER.debug(
-            "Embedded ziggurat firmware: %s", version.rstrip(b"\x00").decode("ascii")
-        )
-
-        rsp = await self.send_command(
-            aiospinel.CommandID.PROP_VALUE_SET,
-            aiospinel.PropertyID.VENDOR_ZIGGURAT_ENABLE.serialize() + b"\x01",
-        )
-        prop_id, enabled = aiospinel.PropertyID.deserialize(rsp.data)
-        if prop_id != aiospinel.PropertyID.VENDOR_ZIGGURAT_ENABLE or enabled != b"\x01":
-            raise ConnectionError(f"Failed to start the Ziggurat stack: {rsp!r}")
+        _LOGGER.debug("Embedded Ziggurat firmware detected")
 
     async def tunnel_send(self, frame: bytes) -> None:
         # No retries: a timed-out tunnel write must not resend the request (the first
         # copy may already have been processed).
         rsp = await self.send_command(
             aiospinel.CommandID.PROP_VALUE_SET,
-            (
-                aiospinel.PropertyID.VENDOR_ZIGGURAT_STREAM.serialize()
-                + len(frame).to_bytes(2, "little")
-                + frame
-            ),
+            (VENDOR_ZIGGURAT.serialize() + len(frame).to_bytes(2, "little") + frame),
             retries=0,
         )
-        prop_id, _ = aiospinel.PropertyID.deserialize(rsp.data)
-        if prop_id != aiospinel.PropertyID.VENDOR_ZIGGURAT_STREAM:
+        prop_id, _ = aiospinel.PackedUInt21.deserialize(rsp.data)
+        if prop_id != VENDOR_ZIGGURAT:
             raise ConnectionError(f"Tunnel write rejected: {rsp!r}")
 
 
@@ -332,7 +315,10 @@ class LegacyWebSocketTransport(_WebSocketBase):
         request_id = int.from_bytes(frame[1:3], "little")
         request = p.REQUESTS[command].deserialize(frame[3:])[0]
 
-        if command == p.CommandId.CONFIGURE:
+        if command == p.CommandId.SHUTDOWN:
+            # The legacy server has no shutdown; it replaces the stack on `configure`.
+            self._emit_ok(command, request_id)
+        elif command == p.CommandId.CONFIGURE:
             self._pending_configure = cast(p.Configure, request)
             self._pending_keys = []
             self._emit_ok(command, request_id)

@@ -37,6 +37,7 @@ class CommandId(t.enum8):
     RESET = 0x02
     GET_FIRMWARE_INFO = 0x03
     GET_HW_ADDRESS = 0x04
+    SHUTDOWN = 0x05
     CONFIGURE = 0x10
     LOAD_KEY_TABLE = 0x11
     LOAD_CHILDREN = 0x12
@@ -267,6 +268,10 @@ class Reset(Request):
     command = CommandId.RESET
 
     hard: t.Bool
+
+
+class Shutdown(Request):
+    command = CommandId.SHUTDOWN
 
 
 class GetFirmwareInfo(Request):

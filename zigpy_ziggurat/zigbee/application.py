@@ -470,7 +470,8 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         )
 
     async def reset_network_info(self) -> None:
-        pass
+        assert self._api is not None
+        await self._api.request(p.Shutdown())
 
     async def _watchdog_feed(self) -> None:
         assert self._api is not None

@@ -46,6 +46,7 @@ class SyntheticBinaryTransport:
         self.handlers: dict[p.CommandId, Handler] = {
             p.CommandId.PING: self._empty_ok,
             p.CommandId.RESET: self._empty_ok,
+            p.CommandId.SHUTDOWN: self._empty_ok,
             p.CommandId.PERMIT_JOINS: self._empty_ok,
             p.CommandId.GET_HW_ADDRESS: self._hw_address,
             p.CommandId.SEND_APS: self._send_aps,
@@ -191,6 +192,11 @@ async def test_request(api: RecordingApi, transport: SyntheticBinaryTransport) -
     hw = await api.request(p.GetHwAddress())
     assert isinstance(hw, p.HwAddress)
     assert hw.ieee == transport.hw_ieee
+
+
+async def test_shutdown(api: RecordingApi, transport: SyntheticBinaryTransport) -> None:
+    assert await api.request(p.Shutdown()) is None
+    assert isinstance(transport.sent(p.Shutdown)[-1], p.Shutdown)
 
 
 async def test_error_response(
