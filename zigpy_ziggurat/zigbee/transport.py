@@ -20,7 +20,7 @@ _LOGGER = logging.getLogger(__name__)
 
 WEBSOCKET_HEARTBEAT = 15
 
-VENDOR_ZIGGURAT = aiospinel.PackedUInt21(0x3C20)
+PROP_VENDOR_ZIGGURAT = aiospinel.PackedUInt21(0x3D5A)
 
 # The callback the API installs to receive a device -> host binary frame.
 OnFrame = Callable[[bytes], None]
@@ -65,7 +65,7 @@ class _SpinelProtocol(aiospinel.SpinelProtocol):
         super().__init__()
         self._on_frame = on_frame
         self._on_lost = on_lost
-        self.add_property_listener(VENDOR_ZIGGURAT, self._stream_frame_received)
+        self.add_property_listener(PROP_VENDOR_ZIGGURAT, self._stream_frame_received)
 
     def connection_lost(self, exc: BaseException | None) -> None:
         super().connection_lost(exc)
@@ -84,10 +84,10 @@ class _SpinelProtocol(aiospinel.SpinelProtocol):
     async def start_ziggurat(self) -> None:
         rsp = await self.send_command(
             aiospinel.CommandID.PROP_VALUE_GET,
-            VENDOR_ZIGGURAT.serialize(),
+            PROP_VENDOR_ZIGGURAT.serialize(),
         )
         prop_id, _ = aiospinel.PackedUInt21.deserialize(rsp.data)
-        if prop_id != VENDOR_ZIGGURAT:
+        if prop_id != PROP_VENDOR_ZIGGURAT:
             raise ConnectionError(
                 f"Firmware does not embed the Ziggurat stack: {rsp!r}"
             )
@@ -98,11 +98,15 @@ class _SpinelProtocol(aiospinel.SpinelProtocol):
         # copy may already have been processed).
         rsp = await self.send_command(
             aiospinel.CommandID.PROP_VALUE_SET,
-            (VENDOR_ZIGGURAT.serialize() + len(frame).to_bytes(2, "little") + frame),
+            (
+                PROP_VENDOR_ZIGGURAT.serialize()
+                + len(frame).to_bytes(2, "little")
+                + frame
+            ),
             retries=0,
         )
         prop_id, _ = aiospinel.PackedUInt21.deserialize(rsp.data)
-        if prop_id != VENDOR_ZIGGURAT:
+        if prop_id != PROP_VENDOR_ZIGGURAT:
             raise ConnectionError(f"Tunnel write rejected: {rsp!r}")
 
 
