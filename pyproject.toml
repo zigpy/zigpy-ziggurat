@@ -17,7 +17,7 @@ dependencies = [
     "zigpy",
     "aiohttp",
     "mashumaro",
-    "aiospinel",
+    "aiospinel>=1.1.0",
 ]
 
 [project.entry-points."zigpy.radio"]
@@ -108,6 +108,3 @@ exclude_lines = [
     "raise NotImplementedError",
     "raise NotImplementedError()",
 ]
-
-[tool.uv.sources]
-aiospinel = { path = "../aiospinel" }

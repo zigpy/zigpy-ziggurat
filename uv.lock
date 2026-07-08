@@ -130,26 +130,15 @@ wheels = [
 
 [[package]]
 name = "aiospinel"
-source = { directory = "../aiospinel" }
+version = "1.1.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "typing-extensions" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "codespell", marker = "extra == 'dev'", specifier = ">=2.4.2" },
-    { name = "mypy", marker = "extra == 'dev'", specifier = ">=2.1.0" },
-    { name = "prek", marker = "extra == 'dev'", specifier = ">=0.3.11" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.1" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=1.3.0" },
-    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.1.0" },
-    { name = "pytest-timeout", marker = "extra == 'dev'", specifier = ">=2.4.0" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.14.6" },
-    { name = "types-setuptools", marker = "extra == 'dev'", specifier = ">=82.0.0.20260508" },
-    { name = "typing-extensions" },
-    { name = "uv", marker = "extra == 'dev'", specifier = ">=0.11.14" },
+sdist = { url = "https://files.pythonhosted.org/packages/a2/e8/9c0412dfde89729dfdcdf832e44a48ca07eebc72c8f35ae50163713f4670/aiospinel-1.1.0.tar.gz", hash = "sha256:6d586e1c102cf413e06c4b969d150b2dfdf18cf4cbf0722eda04cc7ee3c83d65", size = 59384, upload-time = "2026-07-08T18:24:24.203Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/10/e9/d55f9f3201b90729c3969fd20ccc79e9dd71bcc36d0f6985c9151a4d8398/aiospinel-1.1.0-py3-none-any.whl", hash = "sha256:ebd6c77e00f674ef3033a13a658a8f57006975bb24d22fe81e6f090d6ce18f87", size = 14362, upload-time = "2026-07-08T18:24:22.812Z" },
 ]
-provides-extras = ["dev"]
 
 [[package]]
 name = "aiosqlite"
@@ -1555,7 +1544,7 @@ testing = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp" },
-    { name = "aiospinel", directory = "../aiospinel" },
+    { name = "aiospinel", specifier = ">=1.1.0" },
     { name = "mashumaro" },
     { name = "zigpy" },
 ]
