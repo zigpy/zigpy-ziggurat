@@ -18,12 +18,13 @@ CONFIRM_TIMEOUT = 30
 
 
 class _Pending:
-    """One in-flight request: its response body, plus an event queue when streaming."""
+    """One in-flight request: the request itself, its response, and a stream queue."""
 
-    def __init__(self, *, streaming: bool) -> None:
+    def __init__(self, request: p.Request, *, streaming: bool) -> None:
         loop = asyncio.get_running_loop()
-        self.response: asyncio.Future[bytes] = loop.create_future()
-        self.events: asyncio.Queue[bytes | None] | None = (
+        self.request = request
+        self.response: asyncio.Future[p.Response | None] = loop.create_future()
+        self.events: asyncio.Queue[p.Response | None] | None = (
             asyncio.Queue() if streaming else None
         )
 
@@ -88,20 +89,16 @@ class ZigguratApi:
     async def request(self, request: p.Request) -> p.Response | None:
         """Send a request; return its response, or None if the OK reply is empty."""
         request_id = self._next_id()
-        pending = _Pending(streaming=False)
+        pending = _Pending(request, streaming=False)
         self._pending[request_id] = pending
 
         _LOGGER.debug("Sending request (id=%d): %r", request_id, request)
 
         try:
             await self._transport.send_frame(p.encode_request(request, request_id))
-            body = await pending.response
+            return await pending.response
         finally:
             self._pending.pop(request_id, None)
-
-        if request.response is None:
-            return None
-        return request.response.deserialize(body)[0]
 
     async def request_confirmed(self, send: p.SendAps) -> None:
         """Send and await the terminal confirmation."""
@@ -110,7 +107,7 @@ class ZigguratApi:
         # unicast, otherwise the local handoff. A rejected frame raises `DeliveryError`
         # before any confirm; a failed confirmation raises it too.
         request_id = self._next_id()
-        pending = _Pending(streaming=False)
+        pending = _Pending(send, streaming=False)
         self._pending[request_id] = pending
         confirm: asyncio.Future[p.SendConfirm | p.ApsAckConfirm] = (
             asyncio.get_running_loop().create_future()
@@ -143,7 +140,7 @@ class ZigguratApi:
         # An error response or disconnect is raised once the stream is exhausted.
         assert request.event is not None
         request_id = self._next_id()
-        pending = _Pending(streaming=True)
+        pending = _Pending(request, streaming=True)
         self._pending[request_id] = pending
         assert pending.events is not None
 
@@ -152,7 +149,7 @@ class ZigguratApi:
         await self._transport.send_frame(p.encode_request(request, request_id))
         try:
             while (item := await pending.events.get()) is not None:
-                yield request.event.deserialize(item)[0]
+                yield item
             await pending.response  # surface an error
         finally:
             self._pending.pop(request_id, None)
@@ -164,57 +161,76 @@ class ZigguratApi:
         request_id = header.request_id
 
         if header.frame_type == p.FrameType.RESPONSE:
-            pending = self._pending.get(request_id)
-            if pending is None or pending.response.done():
-                return
-            status = p.Status(body[0])
-            if status != p.Status.OK:
-                err = p.Error.deserialize(body)[0]
-                pending.response.set_exception(
-                    p.ProtocolError(status, err.message_text)
-                )
-            else:
-                pending.response.set_result(body[1:])
-            if pending.events is not None:
-                pending.events.put_nowait(None)
+            self._handle_response(request_id, body)
         elif header.frame_type == p.FrameType.EVENT:
-            pending = self._pending.get(request_id)
-            if pending is not None and pending.events is not None:
-                pending.events.put_nowait(body)
+            self._handle_event(request_id, body)
         elif header.frame_type == p.FrameType.NOTIFICATION:
             try:
                 command = p.CommandId(header.command)
             except ValueError:
                 _LOGGER.debug("Unknown notification command %#x", header.command)
                 return
-            self._handle_notification(command, request_id, body)
+            if command not in p.NOTIFICATIONS:
+                _LOGGER.debug("Unhandled notification %r", command)
+                return
+            notification = p.NOTIFICATIONS[command].deserialize(body)[0]
+            _LOGGER.debug("Received notification (id=%d): %r", request_id, notification)
+            self._handle_notification(request_id, notification)
+
+    def _handle_response(self, request_id: int, body: bytes) -> None:
+        pending = self._pending.get(request_id)
+        if pending is None or pending.response.done():
+            return
+
+        status = p.Status(body[0])
+        if status != p.Status.OK:
+            err = p.Error.deserialize(body)[0]
+            _LOGGER.debug("Received error response (id=%d): %r", request_id, err)
+            pending.response.set_exception(p.ProtocolError(status, err.message_text))
+        else:
+            response = (
+                pending.request.response.deserialize(body[1:])[0]
+                if pending.request.response is not None
+                else None
+            )
+            _LOGGER.debug("Received response (id=%d): %r", request_id, response)
+            pending.response.set_result(response)
+
+        if pending.events is not None:
+            pending.events.put_nowait(None)
+
+    def _handle_event(self, request_id: int, body: bytes) -> None:
+        pending = self._pending.get(request_id)
+        if pending is None or pending.events is None:
+            return
+        assert pending.request.event is not None
+        event = pending.request.event.deserialize(body)[0]
+        _LOGGER.debug("Received event (id=%d): %r", request_id, event)
+        pending.events.put_nowait(event)
 
     def _handle_notification(
-        self, command: p.CommandId, request_id: int, body: bytes
+        self, request_id: int, notification: p.Notification
     ) -> None:
-        if command == p.CommandId.SEND_CONFIRM:
+        if isinstance(notification, p.SendConfirm):
             confirm = self._pending_confirms.get(request_id)
             if confirm is None or confirm.done():
                 return
-            payload = p.SendConfirm.deserialize(body)[0]
             # A confirmed handoff is not terminal for an ack-requested send.
-            if payload.confirmed and request_id in self._awaiting_aps_ack:
+            if notification.confirmed and request_id in self._awaiting_aps_ack:
                 return
             self._awaiting_aps_ack.discard(request_id)
-            confirm.set_result(payload)
-        elif command == p.CommandId.APS_ACK_CONFIRM:
+            confirm.set_result(notification)
+        elif isinstance(notification, p.ApsAckConfirm):
             self._awaiting_aps_ack.discard(request_id)
             confirm = self._pending_confirms.get(request_id)
             if confirm is not None and not confirm.done():
-                confirm.set_result(p.ApsAckConfirm.deserialize(body)[0])
-        elif command == p.CommandId.HELLO:
+                confirm.set_result(notification)
+        elif isinstance(notification, p.Hello):
             _LOGGER.debug("Ziggurat stack started")
-        elif command == p.CommandId.LAST_RESET:
-            reset = p.LastReset.deserialize(body)[0]
+        elif isinstance(notification, p.LastReset):
             logging.getLogger("ziggurat.fw").warning(
-                "The firmware's previous reset was abnormal: %s", reset.message_text
+                "The firmware's previous reset was abnormal: %s",
+                notification.message_text,
             )
-        elif command in p.NOTIFICATIONS:
-            self._on_notification(p.NOTIFICATIONS[command].deserialize(body)[0])
         else:
-            _LOGGER.debug("Unhandled notification %r", command)
+            self._on_notification(notification)
