@@ -90,6 +90,9 @@ class ZigguratApi:
         request_id = self._next_id()
         pending = _Pending(streaming=False)
         self._pending[request_id] = pending
+
+        _LOGGER.debug("Sending request (id=%d): %r", request_id, request)
+
         try:
             await self._transport.send_frame(p.encode_request(request, request_id))
             body = await pending.response
@@ -116,6 +119,8 @@ class ZigguratApi:
         if send.aps_ack:
             self._awaiting_aps_ack.add(request_id)
 
+        _LOGGER.debug("Sending request with confirmation (id=%d): %r", request_id, send)
+
         try:
             async with asyncio.timeout(CONFIRM_TIMEOUT):
                 await self._transport.send_frame(p.encode_request(send, request_id))
@@ -141,6 +146,8 @@ class ZigguratApi:
         pending = _Pending(streaming=True)
         self._pending[request_id] = pending
         assert pending.events is not None
+
+        _LOGGER.debug("Sending stream request (id=%d): %r", request_id, request)
 
         await self._transport.send_frame(p.encode_request(request, request_id))
         try:
