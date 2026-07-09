@@ -349,6 +349,32 @@ async def test_connection_lost_fails_pending_requests(
     assert api.disconnects == [None]
 
 
+async def test_hello_reported_as_disconnect(
+    api: RecordingApi, transport: SyntheticBinaryTransport
+) -> None:
+    async def withhold(request: p.Request, request_id: int) -> None:
+        return None
+
+    transport.handlers[p.CommandId.PING] = withhold
+    request = asyncio.ensure_future(api.request(p.Ping()))
+    await asyncio.sleep(0)
+
+    # A firmware reboot (`hello`) wipes the stack, so it must surface as a disconnect
+    # that fails in-flight requests, not as an ordinary notification.
+    transport.notify(
+        p.CommandId.HELLO,
+        0,
+        p.Hello(protocol_version=t.uint8_t(1), configured=t.Bool(False)),
+    )
+
+    with pytest.raises(ConnectionError):
+        await request
+
+    assert len(api.disconnects) == 1
+    assert isinstance(api.disconnects[0], ConnectionError)
+    assert api.notifications == []
+
+
 async def test_timed_out_request_failed_late(
     api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:

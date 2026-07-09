@@ -67,6 +67,9 @@ class ZigguratApi:
         await self._transport.disconnect()
 
     def _on_transport_lost(self, exc: BaseException | None) -> None:
+        self._connection_lost(exc)
+
+    def _connection_lost(self, exc: BaseException | None) -> None:
         for pending in self._pending.values():
             if not pending.response.done():
                 pending.response.set_exception(ConnectionError("Connection lost"))
@@ -76,7 +79,9 @@ class ZigguratApi:
                 confirm.set_exception(ConnectionError("Connection lost"))
         self._pending_confirms.clear()
         self._awaiting_aps_ack.clear()
+        # Report the loss once. `_closing` also suppresses it during our own teardown.
         if not self._closing:
+            self._closing = True
             self._on_disconnect(exc)
 
     def _next_id(self) -> int:
@@ -226,7 +231,8 @@ class ZigguratApi:
             if confirm is not None and not confirm.done():
                 confirm.set_result(notification)
         elif isinstance(notification, p.Hello):
-            _LOGGER.debug("Ziggurat stack started")
+            # The firmware only sends `hello` when it reboots
+            self._connection_lost(ConnectionError("Ziggurat firmware reset"))
         elif isinstance(notification, p.LastReset):
             logging.getLogger("ziggurat.fw").warning(
                 "The firmware's previous reset was abnormal: %s",
