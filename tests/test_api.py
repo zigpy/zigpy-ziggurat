@@ -53,7 +53,7 @@ class SyntheticBinaryTransport:
             p.CommandId.ENERGY_SCAN: self._energy_scan,
         }
 
-    def factory(
+    async def factory(
         self,
         url: str,
         on_frame: Callable[[bytes], None],
@@ -65,9 +65,6 @@ class SyntheticBinaryTransport:
         self._on_frame = on_frame
         self._on_lost = on_lost
         return self
-
-    async def connect(self) -> None:
-        pass
 
     async def disconnect(self) -> None:
         pass
@@ -171,7 +168,7 @@ class RecordingApi(ZigguratApi):
 @pytest.fixture
 def transport(monkeypatch: pytest.MonkeyPatch) -> SyntheticBinaryTransport:
     server = SyntheticBinaryTransport()
-    monkeypatch.setattr(api_module, "select_transport", lambda url: server.factory)
+    monkeypatch.setattr(api_module, "connect_transport", server.factory)
     return server
 
 

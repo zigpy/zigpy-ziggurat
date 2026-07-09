@@ -9,7 +9,7 @@ import logging
 from zigpy.exceptions import DeliveryError
 
 from zigpy_ziggurat.zigbee import protocol as p
-from zigpy_ziggurat.zigbee.transport import Transport, select_transport
+from zigpy_ziggurat.zigbee.transport import Transport, connect_transport
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -41,6 +41,9 @@ class ZigguratApi:
         baudrate: int = 115200,
         flow_control: str | None = None,
     ) -> None:
+        self._url = url
+        self._baudrate = baudrate
+        self._flow_control = flow_control
         self._on_notification = on_notification
         self._on_disconnect = on_disconnect
         self._closing = False
@@ -50,21 +53,21 @@ class ZigguratApi:
             int, asyncio.Future[p.SendConfirm | p.ApsAckConfirm]
         ] = {}
         self._awaiting_aps_ack: set[int] = set()
-
-        self._transport: Transport = select_transport(url)(
-            url,
-            self._handle_frame,
-            self._on_transport_lost,
-            baudrate=baudrate,
-            flow_control=flow_control,
-        )
+        self._transport: Transport | None = None
 
     async def connect(self) -> None:
-        await self._transport.connect()
+        self._transport = await connect_transport(
+            self._url,
+            self._handle_frame,
+            self._on_transport_lost,
+            baudrate=self._baudrate,
+            flow_control=self._flow_control,
+        )
 
     async def disconnect(self) -> None:
         self._closing = True
-        await self._transport.disconnect()
+        if self._transport is not None:
+            await self._transport.disconnect()
 
     def _on_transport_lost(self, exc: BaseException | None) -> None:
         self._connection_lost(exc)
@@ -99,6 +102,7 @@ class ZigguratApi:
 
         _LOGGER.debug("Sending request (id=%d): %r", request_id, request)
 
+        assert self._transport is not None
         try:
             await self._transport.send_frame(p.encode_request(request, request_id))
             return await pending.response
@@ -123,6 +127,7 @@ class ZigguratApi:
 
         _LOGGER.debug("Sending request with confirmation (id=%d): %r", request_id, send)
 
+        assert self._transport is not None
         try:
             async with asyncio.timeout(CONFIRM_TIMEOUT):
                 await self._transport.send_frame(p.encode_request(send, request_id))
@@ -151,6 +156,7 @@ class ZigguratApi:
 
         _LOGGER.debug("Sending stream request (id=%d): %r", request_id, request)
 
+        assert self._transport is not None
         await self._transport.send_frame(p.encode_request(request, request_id))
         try:
             while (item := await pending.events.get()) is not None:

@@ -27,32 +27,34 @@ OnFrame = Callable[[bytes], None]
 OnLost = Callable[[BaseException | None], None]
 
 
+# The server must announce itself with a hello within this window.
+HANDSHAKE_TIMEOUT = 5
+
+
 class Transport(Protocol):
-    """Moves binary protocol frames between the API and a device."""
-
-    def __init__(
-        self,
-        url: str,
-        on_frame: OnFrame,
-        on_lost: OnLost,
-        *,
-        baudrate: int = 115200,
-        flow_control: str | None = None,
-    ) -> None: ...
-
-    async def connect(self) -> None: ...
+    """Moves binary protocol frames between the API and a device, once connected."""
 
     async def disconnect(self) -> None: ...
 
     async def send_frame(self, frame: bytes) -> None: ...
 
 
-def select_transport(url: str) -> type[Transport]:
-    """Pick a transport by URL. A WebSocket URL still speaks JSON to the legacy
-    server; a serial port speaks the binary protocol over Spinel."""
-    if url.startswith(("ws://", "wss://", "ws+unix://")):
-        return cast("type[Transport]", LegacyWebSocketTransport)
-    return cast("type[Transport]", SpinelTransport)
+async def connect_transport(
+    url: str,
+    on_frame: OnFrame,
+    on_lost: OnLost,
+    *,
+    baudrate: int = 115200,
+    flow_control: str | None = None,
+) -> Transport:
+    """Open a connected transport for `url`, probing a WebSocket for its protocol."""
+    if not url.startswith(("ws://", "wss://", "ws+unix://")):
+        spinel = SpinelTransport(
+            url, on_frame, on_lost, baudrate=baudrate, flow_control=flow_control
+        )
+        await spinel.connect()
+        return spinel
+    return await _probe_websocket(url, on_frame, on_lost)
 
 
 # -- serial (Spinel tunnel) ------------------------------------------------------
@@ -155,47 +157,62 @@ class SpinelTransport:
 # -- WebSocket -------------------------------------------------------------------
 
 
-class _WebSocketBase:
-    """Shared aiohttp WebSocket plumbing: connect, receive loop, teardown."""
+async def _open_websocket(
+    url: str,
+) -> tuple[aiohttp.ClientSession, aiohttp.ClientWebSocketResponse]:
+    if url.startswith("ws+unix://"):
+        # The URL's path is the socket path; the HTTP host is a placeholder.
+        connector: aiohttp.BaseConnector | None = aiohttp.UnixConnector(
+            path=url.removeprefix("ws+unix://")
+        )
+        ws_url = "ws://localhost/"
+    else:
+        connector = None
+        ws_url = url
 
-    def __init__(
-        self,
-        url: str,
-        on_frame: OnFrame,
-        on_lost: OnLost,
-        *,
-        baudrate: int = 115200,
-        flow_control: str | None = None,
-    ) -> None:
-        # baudrate/flow_control are accepted for a uniform signature and ignored.
-        self._url = url
+    session = aiohttp.ClientSession(connector=connector)
+    websocket = await session.ws_connect(ws_url, heartbeat=WEBSOCKET_HEARTBEAT)
+    return session, websocket
+
+
+async def _probe_websocket(url: str, on_frame: OnFrame, on_lost: OnLost) -> Transport:
+    """Pick the transport from the server's opening hello: binary frame or JSON text."""
+    session, websocket = await _open_websocket(url)
+    async with asyncio.timeout(HANDSHAKE_TIMEOUT):
+        hello = await websocket.receive()
+
+    if hello.type == aiohttp.WSMsgType.BINARY:
+        transport: _WebSocketBase = WebSocketTransport(on_frame, on_lost)
+        _LOGGER.debug("Detected binary WebSocket protocol")
+    elif hello.type == aiohttp.WSMsgType.TEXT:
+        transport = LegacyWebSocketTransport(on_frame, on_lost)
+        _LOGGER.debug("Detected legacy JSON WebSocket protocol: %s", hello.data)
+    else:
+        await session.close()
+        raise ConnectionError(f"Unexpected handshake from ziggurat: {hello!r}")
+
+    transport._adopt(session, websocket)
+    return transport
+
+
+class _WebSocketBase:
+    """Shared aiohttp WebSocket plumbing, driven from a socket passed to `_adopt`."""
+
+    def __init__(self, on_frame: OnFrame, on_lost: OnLost) -> None:
         self._on_frame = on_frame
         self._on_lost = on_lost
         self._session: aiohttp.ClientSession | None = None
         self._websocket: aiohttp.ClientWebSocketResponse | None = None
         self._receiver_task: asyncio.Task[None] | None = None
 
-    async def connect(self) -> None:
-        if self._url.startswith("ws+unix://"):
-            # The URL's path is the socket path; the HTTP host is a placeholder.
-            connector: aiohttp.BaseConnector | None = aiohttp.UnixConnector(
-                path=self._url.removeprefix("ws+unix://")
-            )
-            url = "ws://localhost/"
-        else:
-            connector = None
-            url = self._url
-
-        self._session = aiohttp.ClientSession(connector=connector)
-        self._websocket = await self._session.ws_connect(
-            url, heartbeat=WEBSOCKET_HEARTBEAT
-        )
-        await self._on_connected()
+    def _adopt(
+        self,
+        session: aiohttp.ClientSession,
+        websocket: aiohttp.ClientWebSocketResponse,
+    ) -> None:
+        self._session = session
+        self._websocket = websocket
         self._receiver_task = asyncio.create_task(self._receive_loop())
-
-    async def _on_connected(self) -> None:
-        # Subclass hook, run after the socket opens and before the receive loop.
-        pass
 
     async def disconnect(self) -> None:
         if self._receiver_task is not None:
@@ -229,6 +246,9 @@ class _WebSocketBase:
         self._on_lost(exc)
 
     def _handle_message(self, msg: aiohttp.WSMessage) -> None:
+        raise NotImplementedError
+
+    async def send_frame(self, frame: bytes) -> None:
         raise NotImplementedError
 
     async def _send(self, data: bytes | str) -> None:
@@ -287,16 +307,8 @@ class LegacyWebSocketTransport(_WebSocketBase):
     """Transcodes the binary protocol to/from the legacy JSON-RPC server, so early
     users' existing setups keep running. Temporary."""
 
-    def __init__(
-        self,
-        url: str,
-        on_frame: OnFrame,
-        on_lost: OnLost,
-        *,
-        baudrate: int = 115200,
-        flow_control: str | None = None,
-    ) -> None:
-        super().__init__(url, on_frame, on_lost)
+    def __init__(self, on_frame: OnFrame, on_lost: OnLost) -> None:
+        super().__init__(on_frame, on_lost)
         # request id -> command, so a JSON response builds the right binary reply
         self._pending_commands: dict[int, p.CommandId] = {}
         # The binary protocol splits `configure` (Configure + LoadKeyTable* +
@@ -306,11 +318,6 @@ class LegacyWebSocketTransport(_WebSocketBase):
         # The key table the JSON get_network_info returns inline, replayed as the
         # events of the ScanKeyTable that follows on the binary side.
         self._scan_keys: list[p.KeyEntry] = []
-
-    async def _on_connected(self) -> None:
-        assert self._websocket is not None
-        hello = json.loads(await self._websocket.receive_str())
-        _LOGGER.debug("Connected to ziggurat: %r", hello)
 
     # -- outbound: binary frame -> JSON request ------------------------------------
 
