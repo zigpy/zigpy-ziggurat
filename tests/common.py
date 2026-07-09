@@ -14,7 +14,7 @@ import pytest
 import zigpy.config
 import zigpy.types as t
 
-from zigpy_ziggurat.zigbee import legacy as commands
+from zigpy_ziggurat.zigbee import legacy as commands, protocol as p
 from zigpy_ziggurat.zigbee.application import ControllerApplication
 
 
@@ -265,6 +265,54 @@ class SyntheticZiggurat:
         return commands.Status(status="complete")
 
 
+class SyntheticBinaryZiggurat:
+    """A WebSocket server speaking the binary protocol, OK-ing every request frame."""
+
+    def __init__(self) -> None:
+        self.web_app = web.Application()
+        self.web_app.router.add_get("/", self._handle_connection)
+        self.url = ""
+        self.requests: list[p.Request] = []
+
+    async def _handle_connection(self, request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+
+        hello = p.Hello(protocol_version=t.uint8_t(1), configured=t.Bool(False))
+        await ws.send_bytes(
+            p.encode_reply(
+                p.FrameType.NOTIFICATION, p.CommandId.HELLO, 0, hello.serialize()
+            )
+        )
+
+        async for msg in ws:
+            command = p.CommandId(msg.data[0])
+            request_id = int.from_bytes(msg.data[1:3], "little")
+            self.requests.append(p.REQUESTS[command].deserialize(msg.data[3:])[0])
+            await ws.send_bytes(
+                p.encode_reply(
+                    p.FrameType.RESPONSE, command, request_id, bytes([p.Status.OK])
+                )
+            )
+
+        return ws
+
+
+class ClosingZiggurat:
+    """A server that closes without a hello, so the probe cannot pick a protocol."""
+
+    def __init__(self) -> None:
+        self.web_app = web.Application()
+        self.web_app.router.add_get("/", self._handle_connection)
+        self.url = ""
+
+    async def _handle_connection(self, request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.close()
+        return ws
+
+
 def make_app_config(url: str) -> dict[str, Any]:
     return {zigpy.config.CONF_DEVICE: {zigpy.config.CONF_DEVICE_PATH: url}}
 
@@ -272,6 +320,30 @@ def make_app_config(url: str) -> dict[str, Any]:
 @pytest.fixture
 async def server() -> AsyncIterator[SyntheticZiggurat]:
     ziggurat = SyntheticZiggurat()
+    test_server = TestServer(ziggurat.web_app)
+    await test_server.start_server()
+    ziggurat.url = f"ws://localhost:{test_server.port}/"
+
+    yield ziggurat
+
+    await test_server.close()
+
+
+@pytest.fixture
+async def binary_server() -> AsyncIterator[SyntheticBinaryZiggurat]:
+    ziggurat = SyntheticBinaryZiggurat()
+    test_server = TestServer(ziggurat.web_app)
+    await test_server.start_server()
+    ziggurat.url = f"ws://localhost:{test_server.port}/"
+
+    yield ziggurat
+
+    await test_server.close()
+
+
+@pytest.fixture
+async def closing_server() -> AsyncIterator[ClosingZiggurat]:
+    ziggurat = ClosingZiggurat()
     test_server = TestServer(ziggurat.web_app)
     await test_server.start_server()
     ziggurat.url = f"ws://localhost:{test_server.port}/"
