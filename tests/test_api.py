@@ -90,7 +90,9 @@ class SyntheticBinaryTransport:
     def error(
         self, command: p.CommandId, request_id: int, status: p.Status, message: str = ""
     ) -> None:
-        body = p.Error(status=status, message=_Bytes(message.encode())).serialize()
+        body = p.Error(
+            status=status, message=t.LongCharacterString(message)
+        ).serialize()
         self._on_frame(p.encode_reply(p.FrameType.RESPONSE, command, request_id, body))
 
     def event(self, command: p.CommandId, request_id: int, payload: p.Response) -> None:
@@ -116,7 +118,7 @@ class SyntheticBinaryTransport:
             p.SendConfirm(
                 confirmed=t.Bool(confirmed),
                 next_hop=t.NWK(0xFFFF),
-                reason=_Bytes(reason.encode()),
+                reason=t.LongCharacterString(reason),
             ),
         )
 
@@ -126,11 +128,14 @@ class SyntheticBinaryTransport:
         self.notify(
             p.CommandId.APS_ACK_CONFIRM,
             request_id,
-            p.ApsAckConfirm(acked=t.Bool(acked), reason=_Bytes(reason.encode())),
+            p.ApsAckConfirm(acked=t.Bool(acked), reason=t.LongCharacterString(reason)),
         )
 
     def lose(self, exc: BaseException | None = None) -> None:
         self._on_lost(exc)
+
+    def raw(self, frame: bytes) -> None:
+        self._on_frame(frame)
 
     # -- default handlers ----------------------------------------------------------
 
@@ -285,7 +290,7 @@ async def test_notifications(
             dst_ep=t.uint8_t(1),
             lqi=t.uint8_t(255),
             rssi=t.int8s(-40),
-            data=_Bytes(b"\x01\x02"),
+            data=t.LongOctetString(b"\x01\x02"),
         ),
     )
     transport.notify(
@@ -308,7 +313,7 @@ async def test_notifications(
     ]
     received = api.notifications[0]
     assert isinstance(received, p.ReceivedAps)
-    assert received.data_bytes == b"\x01\x02"
+    assert received.data == b"\x01\x02"
 
 
 async def test_unsolicited_frames_are_ignored(
@@ -387,3 +392,69 @@ async def test_timed_out_request_failed_late(
 
     await api.disconnect()
     await asyncio.sleep(0)
+
+
+async def test_confirmed_send_delivery_failure(
+    api: RecordingApi, transport: SyntheticBinaryTransport
+) -> None:
+    async def failed_confirm(request: p.Request, request_id: int) -> None:
+        transport.ok(request.command, request_id)
+        transport.send_confirm(request_id, confirmed=False, reason="no route")
+
+    transport.handlers[p.CommandId.SEND_APS] = failed_confirm
+
+    with pytest.raises(DeliveryError, match="no route"):
+        await api.request_confirmed(_send_aps(aps_ack=False))
+
+
+async def test_connection_lost_fails_pending_confirm(
+    api: RecordingApi, transport: SyntheticBinaryTransport
+) -> None:
+    async def accept_only(request: p.Request, request_id: int) -> None:
+        # Accept the send but never confirm, leaving a pending confirmation.
+        transport.ok(request.command, request_id)
+
+    transport.handlers[p.CommandId.SEND_APS] = accept_only
+
+    request = asyncio.ensure_future(api.request_confirmed(_send_aps(aps_ack=False)))
+    while not transport.sent(p.SendAps):
+        await asyncio.sleep(0)
+    transport.lose(None)
+
+    with pytest.raises(ConnectionError):
+        await request
+
+
+async def test_unknown_notification_command_ignored(
+    api: RecordingApi, transport: SyntheticBinaryTransport
+) -> None:
+    frame = p.FrameHeader(
+        frame_type=p.FrameType.NOTIFICATION,
+        command=t.uint8_t(0x06),
+        request_id=t.uint16_t(0),
+    ).serialize()
+    transport.raw(frame)
+    assert api.notifications == []
+
+
+async def test_send_confirm_without_pending_ignored(
+    api: RecordingApi, transport: SyntheticBinaryTransport
+) -> None:
+    # A confirm for a request we aren't tracking is dropped, not misrouted.
+    transport.send_confirm(9999)
+    assert api.notifications == []
+
+
+async def test_last_reset_logged(
+    api: RecordingApi,
+    transport: SyntheticBinaryTransport,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING", logger="ziggurat.fw"):
+        transport.notify(
+            p.CommandId.LAST_RESET,
+            0,
+            p.LastReset(message=t.LongCharacterString("brownout")),
+        )
+    assert "brownout" in caplog.text
+    assert api.notifications == []

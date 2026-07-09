@@ -139,9 +139,9 @@ class ZigguratApi:
             self._awaiting_aps_ack.discard(request_id)
 
         if isinstance(result, p.SendConfirm) and not result.confirmed:
-            raise DeliveryError(result.reason_text)
+            raise DeliveryError(result.reason)
         if isinstance(result, p.ApsAckConfirm) and not result.acked:
-            raise DeliveryError(result.reason_text)
+            raise DeliveryError(result.reason)
 
     async def request_stream(
         self, request: p.Request
@@ -176,11 +176,7 @@ class ZigguratApi:
         elif header.frame_type == p.FrameType.EVENT:
             self._handle_event(request_id, body)
         elif header.frame_type == p.FrameType.NOTIFICATION:
-            try:
-                command = p.CommandId(header.command)
-            except ValueError:
-                _LOGGER.debug("Unknown notification command %#x", header.command)
-                return
+            command = p.CommandId(header.command)
             if command not in p.NOTIFICATIONS:
                 _LOGGER.debug("Unhandled notification %r", command)
                 return
@@ -197,7 +193,7 @@ class ZigguratApi:
         if status != p.Status.OK:
             err = p.Error.deserialize(body)[0]
             _LOGGER.debug("Received error response (id=%d): %r", request_id, err)
-            pending.response.set_exception(p.ProtocolError(status, err.message_text))
+            pending.response.set_exception(p.ProtocolError(status, err.message))
         else:
             response = (
                 pending.request.response.deserialize(body[1:])[0]
@@ -242,7 +238,7 @@ class ZigguratApi:
         elif isinstance(notification, p.LastReset):
             logging.getLogger("ziggurat.fw").warning(
                 "The firmware's previous reset was abnormal: %s",
-                notification.message_text,
+                notification.message,
             )
         else:
             self._on_notification(notification)

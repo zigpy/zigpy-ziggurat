@@ -4,18 +4,22 @@ incoming params and encodes responses through the same wire models as the client
 so every serialization strategy is exercised in both directions."""
 
 import asyncio
+import base64
 from collections.abc import AsyncIterator, Awaitable, Callable
+import hashlib
 import json
 from typing import Any, TypeVar
 
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+import aiospinel
 import pytest
 import zigpy.config
 import zigpy.types as t
 
 from zigpy_ziggurat.zigbee import legacy as commands, protocol as p
 from zigpy_ziggurat.zigbee.application import ControllerApplication
+from zigpy_ziggurat.zigbee.transport import PROP_VENDOR_ZIGGURAT
 
 
 def _request_types() -> dict[str, type[commands.Request[Any]]]:
@@ -313,6 +317,151 @@ class ClosingZiggurat:
         return ws
 
 
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+class ProtocolErrorWebSocket:
+    """A raw WebSocket server that sends a valid binary hello then a bad opcode."""
+
+    def __init__(self) -> None:
+        self.url = ""
+        self._server: asyncio.Server | None = None
+
+    async def start(self) -> None:
+        self._server = await asyncio.start_server(self._serve, "127.0.0.1", 0)
+        port = self._server.sockets[0].getsockname()[1]
+        self.url = f"ws://127.0.0.1:{port}/"
+
+    async def stop(self) -> None:
+        assert self._server is not None
+        self._server.close()
+        await self._server.wait_closed()
+
+    async def _serve(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        request = b""
+        while b"\r\n\r\n" not in request:
+            chunk = await reader.read(1024)
+            if not chunk:
+                return
+            request += chunk
+
+        key = ""
+        for line in request.decode().split("\r\n"):
+            if line.lower().startswith("sec-websocket-key:"):
+                key = line.split(":", 1)[1].strip()
+        accept = base64.b64encode(
+            hashlib.sha1((key + _WS_GUID).encode()).digest()
+        ).decode()
+
+        writer.write(
+            b"HTTP/1.1 101 Switching Protocols\r\n"
+            b"Upgrade: websocket\r\n"
+            b"Connection: Upgrade\r\n"
+            b"Sec-WebSocket-Accept: " + accept.encode() + b"\r\n\r\n"
+        )
+        # A valid FIN+binary frame (the hello), then a frame using reserved opcode
+        # 0x3, a protocol error the client surfaces as a WSMsgType.ERROR message.
+        writer.write(b"\x82\x01\x00")
+        writer.write(b"\x83\x00")
+        await writer.drain()
+        writer.close()
+
+
+class SyntheticSpinelRcp:
+    """A TCP server speaking Spinel, exposing the Ziggurat vendor property."""
+
+    def __init__(
+        self,
+        *,
+        get_prop_id: aiospinel.PackedUInt21 = PROP_VENDOR_ZIGGURAT,
+        set_prop_id: aiospinel.PackedUInt21 = PROP_VENDOR_ZIGGURAT,
+    ) -> None:
+        self.url = ""
+        self.tunnel_writes: list[bytes] = []
+        self._get_prop_id = get_prop_id
+        self._set_prop_id = set_prop_id
+        self._server: asyncio.Server | None = None
+        self._writers: list[asyncio.StreamWriter] = []
+
+    async def start(self) -> None:
+        self._server = await asyncio.start_server(self._serve, "127.0.0.1", 0)
+        port = self._server.sockets[0].getsockname()[1]
+        self.url = f"socket://127.0.0.1:{port}"
+
+    async def stop(self) -> None:
+        assert self._server is not None
+        for writer in self._writers:
+            writer.close()
+        self._server.close()
+        await self._server.wait_closed()
+
+    async def _serve(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        self._writers.append(writer)
+        buffer = bytearray()
+        while True:
+            data = await reader.read(1024)
+            if not data:
+                break
+            buffer += data
+            while True:
+                chunk, flag, rest = buffer.partition(
+                    bytes([aiospinel.HDLCSpecial.FLAG])
+                )
+                if not flag:
+                    buffer = bytearray(chunk)
+                    break
+                buffer = bytearray(rest)
+                if chunk:
+                    self._handle(aiospinel.HDLCLiteFrame.from_bytes(chunk), writer)
+
+    def _handle(
+        self, hdlc: aiospinel.HDLCLiteFrame, writer: asyncio.StreamWriter
+    ) -> None:
+        frame = aiospinel.SpinelFrame.from_bytes(hdlc.data)
+        tid = frame.header.transaction_id
+        if frame.command_id == aiospinel.CommandID.PROP_VALUE_GET:
+            self._respond(writer, tid, self._get_prop_id.serialize())
+        elif frame.command_id == aiospinel.CommandID.PROP_VALUE_SET:
+            _, rest = aiospinel.PackedUInt21.deserialize(frame.data)
+            length = int.from_bytes(rest[:2], "little")
+            self.tunnel_writes.append(rest[2 : 2 + length])
+            self._respond(writer, tid, self._set_prop_id.serialize())
+
+    def _respond(
+        self, writer: asyncio.StreamWriter, tid: int | None, data: bytes
+    ) -> None:
+        frame = aiospinel.SpinelFrame(
+            header=aiospinel.SpinelHeader(
+                flag=0b10, network_link_id=0, transaction_id=tid
+            ),
+            command_id=aiospinel.CommandID.PROP_VALUE_IS,
+            data=data,
+        )
+        writer.write(aiospinel.HDLCLiteFrame(data=frame.serialize()).serialize())
+
+    async def push_stream_frame(self, payload: bytes) -> None:
+        data = (
+            PROP_VENDOR_ZIGGURAT.serialize()
+            + len(payload).to_bytes(2, "little")
+            + payload
+        )
+        frame = aiospinel.SpinelFrame(
+            header=aiospinel.SpinelHeader(
+                flag=0b10, network_link_id=0, transaction_id=0
+            ),
+            command_id=aiospinel.CommandID.PROP_VALUE_IS,
+            data=data,
+        )
+        encoded = aiospinel.HDLCLiteFrame(data=frame.serialize()).serialize()
+        for writer in self._writers:
+            writer.write(encoded)
+            await writer.drain()
+
+
 def make_app_config(url: str) -> dict[str, Any]:
     return {zigpy.config.CONF_DEVICE: {zigpy.config.CONF_DEVICE_PATH: url}}
 
@@ -342,6 +491,16 @@ async def binary_server() -> AsyncIterator[SyntheticBinaryZiggurat]:
 
 
 @pytest.fixture
+async def spinel_rcp() -> AsyncIterator[SyntheticSpinelRcp]:
+    rcp = SyntheticSpinelRcp()
+    await rcp.start()
+
+    yield rcp
+
+    await rcp.stop()
+
+
+@pytest.fixture
 async def closing_server() -> AsyncIterator[ClosingZiggurat]:
     ziggurat = ClosingZiggurat()
     test_server = TestServer(ziggurat.web_app)
@@ -351,6 +510,16 @@ async def closing_server() -> AsyncIterator[ClosingZiggurat]:
     yield ziggurat
 
     await test_server.close()
+
+
+@pytest.fixture
+async def protocol_error_server() -> AsyncIterator[ProtocolErrorWebSocket]:
+    ziggurat = ProtocolErrorWebSocket()
+    await ziggurat.start()
+
+    yield ziggurat
+
+    await ziggurat.stop()
 
 
 @pytest.fixture

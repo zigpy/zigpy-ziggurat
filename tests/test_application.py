@@ -937,3 +937,47 @@ async def test_connection_lost(
             await asyncio.sleep(0.01)
 
     assert lost == [None]
+
+
+async def test_packet_capture(
+    app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    async def capture(
+        command: commands.PacketCapture, request_id: int
+    ) -> commands.Status:
+        await server.send_event_data(
+            request_id,
+            "captured_packet",
+            commands.CapturedPacketEvent(
+                channel=t.uint8_t(15),
+                rssi=t.int8s(-80),
+                lqi=t.uint8_t(200),
+                data="aabbcc",
+            ).to_dict(),
+        )
+        return commands.Status(status="complete")
+
+    server.handlers["packet_capture"] = capture
+
+    packets = [packet async for packet in app.packet_capture(15)]
+
+    assert len(packets) == 1
+    assert packets[0].channel == 15
+    assert packets[0].data == b"\xaa\xbb\xcc"
+    assert server.sent(commands.PacketCapture)[0].channel == 15
+
+
+async def test_packet_capture_change_channel(
+    app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    server.handlers["packet_capture_change_channel"] = server.on_status
+
+    await app.packet_capture_change_channel(20)
+
+    assert server.sent(commands.PacketCaptureChangeChannel)[0].channel == 20
+
+
+def test_max_concurrent_requests() -> None:
+    assert application_module._max_concurrent_requests("ws://host/") == 128
+    assert application_module._max_concurrent_requests("ws+unix:///run/z.sock") == 128
+    assert application_module._max_concurrent_requests("/dev/ttyUSB0") == 32

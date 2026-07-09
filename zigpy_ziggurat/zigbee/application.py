@@ -37,6 +37,13 @@ MFG_ID_OVERRIDES = {
     "54:EF:44": 0x115F,  # Lumi
 }
 
+
+def _max_concurrent_requests(url: str) -> int:
+    if url.startswith(("ws://", "wss://", "ws+unix://")):
+        return 128
+    return 32
+
+
 # 802.15.4 6.3.1: time spent scanning each channel is
 # aBaseSuperframeDuration * (2^n + 1) symbols, at 16 us per symbol
 SYMBOL_PERIOD_MS = 0.016
@@ -126,10 +133,9 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         await self.register_endpoints()
 
         url = self._config[zigpy.config.CONF_DEVICE][zigpy.config.CONF_DEVICE_PATH]
-        if url.startswith(("ws://", "wss://", "ws+unix://")):
-            self._concurrent_requests_semaphore.max_concurrency = 128
-        else:
-            self._concurrent_requests_semaphore.max_concurrency = 32
+        self._concurrent_requests_semaphore.max_concurrency = _max_concurrent_requests(
+            url
+        )
 
     def _register_coordinator_device(self) -> None:
         coordinator = ZigguratCoordinator(
@@ -372,7 +378,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 rssi=packet.rssi,
                 lqi=packet.lqi,
                 channel=packet.channel,
-                data=packet.psdu_bytes,
+                data=packet.psdu,
             )
 
     async def _packet_capture_change_channel(self, channel: int) -> None:
@@ -695,7 +701,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             cluster_id=command.cluster_id,
             lqi=command.lqi,
             rssi=command.rssi,
-            data=t.SerializableBytes(command.data_bytes),
+            data=t.SerializableBytes(command.data),
         )
         self.packet_received(packet)
 

@@ -271,9 +271,6 @@ class WebSocketTransport(_WebSocketBase):
         await self._send(frame)
 
 
-# A u16-length-prefixed byte string, the wire type of every variable payload.
-_Bytes = t.LVList[t.uint8_t, t.uint16_t]
-
 # JSON error code -> binary status. Unknown codes fall back to INVALID_REQUEST; only
 # `not_configured` is load-bearing (ControllerApplication branches on it).
 _STATUS_BY_CODE: dict[str, p.Status] = {
@@ -512,7 +509,7 @@ class LegacyWebSocketTransport(_WebSocketBase):
                 # can't produce): keep the code in the message so callers still see it.
                 status = p.Status.INVALID_REQUEST
                 text = f"{code}: {error['message']}"
-            body = p.Error(status=status, message=_Bytes(text.encode()))
+            body = p.Error(status=status, message=t.LongCharacterString(text))
             self._emit(p.FrameType.RESPONSE, command, request_id, body.serialize())
         elif command == p.CommandId.GET_NETWORK_INFO:
             self._emit_ok(command, request_id, self._network_info(message["result"]))
@@ -544,7 +541,7 @@ class LegacyWebSocketTransport(_WebSocketBase):
                 channel=t.uint8_t(packet.channel),
                 rssi=t.int8s(packet.rssi),
                 lqi=t.uint8_t(packet.lqi),
-                psdu=_Bytes(bytes.fromhex(packet.data)),
+                psdu=t.LongOctetString(bytes.fromhex(packet.data)),
             )
             command = p.CommandId.PACKET_CAPTURE
         else:
@@ -668,14 +665,14 @@ class LegacyWebSocketTransport(_WebSocketBase):
         return p.SendConfirm(
             confirmed=t.Bool(data["status"] == "confirmed"),
             next_hop=next_hop,
-            reason=_Bytes(reason.encode()),
+            reason=t.LongCharacterString(reason),
         )
 
     def _aps_ack_confirm(self, data: dict[str, Any]) -> p.ApsAckConfirm:
         reason = data["reason"] if data.get("reason") else ""
         return p.ApsAckConfirm(
             acked=t.Bool(data["status"] == "confirmed"),
-            reason=_Bytes(reason.encode()),
+            reason=t.LongCharacterString(reason),
         )
 
     def _received_aps(self, data: dict[str, Any]) -> p.ReceivedAps:
@@ -691,7 +688,7 @@ class LegacyWebSocketTransport(_WebSocketBase):
             dst_ep=t.uint8_t(received.dst_ep),
             lqi=t.uint8_t(received.lqi),
             rssi=t.int8s(received.rssi),
-            data=_Bytes(received.data),
+            data=t.LongOctetString(received.data),
         )
 
     def _device_left(self, data: dict[str, Any]) -> p.DeviceLeft:

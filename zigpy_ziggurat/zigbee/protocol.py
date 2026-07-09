@@ -178,11 +178,7 @@ class RouteEntry(Response):
 
 class FirmwareInfo(Response):
     protocol_version: t.uint8_t
-    version: t.LVList[t.uint8_t, t.uint16_t]
-
-    @property
-    def version_text(self) -> str:
-        return bytes(self.version).decode()
+    version: t.LongCharacterString
 
 
 class HwAddress(Response):
@@ -229,22 +225,14 @@ class CapturedPacket(Response):
     channel: t.uint8_t
     rssi: t.int8s
     lqi: t.uint8_t
-    psdu: t.LVList[t.uint8_t, t.uint16_t]
-
-    @property
-    def psdu_bytes(self) -> bytes:
-        return bytes(self.psdu)
+    psdu: t.LongOctetString
 
 
 class Error(t.Struct):
     """The body of a failed response: a non-OK status and a diagnostic message."""
 
     status: Status
-    message: t.LVList[t.uint8_t, t.uint16_t]
-
-    @property
-    def message_text(self) -> str:
-        return bytes(self.message).decode()
+    message: t.LongCharacterString
 
 
 # -- requests --------------------------------------------------------------------
@@ -360,7 +348,7 @@ class SendAps(Request):
     aps_seq: t.uint8_t
     radius: t.uint8_t
     priority: t.int8s
-    asdu: t.LVList[t.uint8_t, t.uint16_t]
+    asdu: t.LongOctetString
 
     @classmethod
     def build(
@@ -396,7 +384,7 @@ class SendAps(Request):
             aps_seq=t.uint8_t(aps_seq),
             radius=t.uint8_t(radius),
             priority=t.int8s(priority),
-            asdu=t.LVList[t.uint8_t, t.uint16_t](asdu),
+            asdu=t.LongOctetString(asdu),
         )
 
 
@@ -464,11 +452,7 @@ class Hello(Notification):
 
 
 class LastReset(Notification):
-    message: t.LVList[t.uint8_t, t.uint16_t]
-
-    @property
-    def message_text(self) -> str:
-        return bytes(self.message).decode()
+    message: t.LongCharacterString
 
 
 class ReceivedAps(Notification):
@@ -482,38 +466,26 @@ class ReceivedAps(Notification):
     dst_ep: t.uint8_t
     lqi: t.uint8_t
     rssi: t.int8s
-    data: t.LVList[t.uint8_t, t.uint16_t]
+    data: t.LongOctetString
 
     @property
     def group_id(self) -> int | None:
         return int(self.group) if self.has_group else None
 
-    @property
-    def data_bytes(self) -> bytes:
-        return bytes(self.data)
-
 
 class SendConfirm(Notification):
     confirmed: t.Bool
     next_hop: t.NWK  # 0xFFFF when unknown
-    reason: t.LVList[t.uint8_t, t.uint16_t]
+    reason: t.LongCharacterString
 
     @property
     def next_hop_or_none(self) -> t.NWK | None:
         return self.next_hop if self.next_hop != t.NWK(0xFFFF) else None
 
-    @property
-    def reason_text(self) -> str:
-        return bytes(self.reason).decode()
-
 
 class ApsAckConfirm(Notification):
     acked: t.Bool
-    reason: t.LVList[t.uint8_t, t.uint16_t]
-
-    @property
-    def reason_text(self) -> str:
-        return bytes(self.reason).decode()
+    reason: t.LongCharacterString
 
 
 class DeviceJoined(Notification):
