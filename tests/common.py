@@ -88,7 +88,6 @@ class SyntheticZiggurat:
         self.hw_address = t.EUI64.convert("11:22:33:44:55:66:77:88")
         self.handlers: dict[str, Callable[[Any, int], Awaitable[Any]]] = {
             "ping": self.on_ping,
-            "reset": self.on_status,
             "configure": self.on_configure,
             "get_network_info": self.on_get_network_info,
             "get_hw_address": self.on_get_hw_address,

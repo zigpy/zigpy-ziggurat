@@ -305,22 +305,6 @@ class SetProvisionalKey(Request[Status]):
     key: t.KeyData
 
 
-class ResetType(enum.StrEnum):
-    # Stop transient radio activity (packet capture) and return to idle, leaving any
-    # configured network running. Sent by the client on connect as a session reset.
-    SOFT = "soft"
-    # Reboot/reset the radio.
-    HARD = "hard"
-
-
-@dataclass
-class Reset(Request[Status]):
-    method = "reset"
-    response_type = Status
-
-    reset_type: ResetType
-
-
 @dataclass
 class SetChannel(Request[Status]):
     method = "set_channel"

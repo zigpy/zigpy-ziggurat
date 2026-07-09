@@ -257,6 +257,24 @@ async def test_legacy_forwards_firmware_log(
         await transport.disconnect()
 
 
+async def test_legacy_transmitted_becomes_send_confirm(
+    server: SyntheticZiggurat,
+) -> None:
+    transport, frames = await _legacy(server)
+    try:
+        # The real server signals a send handoff with a bare `transmitted` event
+        # that carries no `data`; it must become a SEND_CONFIRM, not crash.
+        await server.send_event(9, "transmitted")
+        await _wait_for(frames)
+        header, body = p.FrameHeader.deserialize(frames[0])
+        assert header.frame_type == p.FrameType.NOTIFICATION
+        assert header.command == p.CommandId.SEND_CONFIRM
+        assert header.request_id == 9
+        assert p.SendConfirm.deserialize(body)[0].confirmed
+    finally:
+        await transport.disconnect()
+
+
 async def test_legacy_decodes_send_confirm_next_hop(
     server: SyntheticZiggurat,
 ) -> None:

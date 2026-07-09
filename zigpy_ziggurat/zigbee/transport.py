@@ -54,6 +54,7 @@ async def connect_transport(
         )
         await spinel.connect()
         return spinel
+
     return await _probe_websocket(url, on_frame, on_lost)
 
 
@@ -187,6 +188,10 @@ async def _probe_websocket(url: str, on_frame: OnFrame, on_lost: OnLost) -> Tran
     elif hello.type == aiohttp.WSMsgType.TEXT:
         transport = LegacyWebSocketTransport(on_frame, on_lost)
         _LOGGER.debug("Detected legacy JSON WebSocket protocol: %s", hello.data)
+        _LOGGER.warning(
+            "The legacy JSON WebSocket protocol will be removed soon. Please upgrade"
+            " the Ziggurat app to switch to the new binary protocol."
+        )
     else:
         await session.close()
         raise ConnectionError(f"Unexpected handshake from ziggurat: {hello!r}")
@@ -271,8 +276,7 @@ class WebSocketTransport(_WebSocketBase):
         await self._send(frame)
 
 
-# JSON error code -> binary status. Unknown codes fall back to INVALID_REQUEST; only
-# `not_configured` is load-bearing (ControllerApplication branches on it).
+# JSON error code -> binary status
 _STATUS_BY_CODE: dict[str, p.Status] = {
     "parse": p.Status.PARSE,
     "unknown_command": p.Status.UNKNOWN_COMMAND,
@@ -301,8 +305,7 @@ _RUST_LOG_LEVELS = {
 
 
 class LegacyWebSocketTransport(_WebSocketBase):
-    """Transcodes the binary protocol to/from the legacy JSON-RPC server, so early
-    users' existing setups keep running. Temporary."""
+    """Transcodes the binary protocol to/from the legacy JSON-RPC server."""
 
     def __init__(self, on_frame: OnFrame, on_lost: OnLost) -> None:
         super().__init__(on_frame, on_lost)
@@ -323,8 +326,9 @@ class LegacyWebSocketTransport(_WebSocketBase):
         request_id = int.from_bytes(frame[1:3], "little")
         request = p.REQUESTS[command].deserialize(frame[3:])[0]
 
-        if command == p.CommandId.SHUTDOWN:
-            # The legacy server has no shutdown; it replaces the stack on `configure`.
+        if command in (p.CommandId.SHUTDOWN, p.CommandId.RESET):
+            # The legacy server has neither shutdown nor reset; it replaces the stack
+            # on `configure`. OK them locally so callers don't depend on either.
             self._emit_ok(command, request_id)
         elif command == p.CommandId.CONFIGURE:
             self._pending_configure = cast(p.Configure, request)
@@ -366,13 +370,6 @@ class LegacyWebSocketTransport(_WebSocketBase):
     ) -> tuple[str, dict[str, Any]]:
         if command == p.CommandId.PING:
             return "ping", {}
-        if command == p.CommandId.RESET:
-            reset_type = (
-                legacy.ResetType.HARD
-                if cast(p.Reset, request).hard
-                else legacy.ResetType.SOFT
-            )
-            return "reset", legacy.Reset(reset_type=reset_type).to_dict()
         if command == p.CommandId.GET_HW_ADDRESS:
             return "get_hw_address", {}
         if command == p.CommandId.PERMIT_JOINS:
@@ -522,21 +519,30 @@ class LegacyWebSocketTransport(_WebSocketBase):
     def _handle_event(self, message: dict[str, Any]) -> None:
         request_id = message["id"]
         event = message["event"]
-        if event == "accepted":
-            # The binary protocol has no separate accept; its OK response serves.
+        if event == "transmitted":
+            # The legacy send handoff, delivered as a bare event; the binary protocol
+            # models it as a `send_confirm` notification keyed by request id.
+            self._emit_notification(
+                p.CommandId.SEND_CONFIRM,
+                request_id,
+                p.SendConfirm(
+                    confirmed=t.Bool(True),
+                    next_hop=t.NWK(0xFFFF),
+                    reason=t.LongCharacterString(""),
+                ),
+            )
             return
-        data = message["data"]
         if event == "energy_result":
-            result = legacy.EnergyScanResult.from_dict(data)
+            result = legacy.EnergyScanResult.from_dict(message["data"])
             payload: p.Response = p.EnergyResult(
                 channel=t.uint8_t(result.channel), rssi=t.int8s(result.rssi)
             )
             command = p.CommandId.ENERGY_SCAN
         elif event == "network_found":
-            payload = self._beacon(data)
+            payload = self._beacon(message["data"])
             command = p.CommandId.NETWORK_SCAN
         elif event == "captured_packet":
-            packet = legacy.CapturedPacketEvent.from_dict(data)
+            packet = legacy.CapturedPacketEvent.from_dict(message["data"])
             payload = p.CapturedPacket(
                 channel=t.uint8_t(packet.channel),
                 rssi=t.int8s(packet.rssi),
@@ -545,6 +551,7 @@ class LegacyWebSocketTransport(_WebSocketBase):
             )
             command = p.CommandId.PACKET_CAPTURE
         else:
+            # `accepted` and any other bare event have no binary equivalent.
             return
         self._emit(p.FrameType.EVENT, command, request_id, payload.serialize())
 
