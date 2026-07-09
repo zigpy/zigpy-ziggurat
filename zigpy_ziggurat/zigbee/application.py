@@ -126,10 +126,10 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         await self.register_endpoints()
 
         url = self._config[zigpy.config.CONF_DEVICE][zigpy.config.CONF_DEVICE_PATH]
-        if not url.startswith(("ws://", "wss://", "ws+unix://")):
-            self._concurrent_requests_semaphore.max_concurrency = 64
-        else:
+        if url.startswith(("ws://", "wss://", "ws+unix://")):
             self._concurrent_requests_semaphore.max_concurrency = 128
+        else:
+            self._concurrent_requests_semaphore.max_concurrency = 32
 
     def _register_coordinator_device(self) -> None:
         coordinator = ZigguratCoordinator(
