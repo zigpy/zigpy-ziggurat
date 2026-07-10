@@ -742,6 +742,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     destination_eui64=destination_eui64,
                     aps_ack=t.TransmitOptions.ACK in packet.tx_options,
                     aps_encryption=aps_encryption,
+                    sleepy_destination=packet.extended_timeout,
                     profile_id=packet.profile_id,
                     cluster_id=packet.cluster_id or 0x0000,
                     src_ep=packet.src_ep or 0,

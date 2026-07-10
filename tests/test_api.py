@@ -23,6 +23,7 @@ def _send_aps(*, aps_ack: bool) -> p.SendAps:
         destination_eui64=None,
         aps_ack=aps_ack,
         aps_encryption=False,
+        sleepy_destination=False,
         profile_id=0x0104,
         cluster_id=0x0006,
         src_ep=1,

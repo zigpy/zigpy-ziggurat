@@ -338,7 +338,8 @@ class SendAps(Request):
     aps_ack: t.uint1_t
     aps_encryption: t.uint1_t
     delivery_mode: DeliveryMode
-    reserved: t.uint3_t
+    sleepy_destination: t.uint1_t
+    reserved: t.uint2_t
     destination: t.NWK
     destination_eui64: t.EUI64
     profile_id: t.uint16_t
@@ -359,6 +360,7 @@ class SendAps(Request):
         destination_eui64: t.EUI64 | None,
         aps_ack: bool,
         aps_encryption: bool,
+        sleepy_destination: bool,
         profile_id: int,
         cluster_id: int,
         src_ep: int,
@@ -373,7 +375,8 @@ class SendAps(Request):
             aps_ack=t.uint1_t(aps_ack),
             aps_encryption=t.uint1_t(aps_encryption),
             delivery_mode=delivery_mode,
-            reserved=t.uint3_t(0),
+            sleepy_destination=t.uint1_t(sleepy_destination),
+            reserved=t.uint2_t(0),
             # 0xFFFE stands in for "no short address"; the firmware resolves the EUI64.
             destination=destination if destination is not None else t.NWK(0xFFFE),
             destination_eui64=destination_eui64 or t.EUI64([0] * 8),
