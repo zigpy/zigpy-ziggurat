@@ -19,6 +19,7 @@ import zigpy.state
 import zigpy.types as t
 import zigpy.zdo.types as zdo_t
 
+from zigpy_ziggurat.config import CONF_TUNABLES, CONF_ZIGGURAT_CONFIG, CONFIG_SCHEMA
 from zigpy_ziggurat.zigbee import protocol as p
 from zigpy_ziggurat.zigbee.api import ZigguratApi
 
@@ -90,6 +91,7 @@ class ZigguratCoordinator(zigpy.device.Device):
 class ControllerApplication(zigpy.application.ControllerApplication):
     DISPLAY_NAME = "Ziggurat"
     DESCRIPTION = "Ziggurat: An open source, host-side Zigbee stack in Rust"
+    SCHEMA = CONFIG_SCHEMA
 
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__(config)
@@ -115,6 +117,9 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         # Clear any transient radio state left by a previous client (e.g. a packet
         # capture still streaming on the firmware) so this session starts from idle.
         await api.request(p.Reset(hard=t.Bool(False)))
+
+        for name, value in self._config[CONF_ZIGGURAT_CONFIG][CONF_TUNABLES].items():
+            await api.set_tunable(name, value)
 
     async def disconnect(self) -> None:
         if self._api is not None:

@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import timedelta
 from typing import TypeVar, cast
 
 import pytest
@@ -49,6 +50,7 @@ class SyntheticBinaryTransport:
             p.CommandId.RESET: self._empty_ok,
             p.CommandId.SHUTDOWN: self._empty_ok,
             p.CommandId.PERMIT_JOINS: self._empty_ok,
+            p.CommandId.SET_TUNABLE: self._empty_ok,
             p.CommandId.GET_HW_ADDRESS: self._hw_address,
             p.CommandId.SEND_APS: self._send_aps,
             p.CommandId.ENERGY_SCAN: self._energy_scan,
@@ -200,6 +202,16 @@ async def test_request(api: RecordingApi, transport: SyntheticBinaryTransport) -
 async def test_shutdown(api: RecordingApi, transport: SyntheticBinaryTransport) -> None:
     assert await api.request(p.Shutdown()) is None
     assert isinstance(transport.sent(p.Shutdown)[-1], p.Shutdown)
+
+
+async def test_set_tunable(
+    api: RecordingApi, transport: SyntheticBinaryTransport
+) -> None:
+    await api.set_tunable("aps_ack_timeout", timedelta(seconds=5))
+
+    sent = transport.sent(p.SetTunable)[-1]
+    assert sent.name == b"aps_ack_timeout"
+    assert sent.value == 5_000_000
 
 
 async def test_error_response(

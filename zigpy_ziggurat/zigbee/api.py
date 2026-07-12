@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator, Callable
+from datetime import timedelta
 import logging
 
 from zigpy.exceptions import DeliveryError
@@ -242,3 +243,7 @@ class ZigguratApi:
             )
         else:
             self._on_notification(notification)
+
+    async def set_tunable(self, name: str, value: int | timedelta) -> None:
+        """Set a stack tunable by its Rust field name (a debug/experiment surface)."""
+        await self.request(p.SetTunable.build(name, value))

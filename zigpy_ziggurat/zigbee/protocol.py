@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import ClassVar
 
 from zigpy.exceptions import DeliveryError
@@ -57,6 +58,7 @@ class CommandId(t.enum8):
     NETWORK_SCAN = 0x26
     PACKET_CAPTURE = 0x27
     PACKET_CAPTURE_CHANNEL = 0x28
+    SET_TUNABLE = 0x29
     # More notifications
     RECEIVED_APS = 0x30
     SEND_CONFIRM = 0x31
@@ -444,6 +446,23 @@ class PacketCaptureChannel(Request):
     command = CommandId.PACKET_CAPTURE_CHANNEL
 
     channel: t.uint8_t
+
+
+# The tunable name is a Rust field name of the stack's `Tunables` struct (see the
+# `tunables!` block in ziggurat-zigbee). The value is type-punned into a u64:
+# integers as-is, bools as 0/1, durations in microseconds, enums as their
+# discriminant; the firmware rejects unknown names and out-of-range values.
+class SetTunable(Request):
+    command = CommandId.SET_TUNABLE
+
+    name: t.LVBytes
+    value: t.uint64_t
+
+    @classmethod
+    def build(cls, name: str, value: int | timedelta) -> SetTunable:
+        if isinstance(value, timedelta):
+            value = value // timedelta(microseconds=1)
+        return cls(name=t.LVBytes(name.encode("ascii")), value=t.uint64_t(value))
 
 
 # -- notifications ---------------------------------------------------------------

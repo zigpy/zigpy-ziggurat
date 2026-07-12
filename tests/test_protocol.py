@@ -1,5 +1,7 @@
 """Tests for the convenience accessors on the binary protocol structs."""
 
+from datetime import timedelta
+
 import zigpy.types as t
 
 from zigpy_ziggurat.zigbee import protocol as p
@@ -57,3 +59,15 @@ def test_device_left_router_reported() -> None:
 def test_device_left_router_reported_without_ieee() -> None:
     left = _device_left(p.LeaveReason.ROUTER_REPORTED, has_router_ieee=0)
     assert left.router_ieee_or_none is None
+
+
+def test_set_tunable_build() -> None:
+    integer = p.SetTunable.build("unicast_retries", 5)
+    assert integer.name == b"unicast_retries"
+    assert integer.value == 5
+
+    duration = p.SetTunable.build("aps_ack_timeout", timedelta(milliseconds=1500))
+    assert duration.value == 1_500_000
+
+    flag = p.SetTunable.build("allow_unsecured_rejoins", True)
+    assert flag.value == 1
