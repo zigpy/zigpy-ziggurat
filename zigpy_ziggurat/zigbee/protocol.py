@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import ClassVar
+from typing import ClassVar, cast
 
 from zigpy.exceptions import DeliveryError
 import zigpy.types as t
@@ -111,6 +111,16 @@ class DeliveryMode(t.enum2):
     UNICAST = 0
     BROADCAST = 2
     MULTICAST = 3
+
+
+# How the host wants a unicast routed. Each non-default variant gates a route field in
+# `SendAps`: `next_hop` for the next-hop variants, `relays` for the source routes.
+class RouteControl(t.enum8):
+    STACK_DECIDES = 0
+    HINT_NEXT_HOP = 1
+    FORCE_NEXT_HOP = 2
+    HINT_SOURCE_ROUTE = 3
+    FORCE_SOURCE_ROUTE = 4
 
 
 class FrameHeader(t.Struct):
@@ -380,6 +390,15 @@ class SendAps(Request):
     aps_seq: t.uint8_t
     radius: t.uint8_t
     priority: t.int8s
+    route: RouteControl
+    next_hop: t.NWK = t.StructField(  # type: ignore[assignment]
+        requires=lambda s: cast(SendAps, s).route
+        in (RouteControl.HINT_NEXT_HOP, RouteControl.FORCE_NEXT_HOP)
+    )
+    relays: t.LVList[t.NWK, t.uint8_t] = t.StructField(  # type: ignore[assignment]
+        requires=lambda s: cast(SendAps, s).route
+        in (RouteControl.HINT_SOURCE_ROUTE, RouteControl.FORCE_SOURCE_ROUTE)
+    )
     asdu: t.LongOctetString
 
     @classmethod
@@ -400,6 +419,9 @@ class SendAps(Request):
         radius: int,
         priority: int,
         asdu: bytes,
+        route: RouteControl = RouteControl.STACK_DECIDES,
+        next_hop: t.NWK | None = None,
+        relays: list[t.NWK] | None = None,
     ) -> SendAps:
         return cls(
             has_eui64=t.uint1_t(destination_eui64 is not None),
@@ -418,6 +440,9 @@ class SendAps(Request):
             aps_seq=t.uint8_t(aps_seq),
             radius=t.uint8_t(radius),
             priority=t.int8s(priority),
+            route=route,
+            next_hop=next_hop,
+            relays=relays,
             asdu=t.LongOctetString(asdu),
         )
 
