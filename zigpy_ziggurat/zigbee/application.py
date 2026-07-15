@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 import math
 import os
@@ -57,6 +57,9 @@ KEY_BATCH_SIZE = 12
 # the NWK and APS outgoing counters past that gap so a restart can never roll back and
 # make peers reject our secured frames.
 FRAME_COUNTER_RESTORE_MARGIN = 1000
+
+# How long route hints are supplied to the stack, to reduce startup churn.
+ROUTE_HINT_DURATION = timedelta(minutes=10)
 
 
 def logistic(x: float, *, L: float = 1, x_0: float = 0, k: float = 1) -> float:
@@ -149,6 +152,8 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         self._concurrent_requests_semaphore.max_concurrency = _max_concurrent_requests(
             url
         )
+
+        self._start_time = datetime.now(timezone.utc)
 
     def _register_coordinator_device(self) -> None:
         coordinator = ZigguratCoordinator(
@@ -787,13 +792,16 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         self.packet_received(packet)
 
     async def send_packet(self, packet: t.ZigbeePacket) -> None:
-        aps_encryption = t.TransmitOptions.APS_Encryption in packet.tx_options
-
         dst = packet.dst
         assert dst is not None and dst.address is not None
 
+        try:
+            device = self.get_device_with_address(dst)
+        except (KeyError, ValueError):
+            device = None
+
         destination: t.NWK | None = None
-        destination_eui64: t.EUI64 | None = None
+        destination_eui64 = device.ieee if device is not None else None
 
         if dst.addr_mode == t.AddrMode.IEEE:
             # The server resolves the EUI64 to a network address
@@ -807,22 +815,54 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 t.AddrMode.Broadcast: p.DeliveryMode.BROADCAST,
             }[dst.addr_mode]
 
-            if aps_encryption:
-                # The server selects the link key by EUI64
-                destination_eui64 = self.get_device(nwk=destination).ieee
+        if (
+            t.TransmitOptions.APS_Encryption in packet.tx_options
+            and destination_eui64 is None
+        ):
+            raise DeliveryError(
+                "Cannot send an encrypted packet without a destination EUI64"
+            )
 
         # Resolves once the send is confirmed: passive-ack quorum for a broadcast,
         # next-hop acceptance for a no-ack unicast, or the end-to-end APS ack. A
         # rejected or failed send raises `DeliveryError`.
         assert self._api is not None
         async with self._limit_concurrency(priority=packet.priority):
+            route_control = p.RouteControl.STACK_DECIDES
+            next_hop = None
+            relays = None
+
+            # If we are within the network startup period, provide route hints to the
+            # stack to reduce routing congestion
+            if (
+                device is not None
+                and datetime.now(timezone.utc) - self._start_time < ROUTE_HINT_DURATION
+            ):
+                maybe_relays = self.build_source_route_to(device)
+
+                if maybe_relays is None:
+                    maybe_next_hop = None
+                elif not maybe_relays:
+                    maybe_next_hop = device.nwk
+                else:
+                    maybe_next_hop = maybe_relays[0]
+
+                if self.config[zigpy.config.CONF_SOURCE_ROUTING] and maybe_relays:
+                    route_control = p.RouteControl.HINT_SOURCE_ROUTE
+                    relays = maybe_relays
+                elif maybe_next_hop is not None:
+                    route_control = p.RouteControl.HINT_NEXT_HOP
+                    next_hop = maybe_next_hop
+
             await self._api.request_confirmed(
                 p.SendAps.build(
                     delivery_mode=delivery_mode,
                     destination=destination,
                     destination_eui64=destination_eui64,
                     aps_ack=t.TransmitOptions.ACK in packet.tx_options,
-                    aps_encryption=aps_encryption,
+                    aps_encryption=(
+                        t.TransmitOptions.APS_Encryption in packet.tx_options
+                    ),
                     sleepy_destination=packet.extended_timeout,
                     profile_id=packet.profile_id,
                     cluster_id=packet.cluster_id or 0x0000,
@@ -831,6 +871,9 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     aps_seq=packet.tsn,
                     radius=packet.radius or 30,
                     priority=packet.priority if packet.priority is not None else 0,
+                    route_control=route_control,
+                    next_hop=next_hop,
+                    relays=relays,
                     asdu=packet.data.serialize(),
                 )
             )

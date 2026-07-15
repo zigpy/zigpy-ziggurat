@@ -388,13 +388,13 @@ class SendAps(Request):
     aps_seq: t.uint8_t
     radius: t.uint8_t
     priority: t.int8s
-    route: RouteControl
+    route_control: RouteControl
     next_hop: t.NWK = t.StructField(  # type: ignore[assignment]
-        requires=lambda s: cast(SendAps, s).route
+        requires=lambda s: cast(SendAps, s).route_control
         in (RouteControl.HINT_NEXT_HOP, RouteControl.FORCE_NEXT_HOP)
     )
     relays: t.LVList[t.NWK, t.uint8_t] = t.StructField(  # type: ignore[assignment]
-        requires=lambda s: cast(SendAps, s).route
+        requires=lambda s: cast(SendAps, s).route_control
         in (RouteControl.HINT_SOURCE_ROUTE, RouteControl.FORCE_SOURCE_ROUTE)
     )
     asdu: t.LongOctetString
@@ -417,7 +417,7 @@ class SendAps(Request):
         radius: int,
         priority: int,
         asdu: bytes,
-        route: RouteControl = RouteControl.STACK_DECIDES,
+        route_control: RouteControl = RouteControl.STACK_DECIDES,
         next_hop: t.NWK | None = None,
         relays: list[t.NWK] | None = None,
     ) -> SendAps:
@@ -438,7 +438,7 @@ class SendAps(Request):
             aps_seq=t.uint8_t(aps_seq),
             radius=t.uint8_t(radius),
             priority=t.int8s(priority),
-            route=route,
+            route_control=route_control,
             next_hop=next_hop,
             relays=relays,
             asdu=t.LongOctetString(asdu),
