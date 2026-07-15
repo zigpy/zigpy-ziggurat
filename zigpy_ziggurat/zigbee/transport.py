@@ -337,6 +337,15 @@ class LegacyWebSocketTransport(_WebSocketBase):
         elif command == p.CommandId.LOAD_KEY_TABLE:
             self._pending_keys.extend(cast(p.LoadKeyTable, request).entries)
             self._emit_ok(command, request_id)
+        elif command in (
+            p.CommandId.LOAD_CHILDREN,
+            p.CommandId.LOAD_ADDRESS_CACHE,
+            p.CommandId.LOAD_ROUTE_TABLE,
+            p.CommandId.LOAD_SOURCE_ROUTES,
+        ):
+            # The legacy server re-learns its topology tables, so acknowledge these
+            # restore loads locally and drop them.
+            self._emit_ok(command, request_id)
         elif command == p.CommandId.START_NETWORK:
             assert self._pending_configure is not None
             params = self._configure_params(self._pending_configure, self._pending_keys)
@@ -353,6 +362,10 @@ class LegacyWebSocketTransport(_WebSocketBase):
             count = p.ScanCount(count=t.uint16_t(len(self._scan_keys)))
             self._emit_ok(command, request_id, count)
             self._scan_keys = []
+        elif command == p.CommandId.CANCEL_REQUEST:
+            # The legacy server has no request-cancel concept, so the best-effort
+            # cancel from `ZigguratApi._cancel_send` is dropped here.
+            pass
         else:
             method, params = self._encode_request(command, request)
             self._pending_commands[request_id] = command
@@ -589,7 +602,15 @@ class LegacyWebSocketTransport(_WebSocketBase):
             self._emit_notification(
                 p.CommandId.DEVICE_JOINED,
                 0,
-                p.DeviceJoined(nwk=joined.nwk, ieee=joined.ieee, parent=joined.parent),
+                p.DeviceJoined(
+                    nwk=joined.nwk,
+                    ieee=joined.ieee,
+                    parent=joined.parent,
+                    # The legacy JSON protocol carries no capability information
+                    rx_on_when_idle=t.uint1_t(1),
+                    device_type=p.ChildDeviceType.UNKNOWN,
+                    reserved=t.uint5_t(0),
+                ),
             )
         elif event == "device_left":
             self._emit_notification(p.CommandId.DEVICE_LEFT, 0, self._device_left(data))

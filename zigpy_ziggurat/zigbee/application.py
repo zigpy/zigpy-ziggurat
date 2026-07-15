@@ -52,6 +52,12 @@ BASE_SUPERFRAME_DURATION_SYMBOLS = 960
 
 KEY_BATCH_SIZE = 12
 
+# On a stateless restart we resume from the last persisted frame counters, which trail
+# the radio's true counters by up to the persist stride (plus any commit lag). Jump both
+# the NWK and APS outgoing counters past that gap so a restart can never roll back and
+# make peers reject our secured frames.
+FRAME_COUNTER_RESTORE_MARGIN = 1000
+
 
 def logistic(x: float, *, L: float = 1, x_0: float = 0, k: float = 1) -> float:
     """Logistic function."""
@@ -118,9 +124,6 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         # capture still streaming on the firmware) so this session starts from idle.
         await api.request(p.Reset(hard=t.Bool(False)))
 
-        for name, value in self._config[CONF_ZIGGURAT_CONFIG][CONF_TUNABLES].items():
-            await api.set_tunable(name, value)
-
     async def disconnect(self) -> None:
         if self._api is not None:
             try:
@@ -133,6 +136,11 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         await self.write_network_info(
             network_info=self.state.network_info, node_info=self.state.node_info
         )
+
+        assert self._api is not None
+
+        for name, value in self._config[CONF_ZIGGURAT_CONFIG][CONF_TUNABLES].items():
+            await self._api.set_tunable(name, value)
 
         self._register_coordinator_device()
         await self.register_endpoints()
@@ -232,6 +240,8 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             tc_link_key=zigpy.state.Key(
                 key=state.tc_link_key,
                 partner_ieee=self.state.node_info.ieee,
+                # The APS outgoing frame counter lives on the TC link key by convention
+                tx_counter=state.aps_frame_counter,
             ),
             key_table=key_table,
             stack_specific=stack_specific,
@@ -243,11 +253,18 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         except IndexError as exc:
             raise NetworkNotFormed() from exc
 
-        # The backup's frame counter trails the radio's true counter by however many
-        # frames were sent after the last counter update notification: jump past it
+        # The backup's counters trail the radio's true counters by however many frames
+        # were sent after the last counter notification: jump both past that gap so a
+        # restart never rolls back the NWK or APS outgoing frame counter.
         network_key = latest_backup.network_info.network_key
+        tc_link_key = latest_backup.network_info.tc_link_key
         self.state.network_info = latest_backup.network_info.replace(
-            network_key=network_key.replace(tx_counter=network_key.tx_counter + 500)
+            network_key=network_key.replace(
+                tx_counter=network_key.tx_counter + FRAME_COUNTER_RESTORE_MARGIN
+            ),
+            tc_link_key=tc_link_key.replace(
+                tx_counter=tc_link_key.tx_counter + FRAME_COUNTER_RESTORE_MARGIN
+            ),
         )
         self.state.node_info = latest_backup.node_info
 
@@ -439,7 +456,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             tx_power=t.int8s(
                 network_info.tx_power if network_info.tx_power is not None else 8
             ),
-            aps_frame_counter=t.uint32_t(0),
+            aps_frame_counter=t.uint32_t(network_info.tc_link_key.tx_counter),
         )
         await self._api.request(
             p.Configure(
@@ -469,6 +486,13 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 )
             )
 
+        # Restore the topology tables so the stateless stack starts warm instead of
+        # re-learning everything from scratch.
+        await self._load_children(network_info)
+        await self._load_address_cache(network_info)
+        await self._load_route_table(network_info)
+        await self._load_source_routes()
+
         await self._api.request(p.StartNetwork())
 
         # Ziggurat has no persistent storage of its own: zigpy's backup database is
@@ -479,6 +503,81 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         self.backups.add_backup(
             zigpy.backups.NetworkBackup(network_info=network_info, node_info=node_info)
         )
+
+    async def _load_children(self, network_info: zigpy.state.NetworkInfo) -> None:
+        assert self._api is not None
+        # The backup carries no capability, so device type is Unknown (restored as a
+        # sleepy end device); children without a known NWK address can't be loaded.
+        entries = [
+            p.ChildEntry(
+                ieee=ieee,
+                nwk=network_info.nwk_addresses[ieee],
+                rx_on_when_idle=t.uint1_t(1),
+                device_type=p.ChildDeviceType.UNKNOWN,
+                reserved=t.uint5_t(0),
+            )
+            for ieee in network_info.children
+            if ieee in network_info.nwk_addresses
+        ]
+        for start in range(0, len(entries), KEY_BATCH_SIZE):
+            await self._api.request(
+                p.LoadChildren(
+                    entries=t.LVList[p.ChildEntry, t.uint16_t](
+                        entries[start : start + KEY_BATCH_SIZE]
+                    )
+                )
+            )
+
+    async def _load_address_cache(self, network_info: zigpy.state.NetworkInfo) -> None:
+        assert self._api is not None
+        entries = [
+            p.AddressEntry(ieee=ieee, nwk=nwk)
+            for ieee, nwk in network_info.nwk_addresses.items()
+        ]
+        for start in range(0, len(entries), KEY_BATCH_SIZE):
+            await self._api.request(
+                p.LoadAddressCache(
+                    entries=t.LVList[p.AddressEntry, t.uint16_t](
+                        entries[start : start + KEY_BATCH_SIZE]
+                    )
+                )
+            )
+
+    async def _load_route_table(self, network_info: zigpy.state.NetworkInfo) -> None:
+        assert self._api is not None
+        entries = [
+            p.RouteEntry(
+                destination=dst, next_hop=route.next_hop, path_cost=route.path_cost
+            )
+            for dst, route in network_info.route_table.items()
+        ]
+        for start in range(0, len(entries), KEY_BATCH_SIZE):
+            await self._api.request(
+                p.LoadRouteTable(
+                    entries=t.LVList[p.RouteEntry, t.uint16_t](
+                        entries[start : start + KEY_BATCH_SIZE]
+                    )
+                )
+            )
+
+    async def _load_source_routes(self) -> None:
+        assert self._api is not None
+        entries = [
+            p.SourceRouteEntry(
+                destination=device.nwk,
+                relays=t.LVList[t.NWK, t.uint8_t](device.relays),
+            )
+            for device in self.devices.values()
+            if device.relays
+        ]
+        for start in range(0, len(entries), KEY_BATCH_SIZE):
+            await self._api.request(
+                p.LoadSourceRoutes(
+                    entries=t.LVList[p.SourceRouteEntry, t.uint16_t](
+                        entries[start : start + KEY_BATCH_SIZE]
+                    )
+                )
+            )
 
     async def reset_network_info(self) -> None:
         assert self._api is not None
@@ -618,18 +717,26 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             case p.ReceivedAps():
                 self._handle_received_aps_command(notification)
             case p.FrameCounter():
-                self.state.network_info.network_key.tx_counter = (
-                    notification.frame_counter
-                )
                 _LOGGER.debug(
-                    "Frame counter updated to %d",
-                    self.state.network_info.network_key.tx_counter,
+                    "NWK frame counter updated to %d", notification.frame_counter
                 )
-                self.backups.add_backup(
-                    zigpy.backups.NetworkBackup(
-                        network_info=self.state.network_info,
-                        node_info=self.state.node_info,
-                    )
+                self.network_frame_counter_updated(notification.frame_counter)
+            case p.ApsFrameCounter():
+                _LOGGER.debug(
+                    "APS frame counter updated to %d", notification.frame_counter
+                )
+                self.aps_frame_counter_updated(notification.frame_counter)
+            case p.RouteChanged():
+                self.network_route_updated(
+                    notification.destination,
+                    notification.next_hop,
+                    notification.path_cost,
+                )
+            case p.RouteRemoved():
+                self.network_route_updated(notification.destination, removed=True)
+            case p.RouteRecord():
+                self.handle_relays(
+                    nwk=notification.destination, relays=list(notification.relays)
                 )
             case p.DeviceJoined():
                 self._handle_device_joined(

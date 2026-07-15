@@ -8,6 +8,7 @@ from datetime import timedelta
 import logging
 
 from zigpy.exceptions import DeliveryError
+import zigpy.types as t
 
 from zigpy_ziggurat.zigbee import protocol as p
 from zigpy_ziggurat.zigbee.transport import Transport, connect_transport
@@ -93,6 +94,16 @@ class ZigguratApi:
         self._request_id = (self._request_id % 0xFFFF) + 1
         return request_id
 
+    async def _cancel_send(self, request_id: int) -> None:
+        """Best-effort cancel of an in-flight send by its id."""
+        if self._transport is None or self._closing:
+            return
+        frame = p.encode_request(
+            p.CancelRequest(request_id=t.uint16_t(request_id)),
+            self._next_id(),
+        )
+        await asyncio.shield(self._transport.send_frame(frame))
+
     # -- request surface -----------------------------------------------------------
 
     async def request(self, request: p.Request) -> p.Response | None:
@@ -138,6 +149,9 @@ class ZigguratApi:
             self._pending.pop(request_id, None)
             self._pending_confirms.pop(request_id, None)
             self._awaiting_aps_ack.discard(request_id)
+
+            if not confirm.done() or confirm.cancelled():
+                await self._cancel_send(request_id)
 
         if isinstance(result, p.SendConfirm) and not result.confirmed:
             raise DeliveryError(result.reason)

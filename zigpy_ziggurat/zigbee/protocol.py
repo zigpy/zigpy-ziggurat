@@ -44,6 +44,8 @@ class CommandId(t.enum8):
     LOAD_CHILDREN = 0x12
     LOAD_ADDRESS_CACHE = 0x13
     START_NETWORK = 0x14
+    LOAD_ROUTE_TABLE = 0x15
+    LOAD_SOURCE_ROUTES = 0x16
     GET_NETWORK_INFO = 0x18
     SCAN_KEY_TABLE = 0x19
     SCAN_CHILDREN = 0x1A
@@ -59,6 +61,7 @@ class CommandId(t.enum8):
     PACKET_CAPTURE = 0x27
     PACKET_CAPTURE_CHANNEL = 0x28
     SET_TUNABLE = 0x29
+    CANCEL_REQUEST = 0x2A
     # More notifications
     RECEIVED_APS = 0x30
     SEND_CONFIRM = 0x31
@@ -69,6 +72,10 @@ class CommandId(t.enum8):
     LINK_KEY = 0x36
     APS_DECRYPT_FAILURE = 0x37
     LAST_RESET = 0x38
+    ROUTE_CHANGED = 0x39
+    ROUTE_RECORD = 0x3A
+    APS_FRAME_COUNTER = 0x3B
+    ROUTE_REMOVED = 0x3C
 
 
 class NodeRole(t.enum8):
@@ -175,6 +182,11 @@ class RouteEntry(Response):
     path_cost: t.uint8_t
 
 
+class SourceRouteEntry(Response):
+    destination: t.NWK
+    relays: t.LVList[t.NWK, t.uint8_t]
+
+
 # -- responses / streamed events -------------------------------------------------
 
 
@@ -195,6 +207,11 @@ class NetworkInfo(Response):
 
 class ScanCount(Response):
     count: t.uint16_t
+
+
+class CancelResult(Response):
+    # Whether a still-cancellable (pre-delivery) send was found and removed.
+    cancelled: t.Bool
 
 
 class EnergyResult(Response):
@@ -298,6 +315,18 @@ class LoadAddressCache(Request):
     command = CommandId.LOAD_ADDRESS_CACHE
 
     entries: t.LVList[AddressEntry, t.uint16_t]
+
+
+class LoadRouteTable(Request):
+    command = CommandId.LOAD_ROUTE_TABLE
+
+    entries: t.LVList[RouteEntry, t.uint16_t]
+
+
+class LoadSourceRoutes(Request):
+    command = CommandId.LOAD_SOURCE_ROUTES
+
+    entries: t.LVList[SourceRouteEntry, t.uint16_t]
 
 
 class StartNetwork(Request):
@@ -465,6 +494,14 @@ class SetTunable(Request):
         return cls(name=t.LVBytes(name.encode("ascii")), value=t.uint64_t(value))
 
 
+class CancelRequest(Request):
+    command = CommandId.CANCEL_REQUEST
+    response = CancelResult
+
+    # The request id of the in-flight send to cancel.
+    request_id: t.uint16_t
+
+
 # -- notifications ---------------------------------------------------------------
 
 
@@ -514,6 +551,9 @@ class DeviceJoined(Notification):
     nwk: t.NWK
     ieee: t.EUI64
     parent: t.NWK
+    rx_on_when_idle: t.uint1_t
+    device_type: ChildDeviceType
+    reserved: t.uint5_t
 
 
 class DeviceLeft(Notification):
@@ -563,6 +603,25 @@ class ApsDecryptFailure(Notification):
     key_id: KeyId
 
 
+class RouteChanged(Notification):
+    destination: t.NWK
+    next_hop: t.NWK
+    path_cost: t.uint8_t
+
+
+class RouteRemoved(Notification):
+    destination: t.NWK
+
+
+class RouteRecord(Notification):
+    destination: t.NWK
+    relays: t.LVList[t.NWK, t.uint8_t]
+
+
+class ApsFrameCounter(Notification):
+    frame_counter: t.uint32_t
+
+
 # Notification id -> struct, for decoding unsolicited frames. `SendConfirm` and
 # `ApsAckConfirm` are handled specially (they resolve a pending send by request id).
 NOTIFICATIONS: dict[CommandId, type[Notification]] = {
@@ -576,6 +635,10 @@ NOTIFICATIONS: dict[CommandId, type[Notification]] = {
     CommandId.FRAME_COUNTER: FrameCounter,
     CommandId.LINK_KEY: LinkKey,
     CommandId.APS_DECRYPT_FAILURE: ApsDecryptFailure,
+    CommandId.ROUTE_CHANGED: RouteChanged,
+    CommandId.ROUTE_REMOVED: RouteRemoved,
+    CommandId.ROUTE_RECORD: RouteRecord,
+    CommandId.APS_FRAME_COUNTER: ApsFrameCounter,
 }
 
 

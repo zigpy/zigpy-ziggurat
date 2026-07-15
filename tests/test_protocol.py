@@ -2,6 +2,7 @@
 
 from datetime import timedelta
 
+import pytest
 import zigpy.types as t
 
 from zigpy_ziggurat.zigbee import protocol as p
@@ -71,3 +72,69 @@ def test_set_tunable_build() -> None:
 
     flag = p.SetTunable.build("allow_unsecured_rejoins", True)
     assert flag.value == 1
+
+
+@pytest.mark.parametrize(
+    "notification",
+    [
+        p.RouteChanged(
+            destination=t.NWK(0x1234),
+            next_hop=t.NWK(0x5678),
+            path_cost=t.uint8_t(7),
+        ),
+        p.RouteRemoved(destination=t.NWK(0x1234)),
+        p.RouteRecord(destination=t.NWK(0x1234), relays=[t.NWK(0x0002), t.NWK(0x0003)]),
+        p.RouteRecord(destination=t.NWK(0x1234), relays=[]),
+        p.ApsFrameCounter(frame_counter=t.uint32_t(123456)),
+        p.DeviceJoined(
+            nwk=t.NWK(0xAB12),
+            ieee=_IEEE,
+            parent=t.NWK(0x0000),
+            rx_on_when_idle=t.uint1_t(1),
+            device_type=p.ChildDeviceType.ROUTER,
+            reserved=t.uint5_t(0),
+        ),
+    ],
+)
+def test_notification_round_trip(notification: p.Notification) -> None:
+    parsed, rest = type(notification).deserialize(notification.serialize())
+    assert rest == b""
+    assert parsed == notification
+
+
+@pytest.mark.parametrize(
+    "request_obj",
+    [
+        p.LoadRouteTable(
+            entries=t.LVList[p.RouteEntry, t.uint16_t](
+                [
+                    p.RouteEntry(
+                        destination=t.NWK(0x1234),
+                        next_hop=t.NWK(0x5678),
+                        path_cost=t.uint8_t(0xFF),
+                    )
+                ]
+            )
+        ),
+        p.LoadSourceRoutes(
+            entries=t.LVList[p.SourceRouteEntry, t.uint16_t](
+                [
+                    p.SourceRouteEntry(
+                        destination=t.NWK(0x1234),
+                        relays=t.LVList[t.NWK, t.uint8_t](
+                            [t.NWK(0x0002), t.NWK(0x0003)]
+                        ),
+                    ),
+                    p.SourceRouteEntry(
+                        destination=t.NWK(0xABCD),
+                        relays=t.LVList[t.NWK, t.uint8_t]([]),
+                    ),
+                ]
+            )
+        ),
+    ],
+)
+def test_load_request_round_trip(request_obj: p.Request) -> None:
+    parsed, rest = type(request_obj).deserialize(request_obj.serialize())
+    assert rest == b""
+    assert parsed == request_obj

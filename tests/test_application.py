@@ -198,9 +198,12 @@ async def test_load_network_info(
         network_info=app.state.network_info, node_info=app.state.node_info
     )
     counter = app.state.network_info.network_key.tx_counter
+    aps_counter = app.state.network_info.tc_link_key.tx_counter
     server.handlers["get_network_info"] = not_configured
     await app.load_network_info()
-    assert app.state.network_info.network_key.tx_counter == counter + 500
+    margin = application_module.FRAME_COUNTER_RESTORE_MARGIN
+    assert app.state.network_info.network_key.tx_counter == counter + margin
+    assert app.state.network_info.tc_link_key.tx_counter == aps_counter + margin
 
 
 async def test_write_network_info(

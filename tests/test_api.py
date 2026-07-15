@@ -44,6 +44,7 @@ class SyntheticBinaryTransport:
         self._on_frame: Callable[[bytes], None] = lambda frame: None
         self._on_lost: Callable[[BaseException | None], None] = lambda exc: None
         self.requests: list[p.Request] = []
+        self.request_ids: list[int] = []
         self.hw_ieee = t.EUI64.convert("11:22:33:44:55:66:77:88")
         self.handlers: dict[p.CommandId, Handler] = {
             p.CommandId.PING: self._empty_ok,
@@ -54,6 +55,7 @@ class SyntheticBinaryTransport:
             p.CommandId.GET_HW_ADDRESS: self._hw_address,
             p.CommandId.SEND_APS: self._send_aps,
             p.CommandId.ENERGY_SCAN: self._energy_scan,
+            p.CommandId.CANCEL_REQUEST: self._cancel_request,
         }
 
     async def factory(
@@ -77,6 +79,7 @@ class SyntheticBinaryTransport:
         request_id = int.from_bytes(frame[1:3], "little")
         request = p.REQUESTS[command].deserialize(frame[3:])[0]
         self.requests.append(request)
+        self.request_ids.append(request_id)
         await self.handlers[command](request, request_id)
 
     def sent(self, request_type: type[RequestT]) -> list[RequestT]:
@@ -153,6 +156,9 @@ class SyntheticBinaryTransport:
         self.send_confirm(request_id)
         if request.aps_ack:  # type: ignore[attr-defined]
             self.aps_ack_confirm(request_id)
+
+    async def _cancel_request(self, request: p.Request, request_id: int) -> None:
+        self.ok(request.command, request_id, p.CancelResult(cancelled=t.Bool(True)))
 
     async def _energy_scan(self, request: p.Request, request_id: int) -> None:
         for channel in request.channels:  # type: ignore[attr-defined]
@@ -236,6 +242,70 @@ async def test_request_confirmed(
     assert transport.sent(p.SendAps)[-1].aps_seq == 55
 
 
+async def test_cancel_on_abandon(
+    api: RecordingApi, transport: SyntheticBinaryTransport
+) -> None:
+    """Cancelling a send awaiting confirmation cancels it on the firmware."""
+    send_ids: list[int] = []
+
+    async def accept_only(request: p.Request, request_id: int) -> None:
+        send_ids.append(request_id)
+        transport.ok(request.command, request_id)  # accepted, never confirmed
+
+    transport.handlers[p.CommandId.SEND_APS] = accept_only
+
+    task = asyncio.create_task(api.request_confirmed(_send_aps(aps_ack=False)))
+    while not transport.sent(p.SendAps):
+        await asyncio.sleep(0)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    cancels = transport.sent(p.CancelRequest)
+    assert len(cancels) == 1
+    assert cancels[0].request_id == send_ids[0]
+
+
+async def test_cancel_on_timeout(
+    api: RecordingApi,
+    transport: SyntheticBinaryTransport,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A confirmation timeout cancels the still-in-flight send on the firmware."""
+    monkeypatch.setattr(api_module, "CONFIRM_TIMEOUT", 0.01)
+    send_ids: list[int] = []
+
+    async def accept_only(request: p.Request, request_id: int) -> None:
+        send_ids.append(request_id)
+        transport.ok(request.command, request_id)  # accepted, never confirmed
+
+    transport.handlers[p.CommandId.SEND_APS] = accept_only
+
+    with pytest.raises(TimeoutError):
+        await api.request_confirmed(_send_aps(aps_ack=False))
+
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    cancels = transport.sent(p.CancelRequest)
+    assert len(cancels) == 1
+    assert cancels[0].request_id == send_ids[0]
+
+
+async def test_confirmed_success_sends_no_cancel(
+    api: RecordingApi, transport: SyntheticBinaryTransport
+) -> None:
+    """A send that confirms normally is never cancelled."""
+    await api.request_confirmed(_send_aps(aps_ack=False))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert transport.sent(p.CancelRequest) == []
+
+
 async def test_request_confirmed_next_hop(
     api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:
@@ -316,6 +386,9 @@ async def test_notifications(
             nwk=t.NWK(0xAB12),
             ieee=t.EUI64.convert("aa:aa:aa:aa:aa:aa:aa:aa"),
             parent=t.NWK(0x0000),
+            rx_on_when_idle=t.uint1_t(1),
+            device_type=p.ChildDeviceType.END_DEVICE,
+            reserved=t.uint5_t(0),
         ),
     )
 
