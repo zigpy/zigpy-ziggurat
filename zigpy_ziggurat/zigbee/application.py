@@ -755,14 +755,6 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     "APS frame counter updated to %d", notification.frame_counter
                 )
                 self.aps_frame_counter_updated(notification.frame_counter)
-            case p.RouteChanged():
-                self.network_route_updated(
-                    notification.destination,
-                    notification.next_hop,
-                    notification.path_cost,
-                )
-            case p.RouteRemoved():
-                self.network_route_updated(notification.destination, removed=True)
             case p.RouteRecord():
                 self.handle_relays(
                     nwk=notification.destination, relays=list(notification.relays)

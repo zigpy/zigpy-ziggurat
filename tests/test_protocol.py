@@ -77,12 +77,6 @@ def test_set_tunable_build() -> None:
 @pytest.mark.parametrize(
     "notification",
     [
-        p.RouteChanged(
-            destination=t.NWK(0x1234),
-            next_hop=t.NWK(0x5678),
-            path_cost=t.uint8_t(7),
-        ),
-        p.RouteRemoved(destination=t.NWK(0x1234)),
         p.RouteRecord(destination=t.NWK(0x1234), relays=[t.NWK(0x0002), t.NWK(0x0003)]),
         p.RouteRecord(destination=t.NWK(0x1234), relays=[]),
         p.ApsFrameCounter(frame_counter=t.uint32_t(123456)),

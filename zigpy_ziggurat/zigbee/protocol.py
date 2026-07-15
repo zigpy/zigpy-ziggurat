@@ -72,10 +72,8 @@ class CommandId(t.enum8):
     LINK_KEY = 0x36
     APS_DECRYPT_FAILURE = 0x37
     LAST_RESET = 0x38
-    ROUTE_CHANGED = 0x39
     ROUTE_RECORD = 0x3A
     APS_FRAME_COUNTER = 0x3B
-    ROUTE_REMOVED = 0x3C
 
 
 class NodeRole(t.enum8):
@@ -628,16 +626,6 @@ class ApsDecryptFailure(Notification):
     key_id: KeyId
 
 
-class RouteChanged(Notification):
-    destination: t.NWK
-    next_hop: t.NWK
-    path_cost: t.uint8_t
-
-
-class RouteRemoved(Notification):
-    destination: t.NWK
-
-
 class RouteRecord(Notification):
     destination: t.NWK
     relays: t.LVList[t.NWK, t.uint8_t]
@@ -660,8 +648,6 @@ NOTIFICATIONS: dict[CommandId, type[Notification]] = {
     CommandId.FRAME_COUNTER: FrameCounter,
     CommandId.LINK_KEY: LinkKey,
     CommandId.APS_DECRYPT_FAILURE: ApsDecryptFailure,
-    CommandId.ROUTE_CHANGED: RouteChanged,
-    CommandId.ROUTE_REMOVED: RouteRemoved,
     CommandId.ROUTE_RECORD: RouteRecord,
     CommandId.APS_FRAME_COUNTER: ApsFrameCounter,
 }
