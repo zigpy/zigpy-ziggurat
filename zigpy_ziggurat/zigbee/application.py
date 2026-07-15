@@ -200,20 +200,44 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         state = info.state
 
         key_table: list[zigpy.state.Key] = []
-        async for entry in self._api.request_stream(p.ScanKeyTable()):
-            entry = cast(p.KeyEntry, entry)
+        async for key_entry in self._api.request_stream(p.ScanKeyTable()):
+            key_entry = cast(p.KeyEntry, key_entry)
             key_table.append(
-                zigpy.state.Key(key=entry.key, partner_ieee=entry.partner_ieee)
+                zigpy.state.Key(
+                    key=key_entry.key,
+                    partner_ieee=key_entry.partner_ieee,
+                    tx_counter=key_entry.tx_counter,
+                    rx_counter=key_entry.rx_counter,
+                    seq=key_entry.seq,
+                )
             )
 
         stack_specific: dict[str, Any] = {}
-        seed = state.tclk_seed if state.has_tclk_seed else None
-        if seed is not None:
-            seed_hex = bytes(seed).hex()
+        if state.has_tclk_seed:
+            seed_hex = bytes(state.tclk_seed).hex()
+
             if state.tclk_flavor == p.TclkFlavor.ZSTACK:
                 stack_specific = {"zstack": {"tclk_seed": seed_hex}}
             else:
                 stack_specific = {"ezsp": {"hashed_tclk": seed_hex}}
+
+        children: list[t.EUI64] = []
+        async for child_entry in self._api.request_stream(p.ScanChildren()):
+            child_entry = cast(p.ChildEntry, child_entry)
+            children.append(child_entry.ieee)
+
+        nwk_addresses: dict[t.EUI64, t.NWK] = {}
+        async for addr_entry in self._api.request_stream(p.ScanAddressCache()):
+            addr_entry = cast(p.AddressEntry, addr_entry)
+            nwk_addresses[addr_entry.ieee] = addr_entry.nwk
+
+        route_table: dict[t.NWK, zigpy.state.Route] = {}
+        async for route_entry in self._api.request_stream(p.ScanRouteTable()):
+            route_entry = cast(p.RouteEntry, route_entry)
+            route_table[route_entry.destination] = zigpy.state.Route(
+                next_hop=route_entry.next_hop,
+                path_cost=route_entry.path_cost,
+            )
 
         self.state.node_info = zigpy.state.NodeInfo(
             nwk=state.nwk_address,
@@ -244,6 +268,9 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 tx_counter=state.aps_frame_counter,
             ),
             key_table=key_table,
+            children=children,
+            nwk_addresses=nwk_addresses,
+            route_table=route_table,
             stack_specific=stack_specific,
         )
 
@@ -488,10 +515,10 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
         # Restore the topology tables so the stateless stack starts warm instead of
         # re-learning everything from scratch.
-        await self._load_children(network_info)
-        await self._load_address_cache(network_info)
-        await self._load_route_table(network_info)
-        await self._load_source_routes()
+        await self._restore_children(network_info)
+        await self._restore_address_cache(network_info)
+        await self._restore_route_table(network_info)
+        await self._restore_source_routes()
 
         await self._api.request(p.StartNetwork())
 
@@ -504,7 +531,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             zigpy.backups.NetworkBackup(network_info=network_info, node_info=node_info)
         )
 
-    async def _load_children(self, network_info: zigpy.state.NetworkInfo) -> None:
+    async def _restore_children(self, network_info: zigpy.state.NetworkInfo) -> None:
         assert self._api is not None
         # The backup carries no capability, so device type is Unknown (restored as a
         # sleepy end device); children without a known NWK address can't be loaded.
@@ -528,7 +555,9 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 )
             )
 
-    async def _load_address_cache(self, network_info: zigpy.state.NetworkInfo) -> None:
+    async def _restore_address_cache(
+        self, network_info: zigpy.state.NetworkInfo
+    ) -> None:
         assert self._api is not None
         entries = [
             p.AddressEntry(ieee=ieee, nwk=nwk)
@@ -543,7 +572,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 )
             )
 
-    async def _load_route_table(self, network_info: zigpy.state.NetworkInfo) -> None:
+    async def _restore_route_table(self, network_info: zigpy.state.NetworkInfo) -> None:
         assert self._api is not None
         entries = [
             p.RouteEntry(
@@ -560,7 +589,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 )
             )
 
-    async def _load_source_routes(self) -> None:
+    async def _restore_source_routes(self) -> None:
         assert self._api is not None
         entries = [
             p.SourceRouteEntry(
