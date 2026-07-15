@@ -231,12 +231,15 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             addr_entry = cast(p.AddressEntry, addr_entry)
             nwk_addresses[addr_entry.ieee] = addr_entry.nwk
 
-        route_table: dict[t.NWK, zigpy.state.Route] = {}
+        stack_specific["ziggurat"] = {"routes": []}
         async for route_entry in self._api.request_stream(p.ScanRouteTable()):
             route_entry = cast(p.RouteEntry, route_entry)
-            route_table[route_entry.destination] = zigpy.state.Route(
-                next_hop=route_entry.next_hop,
-                path_cost=route_entry.path_cost,
+            stack_specific["ziggurat"]["routes"].append(
+                {
+                    "destination": route_entry.destination,
+                    "next_hop": route_entry.next_hop,
+                    "path_cost": route_entry.path_cost,
+                }
             )
 
         self.state.node_info = zigpy.state.NodeInfo(
@@ -270,7 +273,6 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             key_table=key_table,
             children=children,
             nwk_addresses=nwk_addresses,
-            route_table=route_table,
             stack_specific=stack_specific,
         )
 
@@ -513,12 +515,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 )
             )
 
-        # Restore the topology tables so the stateless stack starts warm instead of
-        # re-learning everything from scratch.
         await self._restore_children(network_info)
-        await self._restore_address_cache(network_info)
-        await self._restore_route_table(network_info)
-        await self._restore_source_routes()
 
         await self._api.request(p.StartNetwork())
 
@@ -550,59 +547,6 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             await self._api.request(
                 p.LoadChildren(
                     entries=t.LVList[p.ChildEntry, t.uint16_t](
-                        entries[start : start + KEY_BATCH_SIZE]
-                    )
-                )
-            )
-
-    async def _restore_address_cache(
-        self, network_info: zigpy.state.NetworkInfo
-    ) -> None:
-        assert self._api is not None
-        entries = [
-            p.AddressEntry(ieee=ieee, nwk=nwk)
-            for ieee, nwk in network_info.nwk_addresses.items()
-        ]
-        for start in range(0, len(entries), KEY_BATCH_SIZE):
-            await self._api.request(
-                p.LoadAddressCache(
-                    entries=t.LVList[p.AddressEntry, t.uint16_t](
-                        entries[start : start + KEY_BATCH_SIZE]
-                    )
-                )
-            )
-
-    async def _restore_route_table(self, network_info: zigpy.state.NetworkInfo) -> None:
-        assert self._api is not None
-        entries = [
-            p.RouteEntry(
-                destination=dst, next_hop=route.next_hop, path_cost=route.path_cost
-            )
-            for dst, route in network_info.route_table.items()
-        ]
-        for start in range(0, len(entries), KEY_BATCH_SIZE):
-            await self._api.request(
-                p.LoadRouteTable(
-                    entries=t.LVList[p.RouteEntry, t.uint16_t](
-                        entries[start : start + KEY_BATCH_SIZE]
-                    )
-                )
-            )
-
-    async def _restore_source_routes(self) -> None:
-        assert self._api is not None
-        entries = [
-            p.SourceRouteEntry(
-                destination=device.nwk,
-                relays=t.LVList[t.NWK, t.uint8_t](device.relays),
-            )
-            for device in self.devices.values()
-            if device.relays
-        ]
-        for start in range(0, len(entries), KEY_BATCH_SIZE):
-            await self._api.request(
-                p.LoadSourceRoutes(
-                    entries=t.LVList[p.SourceRouteEntry, t.uint16_t](
                         entries[start : start + KEY_BATCH_SIZE]
                     )
                 )
@@ -749,12 +693,16 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 _LOGGER.debug(
                     "NWK frame counter updated to %d", notification.frame_counter
                 )
-                self.network_frame_counter_updated(notification.frame_counter)
+                self.state.network_info.network_key.tx_counter = (
+                    notification.frame_counter
+                )
             case p.ApsFrameCounter():
                 _LOGGER.debug(
                     "APS frame counter updated to %d", notification.frame_counter
                 )
-                self.aps_frame_counter_updated(notification.frame_counter)
+                self.state.network_info.tc_link_key.tx_counter = (
+                    notification.frame_counter
+                )
             case p.RouteRecord():
                 self.handle_relays(
                     nwk=notification.destination, relays=list(notification.relays)
