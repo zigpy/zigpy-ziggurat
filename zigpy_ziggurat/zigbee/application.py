@@ -701,6 +701,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 self.state.network_info.network_key.tx_counter = (
                     notification.frame_counter
                 )
+                self.backups.add_backup(self.backups.from_network_state())
             case p.ApsFrameCounter():
                 _LOGGER.debug(
                     "APS frame counter updated to %d", notification.frame_counter
@@ -708,6 +709,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 self.state.network_info.tc_link_key.tx_counter = (
                     notification.frame_counter
                 )
+                self.backups.add_backup(self.backups.from_network_state())
             case p.RouteRecord():
                 self.handle_relays(
                     nwk=notification.destination, relays=list(notification.relays)
