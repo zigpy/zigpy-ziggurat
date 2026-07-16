@@ -453,7 +453,7 @@ async def test_network_scan(
             {
                 "delivery_mode": "unicast",
                 "destination": DEVICE_NWK,
-                "destination_eui64": None,
+                "destination_eui64": DEVICE_IEEE,
                 "profile_id": 0x0104,
                 "aps_ack": True,
                 "aps_encryption": False,

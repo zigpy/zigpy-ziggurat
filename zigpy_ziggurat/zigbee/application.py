@@ -236,16 +236,18 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             addr_entry = cast(p.AddressEntry, addr_entry)
             nwk_addresses[addr_entry.ieee] = addr_entry.nwk
 
-        stack_specific["ziggurat"] = {"routes": []}
+        routes = []
         async for route_entry in self._api.request_stream(p.ScanRouteTable()):
             route_entry = cast(p.RouteEntry, route_entry)
-            stack_specific["ziggurat"]["routes"].append(
+            routes.append(
                 {
                     "destination": route_entry.destination,
                     "next_hop": route_entry.next_hop,
                     "path_cost": route_entry.path_cost,
                 }
             )
+        if routes:
+            stack_specific["ziggurat"] = {"routes": routes}
 
         self.state.node_info = zigpy.state.NodeInfo(
             nwk=state.nwk_address,
