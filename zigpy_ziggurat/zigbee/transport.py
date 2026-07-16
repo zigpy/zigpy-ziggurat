@@ -362,6 +362,15 @@ class LegacyWebSocketTransport(_WebSocketBase):
             count = p.ScanCount(count=t.uint16_t(len(self._scan_keys)))
             self._emit_ok(command, request_id, count)
             self._scan_keys = []
+        elif command in (
+            p.CommandId.SCAN_CHILDREN,
+            p.CommandId.SCAN_ADDRESS_CACHE,
+            p.CommandId.SCAN_ROUTE_TABLE,
+        ):
+            # The JSON server surfaces only the key table (inline in get_network_info);
+            # it has no children/address/route scans, so these stream empty. The app
+            # re-learns that topology from join notifications during the transition.
+            self._emit_ok(command, request_id, p.ScanCount(count=t.uint16_t(0)))
         elif command == p.CommandId.CANCEL_REQUEST:
             # The legacy server has no request-cancel concept, so the best-effort
             # cancel from `ZigguratApi._cancel_send` is dropped here.
@@ -465,7 +474,9 @@ class LegacyWebSocketTransport(_WebSocketBase):
     ) -> dict[str, Any]:
         state = configure.state
         seed = bytes(state.tclk_seed).hex() if state.has_tclk_seed else None
-        flavor = state.tclk_flavor.name.lower() if state.has_tclk_seed else None
+        flavor = None
+        if state.has_tclk_seed:
+            flavor = "zstack" if state.tclk_flavor == p.TclkFlavorId.Z_STACK else "ezsp"
         return legacy.Configure(
             channel=int(state.channel),
             nwk_update_id=int(state.nwk_update_id),
@@ -519,7 +530,7 @@ class LegacyWebSocketTransport(_WebSocketBase):
                 # can't produce): keep the code in the message so callers still see it.
                 status = p.Status.INVALID_REQUEST
                 text = f"{code}: {error['message']}"
-            body = p.Error(status=status, message=t.LongCharacterString(text))
+            body = p.ErrorPayload(status=status, message=t.LongCharacterString(text))
             self._emit(p.FrameType.RESPONSE, command, request_id, body.serialize())
         elif command == p.CommandId.GET_NETWORK_INFO:
             self._emit_ok(command, request_id, self._network_info(message["result"]))
@@ -653,9 +664,9 @@ class LegacyWebSocketTransport(_WebSocketBase):
             has_tclk_seed=t.Bool(seed is not None),
             tclk_seed=t.KeyData(bytes.fromhex(seed) if seed is not None else bytes(16)),
             tclk_flavor=(
-                p.TclkFlavor[info.tclk_flavor.upper()]
-                if info.tclk_flavor
-                else p.TclkFlavor.EZSP
+                p.TclkFlavorId.Z_STACK
+                if info.tclk_flavor == "zstack"
+                else p.TclkFlavorId.EZSP
             ),
             tx_power=t.int8s(info.tx_power),
             aps_frame_counter=t.uint32_t(info.aps_frame_counter),

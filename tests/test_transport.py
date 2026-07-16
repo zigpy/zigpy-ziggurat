@@ -59,7 +59,7 @@ async def test_probe_selects_binary(binary_server: SyntheticBinaryZiggurat) -> N
 
     # The opening hello is consumed by the probe, so the only frame is the response.
     assert len(frames) == 1
-    header, body = p.FrameHeader.deserialize(frames[0])
+    header, body = p.ReplyHeader.deserialize(frames[0])
     assert header.frame_type == p.FrameType.RESPONSE
     assert header.command == p.CommandId.PING
     assert body == bytes([p.Status.OK])
@@ -222,7 +222,7 @@ async def test_legacy_decodes_captured_packet(server: SyntheticZiggurat) -> None
         )
         await _wait_for(frames)
         assert len(frames) == 1
-        header, body = p.FrameHeader.deserialize(frames[0])
+        header, body = p.ReplyHeader.deserialize(frames[0])
         assert header.frame_type == p.FrameType.EVENT
         assert header.command == p.CommandId.PACKET_CAPTURE
         packet = p.CapturedPacket.deserialize(body)[0]
@@ -266,7 +266,7 @@ async def test_legacy_transmitted_becomes_send_confirm(
         # that carries no `data`; it must become a SEND_CONFIRM, not crash.
         await server.send_event(9, "transmitted")
         await _wait_for(frames)
-        header, body = p.FrameHeader.deserialize(frames[0])
+        header, body = p.ReplyHeader.deserialize(frames[0])
         assert header.frame_type == p.FrameType.NOTIFICATION
         assert header.command == p.CommandId.SEND_CONFIRM
         assert header.request_id == 9
@@ -282,7 +282,7 @@ async def test_legacy_decodes_send_confirm_next_hop(
     try:
         await server.send_confirm(1, next_hop="0x1234")
         await _wait_for(frames)
-        header, body = p.FrameHeader.deserialize(frames[0])
+        header, body = p.ReplyHeader.deserialize(frames[0])
         assert header.command == p.CommandId.SEND_CONFIRM
         confirm = p.SendConfirm.deserialize(body)[0]
         assert confirm.next_hop == 0x1234
@@ -304,7 +304,7 @@ async def test_legacy_decodes_decrypt_failure_known_key(
             )
         )
         await _wait_for(frames)
-        header, body = p.FrameHeader.deserialize(frames[0])
+        header, body = p.ReplyHeader.deserialize(frames[0])
         assert header.command == p.CommandId.APS_DECRYPT_FAILURE
         failure = p.ApsDecryptFailure.deserialize(body)[0]
         assert failure.key_id == p.KeyId.NETWORK
@@ -326,7 +326,7 @@ async def test_legacy_ignores_binary_and_unknown_response(
         await server.send_confirm(1)
         await _wait_for(frames)
         assert len(frames) == 1
-        header, _ = p.FrameHeader.deserialize(frames[0])
+        header, _ = p.ReplyHeader.deserialize(frames[0])
         assert header.command == p.CommandId.SEND_CONFIRM
     finally:
         await transport.disconnect()

@@ -3,130 +3,29 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import ClassVar, cast
+from typing import ClassVar
 
 from zigpy.exceptions import DeliveryError
 import zigpy.types as t
 
+from zigpy_ziggurat.zigbee import wire
 
-# Device -> host only: host -> device frames are always requests and carry no
-# frame type (see `encode_request`).
-class FrameType(t.enum8):
-    RESPONSE = 1
-    EVENT = 2
-    NOTIFICATION = 3
-
-
-class Status(t.enum8):
-    OK = 0
-    PARSE = 1
-    UNKNOWN_COMMAND = 2
-    INVALID_STATE = 3
-    NOT_CONFIGURED = 4
-    RADIO_ERROR = 5
-    NETWORK_START_FAILED = 6
-    TRANSMIT_FAILED = 7
-    SCAN_FAILED = 8
-    INVALID_REQUEST = 9
-
-
-class CommandId(t.enum8):
-    # Notifications (device -> host, unsolicited)
-    HELLO = 0x00
-    # Requests (host -> device)
-    PING = 0x01
-    RESET = 0x02
-    GET_FIRMWARE_INFO = 0x03
-    GET_HW_ADDRESS = 0x04
-    SHUTDOWN = 0x05
-    CONFIGURE = 0x10
-    LOAD_KEY_TABLE = 0x11
-    LOAD_CHILDREN = 0x12
-    LOAD_ADDRESS_CACHE = 0x13
-    START_NETWORK = 0x14
-    LOAD_ROUTE_TABLE = 0x15
-    LOAD_SOURCE_ROUTES = 0x16
-    GET_NETWORK_INFO = 0x18
-    SCAN_KEY_TABLE = 0x19
-    SCAN_CHILDREN = 0x1A
-    SCAN_ADDRESS_CACHE = 0x1B
-    SCAN_ROUTE_TABLE = 0x1C
-    SEND_APS = 0x20
-    PERMIT_JOINS = 0x21
-    SET_CHANNEL = 0x22
-    SET_NWK_UPDATE_ID = 0x23
-    SET_PROVISIONAL_KEY = 0x24
-    ENERGY_SCAN = 0x25
-    NETWORK_SCAN = 0x26
-    PACKET_CAPTURE = 0x27
-    PACKET_CAPTURE_CHANNEL = 0x28
-    SET_TUNABLE = 0x29
-    CANCEL_REQUEST = 0x2A
-    # More notifications
-    RECEIVED_APS = 0x30
-    SEND_CONFIRM = 0x31
-    APS_ACK_CONFIRM = 0x32
-    DEVICE_JOINED = 0x33
-    DEVICE_LEFT = 0x34
-    FRAME_COUNTER = 0x35
-    LINK_KEY = 0x36
-    APS_DECRYPT_FAILURE = 0x37
-    LAST_RESET = 0x38
-    ROUTE_RECORD = 0x3A
-    APS_FRAME_COUNTER = 0x3B
-
-
-class NodeRole(t.enum8):
-    COORDINATOR = 0
-    ROUTER = 1
-
-
-class TclkFlavor(t.enum8):
-    ZSTACK = 0
-    EZSP = 1
-
-
-class ChildDeviceType(t.enum2):
-    UNKNOWN = 0
-    ROUTER = 1
-    END_DEVICE = 2
-
-
-class KeyId(t.enum8):
-    DATA = 0
-    NETWORK = 1
-    KEY_TRANSPORT = 2
-    KEY_LOAD = 3
-
-
-class LeaveReason(t.enum8):
-    ANNOUNCED = 0
-    ROUTER_REPORTED = 1
-    KEEPALIVE_TIMEOUT = 2
-
-
-class DeliveryMode(t.enum2):
-    UNICAST = 0
-    BROADCAST = 2
-    MULTICAST = 3
-
-
-# How the host wants a unicast routed. Each non-default variant gates a route field in
-# `SendAps`: `next_hop` for the next-hop variants, `relays` for the source routes.
-class RouteControl(t.enum8):
-    STACK_DECIDES = 0
-    HINT_NEXT_HOP = 1
-    FORCE_NEXT_HOP = 2
-    HINT_SOURCE_ROUTE = 3
-    FORCE_SOURCE_ROUTE = 4
-
-
-class FrameHeader(t.Struct):
-    """The 4-byte header of every device -> host frame."""
-
-    frame_type: FrameType
-    command: t.uint8_t  # raw CommandId byte (unknown ids still parse the header)
-    request_id: t.uint16_t
+# Re-export the generated wire types for the rest of zigpy-ziggurat to use.
+from zigpy_ziggurat.zigbee.wire import (
+    ChildDeviceType as ChildDeviceType,
+    CommandId as CommandId,
+    DeliveryMode as DeliveryMode,
+    ErrorPayload as ErrorPayload,
+    FrameType as FrameType,
+    KeyId as KeyId,
+    LeaveReason as LeaveReason,
+    NetworkState as NetworkState,
+    NodeRole as NodeRole,
+    ReplyHeader as ReplyHeader,
+    RouteControl as RouteControl,
+    Status as Status,
+    TclkFlavorId as TclkFlavorId,
+)
 
 
 class Response(t.Struct):
@@ -135,134 +34,6 @@ class Response(t.Struct):
 
 class Notification(t.Struct):
     """An unsolicited device -> host frame."""
-
-
-# -- shared sub-structures -------------------------------------------------------
-
-
-class NetworkState(t.Struct):
-    """The persistent network state shared by `Configure` and `NetworkInfo`."""
-
-    channel: t.uint8_t
-    nwk_update_id: t.uint8_t
-    pan_id: t.PanId
-    extended_pan_id: t.ExtendedPanId
-    nwk_address: t.NWK
-    ieee_address: t.EUI64
-    network_key: t.KeyData
-    network_key_seq: t.uint8_t
-    network_key_tx_counter: t.uint32_t
-    tc_link_key: t.KeyData
-    has_tclk_seed: t.Bool
-    tclk_seed: t.KeyData
-    tclk_flavor: TclkFlavor
-    tx_power: t.int8s
-    aps_frame_counter: t.uint32_t
-
-
-# -- table entries (streamed by scans, loaded by the load requests) --------------
-
-
-class KeyEntry(Response):
-    key: t.KeyData
-    tx_counter: t.uint32_t
-    rx_counter: t.uint32_t
-    seq: t.uint8_t
-    partner_ieee: t.EUI64
-
-
-class ChildEntry(Response):
-    ieee: t.EUI64
-    nwk: t.NWK
-    rx_on_when_idle: t.uint1_t
-    device_type: ChildDeviceType
-    reserved: t.uint5_t
-
-
-class AddressEntry(Response):
-    ieee: t.EUI64
-    nwk: t.NWK
-
-
-class RouteEntry(Response):
-    destination: t.NWK
-    next_hop: t.NWK
-    path_cost: t.uint8_t
-
-
-class SourceRouteEntry(Response):
-    destination: t.NWK
-    relays: t.LVList[t.NWK, t.uint8_t]
-
-
-# -- responses / streamed events -------------------------------------------------
-
-
-class FirmwareInfo(Response):
-    protocol_version: t.uint8_t
-    version: t.LongCharacterString
-
-
-class HwAddress(Response):
-    ieee: t.EUI64
-
-
-class NetworkInfo(Response):
-    state: NetworkState
-    key_count: t.uint16_t
-    started: t.Bool
-
-
-class ScanCount(Response):
-    count: t.uint16_t
-
-
-class CancelResult(Response):
-    # Whether a still-cancellable (pre-delivery) send was found and removed.
-    cancelled: t.Bool
-
-
-class EnergyResult(Response):
-    channel: t.uint8_t
-    rssi: t.int8s
-
-
-class Beacon(Response):
-    channel: t.uint8_t
-    source: t.NWK  # 0xFFFF when the beacon had no short source
-    pan_id: t.PanId
-    extended_pan_id: t.ExtendedPanId
-    permit_joining: t.uint1_t
-    router_capacity: t.uint1_t
-    end_device_capacity: t.uint1_t
-    reserved: t.uint5_t
-    stack_profile: t.uint8_t
-    protocol_version: t.uint8_t
-    device_depth: t.uint8_t
-    update_id: t.uint8_t
-    lqi: t.uint8_t
-    rssi: t.int8s
-
-    @property
-    def source_or_none(self) -> t.NWK | None:
-        return self.source if self.source != t.NWK(0xFFFF) else None
-
-
-class CapturedPacket(Response):
-    channel: t.uint8_t
-    rssi: t.int8s
-    lqi: t.uint8_t
-    psdu: t.LongOctetString
-
-
-class Error(t.Struct):
-    """The body of a failed response: a non-OK status and a diagnostic message."""
-
-    status: Status
-    message: t.LongCharacterString
-
-
-# -- requests --------------------------------------------------------------------
 
 
 class Request(t.Struct):
@@ -275,14 +46,76 @@ class Request(t.Struct):
     event: ClassVar[type[Response] | None] = None
 
 
+# -- table entries (streamed by scans, loaded by the load requests) --------------
+
+
+class KeyEntry(Response, wire.KeyEntry):
+    pass
+
+
+class ChildEntry(Response, wire.ChildEntry):
+    pass
+
+
+class AddressEntry(Response, wire.AddressEntry):
+    pass
+
+
+class RouteEntry(Response, wire.RouteEntry):
+    pass
+
+
+class SourceRouteEntry(Response, wire.SourceRouteEntry):
+    pass
+
+
+# -- responses / streamed events -------------------------------------------------
+
+
+class FirmwareInfo(Response, wire.FirmwareInfoPayload):
+    pass
+
+
+class HwAddress(Response, wire.HwAddressPayload):
+    pass
+
+
+class NetworkInfo(Response, wire.NetworkInfoPayload):
+    pass
+
+
+class ScanCount(Response, wire.ScanCountPayload):
+    pass
+
+
+class CancelResult(Response, wire.CancelResultPayload):
+    # Whether a still-cancellable (pre-delivery) send was found and removed.
+    pass
+
+
+class EnergyResult(Response, wire.EnergyResultPayload):
+    pass
+
+
+class Beacon(Response, wire.BeaconPayload):
+    @property
+    def source_or_none(self) -> t.NWK | None:
+        return self.source if self.source != t.NWK(0xFFFF) else None
+
+
+class CapturedPacket(Response, wire.CapturedPacketPayload):
+    pass
+
+
+# -- requests --------------------------------------------------------------------
+
+
 class Ping(Request):
     command = CommandId.PING
 
 
-class Reset(Request):
+class Reset(Request, wire.ResetPayload):
     command = CommandId.RESET
-
-    hard: t.Bool
 
 
 class Shutdown(Request):
@@ -299,42 +132,28 @@ class GetHwAddress(Request):
     response = HwAddress
 
 
-class Configure(Request):
+class Configure(Request, wire.ConfigurePayload):
     command = CommandId.CONFIGURE
 
-    role: NodeRole
-    source_routing: t.Bool
-    state: NetworkState
 
-
-class LoadKeyTable(Request):
+class LoadKeyTable(Request, wire.LoadKeyTablePayload):
     command = CommandId.LOAD_KEY_TABLE
 
-    entries: t.LVList[KeyEntry, t.uint16_t]
 
-
-class LoadChildren(Request):
+class LoadChildren(Request, wire.LoadChildrenPayload):
     command = CommandId.LOAD_CHILDREN
 
-    entries: t.LVList[ChildEntry, t.uint16_t]
 
-
-class LoadAddressCache(Request):
+class LoadAddressCache(Request, wire.LoadAddressCachePayload):
     command = CommandId.LOAD_ADDRESS_CACHE
 
-    entries: t.LVList[AddressEntry, t.uint16_t]
 
-
-class LoadRouteTable(Request):
+class LoadRouteTable(Request, wire.LoadRouteTablePayload):
     command = CommandId.LOAD_ROUTE_TABLE
 
-    entries: t.LVList[RouteEntry, t.uint16_t]
 
-
-class LoadSourceRoutes(Request):
+class LoadSourceRoutes(Request, wire.LoadSourceRoutesPayload):
     command = CommandId.LOAD_SOURCE_ROUTES
-
-    entries: t.LVList[SourceRouteEntry, t.uint16_t]
 
 
 class StartNetwork(Request):
@@ -370,34 +189,8 @@ class ScanRouteTable(Request):
     event = RouteEntry
 
 
-class SendAps(Request):
+class SendAps(Request, wire.SendApsPayload):
     command = CommandId.SEND_APS
-
-    has_eui64: t.uint1_t
-    aps_ack: t.uint1_t
-    aps_encryption: t.uint1_t
-    delivery_mode: DeliveryMode
-    sleepy_destination: t.uint1_t
-    reserved: t.uint2_t
-    destination: t.NWK
-    destination_eui64: t.EUI64
-    profile_id: t.uint16_t
-    cluster_id: t.uint16_t
-    src_ep: t.uint8_t
-    dst_ep: t.uint8_t
-    aps_seq: t.uint8_t
-    radius: t.uint8_t
-    priority: t.int8s
-    route_control: RouteControl
-    next_hop: t.NWK = t.StructField(  # type: ignore[assignment]
-        requires=lambda s: cast(SendAps, s).route_control
-        in (RouteControl.HINT_NEXT_HOP, RouteControl.FORCE_NEXT_HOP)
-    )
-    relays: t.LVList[t.NWK, t.uint8_t] = t.StructField(  # type: ignore[assignment]
-        requires=lambda s: cast(SendAps, s).route_control
-        in (RouteControl.HINT_SOURCE_ROUTE, RouteControl.FORCE_SOURCE_ROUTE)
-    )
-    asdu: t.LongOctetString
 
     @classmethod
     def build(
@@ -438,77 +231,58 @@ class SendAps(Request):
             aps_seq=t.uint8_t(aps_seq),
             radius=t.uint8_t(radius),
             priority=t.int8s(priority),
-            route_control=route_control,
+            route=route_control,
             next_hop=next_hop,
-            relays=relays,
+            relays=(
+                wire.SourceRouteRelays(relays=t.LVList[t.NWK, t.uint8_t](relays))
+                if relays is not None
+                else None
+            ),
             asdu=t.LongOctetString(asdu),
         )
 
 
-class PermitJoins(Request):
+class PermitJoins(Request, wire.PermitJoinsPayload):
     command = CommandId.PERMIT_JOINS
 
-    duration: t.uint16_t
-    accept_direct_joins: t.Bool
 
-
-class SetChannel(Request):
+class SetChannel(Request, wire.ChannelPayload):
     command = CommandId.SET_CHANNEL
 
-    channel: t.uint8_t
 
-
-class SetNwkUpdateId(Request):
+class SetNwkUpdateId(Request, wire.NwkUpdateIdPayload):
     command = CommandId.SET_NWK_UPDATE_ID
 
-    nwk_update_id: t.uint8_t
 
-
-class SetProvisionalKey(Request):
+class SetProvisionalKey(Request, wire.ProvisionalKeyPayload):
     command = CommandId.SET_PROVISIONAL_KEY
 
-    ieee: t.EUI64
-    key: t.KeyData
 
-
-class EnergyScan(Request):
+class EnergyScan(Request, wire.ScanRequestPayload):
     command = CommandId.ENERGY_SCAN
     event = EnergyResult
 
-    channels: t.LVList[t.uint8_t, t.uint16_t]
-    duration_per_channel_ms: t.uint16_t
 
-
-class NetworkScan(Request):
+class NetworkScan(Request, wire.ScanRequestPayload):
     command = CommandId.NETWORK_SCAN
     event = Beacon
 
-    channels: t.LVList[t.uint8_t, t.uint16_t]
-    duration_per_channel_ms: t.uint16_t
 
-
-class PacketCapture(Request):
+class PacketCapture(Request, wire.ChannelPayload):
     command = CommandId.PACKET_CAPTURE
     event = CapturedPacket
 
-    channel: t.uint8_t
 
-
-class PacketCaptureChannel(Request):
+class PacketCaptureChannel(Request, wire.ChannelPayload):
     command = CommandId.PACKET_CAPTURE_CHANNEL
-
-    channel: t.uint8_t
 
 
 # The tunable name is a Rust field name of the stack's `Tunables` struct (see the
 # `tunables!` block in ziggurat-zigbee). The value is type-punned into a u64:
 # integers as-is, bools as 0/1, durations in microseconds, enums as their
 # discriminant; the firmware rejects unknown names and out-of-range values.
-class SetTunable(Request):
+class SetTunable(Request, wire.SetTunablePayload):
     command = CommandId.SET_TUNABLE
-
-    name: t.LVBytes
-    value: t.uint64_t
 
     @classmethod
     def build(cls, name: str, value: int | timedelta) -> SetTunable:
@@ -517,79 +291,43 @@ class SetTunable(Request):
         return cls(name=t.LVBytes(name.encode("ascii")), value=t.uint64_t(value))
 
 
-class CancelRequest(Request):
+class CancelRequest(Request, wire.CancelRequestPayload):
     command = CommandId.CANCEL_REQUEST
     response = CancelResult
-
-    # The request id of the in-flight send to cancel.
-    request_id: t.uint16_t
 
 
 # -- notifications ---------------------------------------------------------------
 
 
-class Hello(Notification):
-    protocol_version: t.uint8_t
-    configured: t.Bool
+class Hello(Notification, wire.HelloPayload):
+    pass
 
 
-class LastReset(Notification):
-    message: t.LongCharacterString
+class LastReset(Notification, wire.LastResetPayload):
+    pass
 
 
-class ReceivedAps(Notification):
-    source: t.NWK
-    destination: t.NWK
-    has_group: t.Bool
-    group: t.uint16_t
-    profile_id: t.uint16_t
-    cluster_id: t.uint16_t
-    src_ep: t.uint8_t
-    dst_ep: t.uint8_t
-    lqi: t.uint8_t
-    rssi: t.int8s
-    data: t.LongOctetString
-
+class ReceivedAps(Notification, wire.ReceivedApsPayload):
     @property
     def group_id(self) -> int | None:
         return int(self.group) if self.has_group else None
 
 
-class SendConfirm(Notification):
-    confirmed: t.Bool
-    next_hop: t.NWK  # 0xFFFF when unknown
-    reason: t.LongCharacterString
-
+class SendConfirm(Notification, wire.SendConfirmPayload):
     @property
     def next_hop_or_none(self) -> t.NWK | None:
         return self.next_hop if self.next_hop != t.NWK(0xFFFF) else None
 
 
-class ApsAckConfirm(Notification):
-    acked: t.Bool
-    reason: t.LongCharacterString
+class ApsAckConfirm(Notification, wire.ApsAckConfirmPayload):
+    pass
 
 
-class DeviceJoined(Notification):
-    nwk: t.NWK
-    ieee: t.EUI64
-    parent: t.NWK
-    rx_on_when_idle: t.uint1_t
-    device_type: ChildDeviceType
-    reserved: t.uint5_t
+class DeviceJoined(Notification, wire.DeviceJoinedPayload):
+    pass
 
 
-class DeviceLeft(Notification):
-    nwk: t.NWK
-    has_ieee: t.uint1_t
-    rejoin: t.uint1_t
-    has_router_ieee: t.uint1_t
-    reserved: t.uint5_t
-    ieee: t.EUI64
-    reason: LeaveReason
-    router: t.NWK  # 0xFFFF when not router_reported
-    router_ieee: t.EUI64
-
+class DeviceLeft(Notification, wire.DeviceLeftPayload):
     @property
     def ieee_or_none(self) -> t.EUI64 | None:
         return self.ieee if self.has_ieee else None
@@ -610,29 +348,24 @@ class DeviceLeft(Notification):
         return None
 
 
-class FrameCounter(Notification):
-    frame_counter: t.uint32_t
+class FrameCounter(Notification, wire.FrameCounterPayload):
+    pass
 
 
-class LinkKey(Notification):
-    ieee: t.EUI64
-    key: t.KeyData
+class LinkKey(Notification, wire.LinkKeyPayload):
+    pass
 
 
-class ApsDecryptFailure(Notification):
-    source: t.NWK
-    source_ieee: t.EUI64
-    frame_counter: t.uint32_t
-    key_id: KeyId
+class ApsDecryptFailure(Notification, wire.ApsDecryptFailPayload):
+    pass
 
 
-class RouteRecord(Notification):
-    destination: t.NWK
-    relays: t.LVList[t.NWK, t.uint8_t]
+class RouteRecord(Notification, wire.RouteRecordPayload):
+    pass
 
 
-class ApsFrameCounter(Notification):
-    frame_counter: t.uint32_t
+class ApsFrameCounter(Notification, wire.ApsFrameCounterPayload):
+    pass
 
 
 # Notification id -> struct, for decoding unsolicited frames. `SendConfirm` and
@@ -666,7 +399,7 @@ def encode_reply(
     frame_type: FrameType, command: CommandId, request_id: int, body: bytes = b""
 ) -> bytes:
     """Serialize a device -> host frame (4-byte header, then the body)."""
-    header = FrameHeader(
+    header = ReplyHeader(
         frame_type=frame_type,
         command=t.uint8_t(command),
         request_id=t.uint16_t(request_id),

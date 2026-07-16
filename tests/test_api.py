@@ -96,7 +96,7 @@ class SyntheticBinaryTransport:
     def error(
         self, command: p.CommandId, request_id: int, status: p.Status, message: str = ""
     ) -> None:
-        body = p.Error(
+        body = p.ErrorPayload(
             status=status, message=t.LongCharacterString(message)
         ).serialize()
         self._on_frame(p.encode_reply(p.FrameType.RESPONSE, command, request_id, body))
@@ -514,7 +514,7 @@ async def test_connection_lost_fails_pending_confirm(
 async def test_unknown_notification_command_ignored(
     api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:
-    frame = p.FrameHeader(
+    frame = p.ReplyHeader(
         frame_type=p.FrameType.NOTIFICATION,
         command=t.uint8_t(0x06),
         request_id=t.uint16_t(0),

@@ -221,7 +221,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         if state.has_tclk_seed:
             seed_hex = bytes(state.tclk_seed).hex()
 
-            if state.tclk_flavor == p.TclkFlavor.ZSTACK:
+            if state.tclk_flavor == p.TclkFlavorId.Z_STACK:
                 stack_specific = {"zstack": {"tclk_seed": seed_hex}}
             else:
                 stack_specific = {"ezsp": {"hashed_tclk": seed_hex}}
@@ -454,14 +454,14 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         # already store the seed as a plain hex string.
         stack_specific = network_info.stack_specific
         tclk_seed = None
-        tclk_flavor = p.TclkFlavor.EZSP
+        tclk_flavor = p.TclkFlavorId.EZSP
 
         if "zstack" in stack_specific and "tclk_seed" in stack_specific["zstack"]:
             tclk_seed = stack_specific["zstack"]["tclk_seed"]
-            tclk_flavor = p.TclkFlavor.ZSTACK
+            tclk_flavor = p.TclkFlavorId.Z_STACK
         elif "ezsp" in stack_specific and "hashed_tclk" in stack_specific["ezsp"]:
             tclk_seed = stack_specific["ezsp"]["hashed_tclk"]
-            tclk_flavor = p.TclkFlavor.EZSP
+            tclk_flavor = p.TclkFlavorId.EZSP
 
         # `UNKNOWN` is assigned after the class body, where mypy cannot see it
         if node_info.ieee == t.EUI64.UNKNOWN:  # type: ignore[attr-defined]

@@ -183,7 +183,7 @@ class ZigguratApi:
     # -- inbound frame handling ----------------------------------------------------
 
     def _handle_frame(self, frame: bytes) -> None:
-        header, body = p.FrameHeader.deserialize(frame)
+        header, body = p.ReplyHeader.deserialize(frame)
         request_id = header.request_id
 
         if header.frame_type == p.FrameType.RESPONSE:
@@ -206,7 +206,7 @@ class ZigguratApi:
 
         status = p.Status(body[0])
         if status != p.Status.OK:
-            err = p.Error.deserialize(body)[0]
+            err = p.ErrorPayload.deserialize(body)[0]
             _LOGGER.debug("Received error response (id=%d): %r", request_id, err)
             pending.response.set_exception(p.ProtocolError(status, err.message))
         else:
