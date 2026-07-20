@@ -270,22 +270,7 @@ async def test_legacy_transmitted_becomes_send_confirm(
         assert header.frame_type == p.FrameType.NOTIFICATION
         assert header.command == p.CommandId.SEND_CONFIRM
         assert header.request_id == 9
-        assert p.SendConfirm.deserialize(body)[0].confirmed
-    finally:
-        await transport.disconnect()
-
-
-async def test_legacy_decodes_send_confirm_next_hop(
-    server: SyntheticZiggurat,
-) -> None:
-    transport, frames = await _legacy(server)
-    try:
-        await server.send_confirm(1, next_hop="0x1234")
-        await _wait_for(frames)
-        header, body = p.ReplyHeader.deserialize(frames[0])
-        assert header.command == p.CommandId.SEND_CONFIRM
-        confirm = p.SendConfirm.deserialize(body)[0]
-        assert confirm.next_hop == 0x1234
+        assert p.SendConfirm.deserialize(body)[0].status == p.SendStatus.SUCCESS
     finally:
         await transport.disconnect()
 

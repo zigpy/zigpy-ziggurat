@@ -21,8 +21,10 @@ from zigpy_ziggurat.zigbee.wire import (
     LeaveReason as LeaveReason,
     NetworkState as NetworkState,
     NodeRole as NodeRole,
+    RateLimitedPayload as RateLimitedPayload,
     ReplyHeader as ReplyHeader,
     RouteControl as RouteControl,
+    SendStatus as SendStatus,
     Status as Status,
     TclkFlavorId as TclkFlavorId,
 )
@@ -314,9 +316,7 @@ class ReceivedAps(Notification, wire.ReceivedApsPayload):
 
 
 class SendConfirm(Notification, wire.SendConfirmPayload):
-    @property
-    def next_hop_or_none(self) -> t.NWK | None:
-        return self.next_hop if self.next_hop != t.NWK(0xFFFF) else None
+    pass
 
 
 class ApsAckConfirm(Notification, wire.ApsAckConfirmPayload):
@@ -423,3 +423,13 @@ class ProtocolError(DeliveryError):
         super().__init__(f"{code}: {message}" if message else f"{code}: ")
         self.status = status
         self.message = message
+
+
+class RateLimitedError(ProtocolError):
+    """A broadcast rejected by the firmware's rate limit, carrying when to retry."""
+
+    def __init__(self, retry_in: timedelta) -> None:
+        super().__init__(
+            Status.RATE_LIMITED, f"retry in {retry_in.total_seconds():.1f}s"
+        )
+        self.retry_in = retry_in

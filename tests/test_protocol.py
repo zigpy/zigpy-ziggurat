@@ -10,19 +10,6 @@ from zigpy_ziggurat.zigbee import protocol as p
 _IEEE = t.EUI64.convert("00:11:22:33:44:55:66:77")
 
 
-def test_send_confirm_next_hop_or_none() -> None:
-    known = p.SendConfirm(
-        confirmed=t.Bool(True), next_hop=t.NWK(0x1234), reason=t.LongCharacterString("")
-    )
-    assert known.next_hop_or_none == 0x1234
-    unknown = p.SendConfirm(
-        confirmed=t.Bool(True),
-        next_hop=t.NWK(0xFFFF),
-        reason=t.LongCharacterString(""),
-    )
-    assert unknown.next_hop_or_none is None
-
-
 def _device_left(
     reason: p.LeaveReason,
     *,

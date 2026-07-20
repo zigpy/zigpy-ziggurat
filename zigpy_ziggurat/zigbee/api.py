@@ -153,10 +153,8 @@ class ZigguratApi:
             if not confirm.done() or confirm.cancelled():
                 await self._cancel_send(request_id)
 
-        if isinstance(result, p.SendConfirm) and not result.confirmed:
-            raise DeliveryError(result.reason)
-        if isinstance(result, p.ApsAckConfirm) and not result.acked:
-            raise DeliveryError(result.reason)
+        if result.status != p.SendStatus.SUCCESS:
+            raise DeliveryError(f"Send failed: {result.status.name}")
 
     async def request_stream(
         self, request: p.Request
@@ -205,7 +203,16 @@ class ZigguratApi:
             return
 
         status = p.Status(body[0])
-        if status != p.Status.OK:
+        if status == p.Status.RATE_LIMITED:
+            rate_limited = p.RateLimitedPayload.deserialize(body)[0]
+            retry_in = timedelta(milliseconds=rate_limited.retry_in_ms)
+            _LOGGER.debug(
+                "Received rate-limited response (id=%d): retry in %s",
+                request_id,
+                retry_in,
+            )
+            pending.response.set_exception(p.RateLimitedError(retry_in))
+        elif status != p.Status.OK:
             err = p.ErrorPayload.deserialize(body)[0]
             _LOGGER.debug("Received error response (id=%d): %r", request_id, err)
             pending.response.set_exception(p.ProtocolError(status, err.message))
@@ -238,7 +245,10 @@ class ZigguratApi:
             if confirm is None or confirm.done():
                 return
             # A confirmed handoff is not terminal for an ack-requested send.
-            if notification.confirmed and request_id in self._awaiting_aps_ack:
+            if (
+                notification.status == p.SendStatus.SUCCESS
+                and request_id in self._awaiting_aps_ack
+            ):
                 return
             self._awaiting_aps_ack.discard(request_id)
             confirm.set_result(notification)

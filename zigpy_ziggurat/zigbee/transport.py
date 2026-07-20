@@ -549,11 +549,7 @@ class LegacyWebSocketTransport(_WebSocketBase):
             self._emit_notification(
                 p.CommandId.SEND_CONFIRM,
                 request_id,
-                p.SendConfirm(
-                    confirmed=t.Bool(True),
-                    next_hop=t.NWK(0xFFFF),
-                    reason=t.LongCharacterString(""),
-                ),
+                p.SendConfirm(status=p.SendStatus.SUCCESS),
             )
             return
         if event == "energy_result":
@@ -697,21 +693,23 @@ class LegacyWebSocketTransport(_WebSocketBase):
         )
 
     def _send_confirm(self, data: dict[str, Any]) -> p.SendConfirm:
-        next_hop = t.NWK(0xFFFF)
-        if data.get("next_hop"):
-            next_hop = t.NWK(int(data["next_hop"], 16))
-        reason = data["reason"] if data.get("reason") else ""
         return p.SendConfirm(
-            confirmed=t.Bool(data["status"] == "confirmed"),
-            next_hop=next_hop,
-            reason=t.LongCharacterString(reason),
+            # The legacy JSON protocol carries no failure kind; a transmit failure is
+            # the least-wrong stand-in.
+            status=(
+                p.SendStatus.SUCCESS
+                if data["status"] == "confirmed"
+                else p.SendStatus.TRANSMIT_FAILED
+            ),
         )
 
     def _aps_ack_confirm(self, data: dict[str, Any]) -> p.ApsAckConfirm:
-        reason = data["reason"] if data.get("reason") else ""
         return p.ApsAckConfirm(
-            acked=t.Bool(data["status"] == "confirmed"),
-            reason=t.LongCharacterString(reason),
+            status=(
+                p.SendStatus.SUCCESS
+                if data["status"] == "confirmed"
+                else p.SendStatus.APS_ACK_TIMEOUT
+            ),
         )
 
     def _received_aps(self, data: dict[str, Any]) -> p.ReceivedAps:

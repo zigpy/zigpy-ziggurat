@@ -101,6 +101,14 @@ class SyntheticBinaryTransport:
         ).serialize()
         self._on_frame(p.encode_reply(p.FrameType.RESPONSE, command, request_id, body))
 
+    def rate_limited(
+        self, command: p.CommandId, request_id: int, retry_in_ms: int
+    ) -> None:
+        body = p.RateLimitedPayload(
+            status=p.Status.RATE_LIMITED, retry_in_ms=t.uint32_t(retry_in_ms)
+        ).serialize()
+        self._on_frame(p.encode_reply(p.FrameType.RESPONSE, command, request_id, body))
+
     def event(self, command: p.CommandId, request_id: int, payload: p.Response) -> None:
         self._on_frame(
             p.encode_reply(p.FrameType.EVENT, command, request_id, payload.serialize())
@@ -116,25 +124,21 @@ class SyntheticBinaryTransport:
         )
 
     def send_confirm(
-        self, request_id: int, *, confirmed: bool = True, reason: str = ""
+        self, request_id: int, *, status: p.SendStatus = p.SendStatus.SUCCESS
     ) -> None:
         self.notify(
             p.CommandId.SEND_CONFIRM,
             request_id,
-            p.SendConfirm(
-                confirmed=t.Bool(confirmed),
-                next_hop=t.NWK(0xFFFF),
-                reason=t.LongCharacterString(reason),
-            ),
+            p.SendConfirm(status=status),
         )
 
     def aps_ack_confirm(
-        self, request_id: int, *, acked: bool = True, reason: str = ""
+        self, request_id: int, *, status: p.SendStatus = p.SendStatus.SUCCESS
     ) -> None:
         self.notify(
             p.CommandId.APS_ACK_CONFIRM,
             request_id,
-            p.ApsAckConfirm(acked=t.Bool(acked), reason=t.LongCharacterString(reason)),
+            p.ApsAckConfirm(status=status),
         )
 
     def lose(self, exc: BaseException | None = None) -> None:
@@ -234,6 +238,21 @@ async def test_error_response(
         await api.request(p.Ping())
 
 
+async def test_rate_limited_response(
+    api: RecordingApi, transport: SyntheticBinaryTransport
+) -> None:
+    async def rate_limit(request: p.Request, request_id: int) -> None:
+        transport.rate_limited(request.command, request_id, retry_in_ms=1800)
+
+    transport.handlers[p.CommandId.SEND_APS] = rate_limit
+
+    with pytest.raises(p.RateLimitedError, match="rate_limited: retry in 1.8s") as exc:
+        await api.request_confirmed(_send_aps(aps_ack=False))
+
+    assert exc.value.status == p.Status.RATE_LIMITED
+    assert exc.value.retry_in == timedelta(milliseconds=1800)
+
+
 async def test_request_confirmed(
     api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:
@@ -306,13 +325,6 @@ async def test_confirmed_success_sends_no_cancel(
     assert transport.sent(p.CancelRequest) == []
 
 
-async def test_request_confirmed_next_hop(
-    api: RecordingApi, transport: SyntheticBinaryTransport
-) -> None:
-    """A no-ack unicast resolves on the local handoff."""
-    await api.request_confirmed(_send_aps(aps_ack=False))
-
-
 async def test_request_confirmed_rejected(
     api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:
@@ -336,12 +348,12 @@ async def test_request_confirmed_failure(
 
     async def ack_timeout(request: p.Request, request_id: int) -> None:
         transport.ok(request.command, request_id)
-        transport.send_confirm(request_id, confirmed=True)
-        transport.aps_ack_confirm(request_id, acked=False, reason="APS ack timed out")
+        transport.send_confirm(request_id, status=p.SendStatus.SUCCESS)
+        transport.aps_ack_confirm(request_id, status=p.SendStatus.APS_ACK_TIMEOUT)
 
     transport.handlers[p.CommandId.SEND_APS] = ack_timeout
 
-    with pytest.raises(DeliveryError, match="APS ack timed out"):
+    with pytest.raises(DeliveryError, match="APS_ACK_TIMEOUT"):
         await api.request_confirmed(_send_aps(aps_ack=True))
 
 
@@ -485,11 +497,11 @@ async def test_confirmed_send_delivery_failure(
 ) -> None:
     async def failed_confirm(request: p.Request, request_id: int) -> None:
         transport.ok(request.command, request_id)
-        transport.send_confirm(request_id, confirmed=False, reason="no route")
+        transport.send_confirm(request_id, status=p.SendStatus.ROUTE_DISCOVERY_TIMEOUT)
 
     transport.handlers[p.CommandId.SEND_APS] = failed_confirm
 
-    with pytest.raises(DeliveryError, match="no route"):
+    with pytest.raises(DeliveryError, match="ROUTE_DISCOVERY_TIMEOUT"):
         await api.request_confirmed(_send_aps(aps_ack=False))
 
 

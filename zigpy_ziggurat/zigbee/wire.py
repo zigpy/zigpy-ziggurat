@@ -73,6 +73,8 @@ class Status(t.enum8):
     TRANSMIT_FAILED = 7
     SCAN_FAILED = 8
     INVALID_REQUEST = 9
+    RATE_LIMITED = 10
+    BUDGET_EXHAUSTED = 11
 
 
 class NodeRole(t.enum8):
@@ -324,6 +326,11 @@ class ErrorPayload(t.Struct):
     message: t.LongCharacterString
 
 
+class RateLimitedPayload(t.Struct):
+    status: Status
+    retry_in_ms: t.uint32_t
+
+
 class HelloPayload(t.Struct):
     protocol_version: t.uint8_t
     configured: t.Bool
@@ -347,15 +354,31 @@ class ReceivedApsPayload(t.Struct):
     data: t.LongOctetString
 
 
+class SendStatus(t.enum8):
+    SUCCESS = 0
+    ROUTE_DISCOVERY_TIMEOUT = 1
+    ROUTE_DISCOVERY_NO_ENTRY = 2
+    ROUTE_INACTIVE_AFTER_DISCOVERY = 3
+    ROUTE_DISCOVERY_SUPPRESSED = 4
+    NWK_NO_ACK = 5
+    CCA_FAILURE = 6
+    TRANSMIT_FAILED = 7
+    APS_ACK_TIMEOUT = 8
+    PAYLOAD_TOO_LONG = 9
+    FRAME_BUDGET_EXHAUSTED = 10
+    APS_SECURITY_FAILED = 11
+    INDIRECT_EXPIRED = 12
+    BROADCAST_RATE_LIMITED = 13
+    BROADCAST_QUORUM_NOT_REACHED = 14
+    RADIO_ERROR = 15
+
+
 class SendConfirmPayload(t.Struct):
-    confirmed: t.Bool
-    next_hop: t.NWK
-    reason: t.LongCharacterString
+    status: SendStatus
 
 
 class ApsAckConfirmPayload(t.Struct):
-    acked: t.Bool
-    reason: t.LongCharacterString
+    status: SendStatus
 
 
 class DeviceJoinedPayload(t.Struct):
