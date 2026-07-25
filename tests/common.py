@@ -279,17 +279,23 @@ class SyntheticBinaryZiggurat:
         ws = web.WebSocketResponse()
         await ws.prepare(request)
 
-        hello = p.Hello(protocol_version=t.uint8_t(1), configured=t.Bool(False))
+        hello = p.Hello(
+            protocol_version=t.uint8_t(p.PROTOCOL_VERSION), configured=t.Bool(False)
+        )
         await ws.send_bytes(
             p.encode_reply(
-                p.FrameType.NOTIFICATION, p.CommandId.HELLO, 0, hello.serialize()
+                p.FrameType.NOTIFICATION,
+                p.NotificationCommand.HELLO,
+                0,
+                hello.serialize(),
             )
         )
 
         async for msg in ws:
-            command = p.CommandId(msg.data[0])
-            request_id = int.from_bytes(msg.data[1:3], "little")
-            self.requests.append(p.REQUESTS[command].deserialize(msg.data[3:])[0])
+            header, body = p.Header.deserialize(msg.data)
+            command = p.RequestCommand(header.command)
+            request_id = int(header.request_id)
+            self.requests.append(p.REQUESTS[command].deserialize(body)[0])
             await ws.send_bytes(
                 p.encode_reply(
                     p.FrameType.RESPONSE, command, request_id, bytes([p.Status.OK])

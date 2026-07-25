@@ -153,14 +153,15 @@ async def test_load_network_info(
     with pytest.raises(NetworkNotFormed):
         await app.load_network_info()
 
-    # Unrelated errors propagate
+    # Unrelated errors propagate. The unknown JSON code has no binary status, so
+    # it degrades to a generic invalid-request; the detail goes to the log.
     async def serial_error(
         command: commands.GetNetworkInfo, request_id: int
     ) -> commands.NetworkInfo:
         raise RpcError("serial_port_error", "it burned down")
 
     server.handlers["get_network_info"] = serial_error
-    with pytest.raises(DeliveryError, match="serial_port_error"):
+    with pytest.raises(DeliveryError, match="invalid_request"):
         await app.load_network_info()
 
     # The server has a running network
@@ -560,7 +561,8 @@ async def test_send_packet_delivery_failure(
 
     server.handlers["send_aps"] = fail
 
-    with pytest.raises(DeliveryError, match="transmit_failed"):
+    # The legacy `transmit_failed` code maps to the binary RADIO_ERROR status.
+    with pytest.raises(DeliveryError, match="radio_error"):
         await app.send_packet(
             t.ZigbeePacket(
                 src=t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=t.NWK(0x0000)),

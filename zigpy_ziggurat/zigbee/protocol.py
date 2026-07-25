@@ -12,17 +12,18 @@ from zigpy_ziggurat.zigbee import wire
 
 # Re-export the generated wire types for the rest of zigpy-ziggurat to use.
 from zigpy_ziggurat.zigbee.wire import (
+    PROTOCOL_VERSION as PROTOCOL_VERSION,
     ChildDeviceType as ChildDeviceType,
-    CommandId as CommandId,
     DeliveryMode as DeliveryMode,
-    ErrorPayload as ErrorPayload,
     FrameType as FrameType,
+    Header as Header,
     KeyId as KeyId,
     LeaveReason as LeaveReason,
     NetworkState as NetworkState,
     NodeRole as NodeRole,
+    NotificationCommand as NotificationCommand,
     RateLimitedPayload as RateLimitedPayload,
-    ReplyHeader as ReplyHeader,
+    RequestCommand as RequestCommand,
     RouteControl as RouteControl,
     SendStatus as SendStatus,
     Status as Status,
@@ -41,7 +42,7 @@ class Notification(t.Struct):
 class Request(t.Struct):
     """A host -> device request."""
 
-    command: ClassVar[CommandId]
+    command: ClassVar[RequestCommand]
     # The OK-body response type; None when the OK reply is empty.
     response: ClassVar[type[Response] | None] = None
     # The streamed item type for a scan/stream request; None for plain request/response.
@@ -112,87 +113,83 @@ class CapturedPacket(Response, wire.CapturedPacketPayload):
 # -- requests --------------------------------------------------------------------
 
 
-class Ping(Request):
-    command = CommandId.PING
-
-
 class Reset(Request, wire.ResetPayload):
-    command = CommandId.RESET
+    command = RequestCommand.RESET
 
 
 class Shutdown(Request):
-    command = CommandId.SHUTDOWN
+    command = RequestCommand.SHUTDOWN
 
 
 class GetFirmwareInfo(Request):
-    command = CommandId.GET_FIRMWARE_INFO
+    command = RequestCommand.GET_FIRMWARE_INFO
     response = FirmwareInfo
 
 
 class GetHwAddress(Request):
-    command = CommandId.GET_HW_ADDRESS
+    command = RequestCommand.GET_HW_ADDRESS
     response = HwAddress
 
 
 class Configure(Request, wire.ConfigurePayload):
-    command = CommandId.CONFIGURE
+    command = RequestCommand.CONFIGURE
 
 
 class LoadKeyTable(Request, wire.LoadKeyTablePayload):
-    command = CommandId.LOAD_KEY_TABLE
+    command = RequestCommand.LOAD_KEY_TABLE
 
 
 class LoadChildren(Request, wire.LoadChildrenPayload):
-    command = CommandId.LOAD_CHILDREN
+    command = RequestCommand.LOAD_CHILDREN
 
 
 class LoadAddressCache(Request, wire.LoadAddressCachePayload):
-    command = CommandId.LOAD_ADDRESS_CACHE
+    command = RequestCommand.LOAD_ADDRESS_CACHE
 
 
 class LoadRouteTable(Request, wire.LoadRouteTablePayload):
-    command = CommandId.LOAD_ROUTE_TABLE
+    command = RequestCommand.LOAD_ROUTE_TABLE
 
 
 class LoadSourceRoutes(Request, wire.LoadSourceRoutesPayload):
-    command = CommandId.LOAD_SOURCE_ROUTES
+    command = RequestCommand.LOAD_SOURCE_ROUTES
 
 
 class StartNetwork(Request):
-    command = CommandId.START_NETWORK
+    command = RequestCommand.START_NETWORK
 
 
 class GetNetworkInfo(Request):
-    command = CommandId.GET_NETWORK_INFO
+    command = RequestCommand.GET_NETWORK_INFO
     response = NetworkInfo
 
 
 class ScanKeyTable(Request):
-    command = CommandId.SCAN_KEY_TABLE
+    command = RequestCommand.SCAN_KEY_TABLE
     response = ScanCount
     event = KeyEntry
 
 
 class ScanChildren(Request):
-    command = CommandId.SCAN_CHILDREN
+    command = RequestCommand.SCAN_CHILDREN
     response = ScanCount
     event = ChildEntry
 
 
 class ScanAddressCache(Request):
-    command = CommandId.SCAN_ADDRESS_CACHE
+    command = RequestCommand.SCAN_ADDRESS_CACHE
     response = ScanCount
     event = AddressEntry
 
 
 class ScanRouteTable(Request):
-    command = CommandId.SCAN_ROUTE_TABLE
+    command = RequestCommand.SCAN_ROUTE_TABLE
     response = ScanCount
     event = RouteEntry
 
 
 class SendUnicast(Request, wire.SendUnicastPayload):
-    command = CommandId.SEND_UNICAST
+    command = RequestCommand.SEND_UNICAST
 
     @classmethod
     def build(
@@ -243,7 +240,7 @@ class SendUnicast(Request, wire.SendUnicastPayload):
 
 
 class SendBroadcast(Request, wire.SendBroadcastPayload):
-    command = CommandId.SEND_BROADCAST
+    command = RequestCommand.SEND_BROADCAST
 
     @classmethod
     def build(
@@ -274,7 +271,7 @@ class SendBroadcast(Request, wire.SendBroadcastPayload):
 
 
 class SendGroupcast(Request, wire.SendGroupcastPayload):
-    command = CommandId.SEND_GROUPCAST
+    command = RequestCommand.SEND_GROUPCAST
 
     @classmethod
     def build(
@@ -303,38 +300,38 @@ class SendGroupcast(Request, wire.SendGroupcastPayload):
 
 
 class PermitJoins(Request, wire.PermitJoinsPayload):
-    command = CommandId.PERMIT_JOINS
+    command = RequestCommand.PERMIT_JOINS
 
 
 class SetChannel(Request, wire.ChannelPayload):
-    command = CommandId.SET_CHANNEL
+    command = RequestCommand.SET_CHANNEL
 
 
 class SetNwkUpdateId(Request, wire.NwkUpdateIdPayload):
-    command = CommandId.SET_NWK_UPDATE_ID
+    command = RequestCommand.SET_NWK_UPDATE_ID
 
 
 class SetProvisionalKey(Request, wire.ProvisionalKeyPayload):
-    command = CommandId.SET_PROVISIONAL_KEY
+    command = RequestCommand.SET_PROVISIONAL_KEY
 
 
 class EnergyScan(Request, wire.ScanRequestPayload):
-    command = CommandId.ENERGY_SCAN
+    command = RequestCommand.ENERGY_SCAN
     event = EnergyResult
 
 
 class NetworkScan(Request, wire.ScanRequestPayload):
-    command = CommandId.NETWORK_SCAN
+    command = RequestCommand.NETWORK_SCAN
     event = Beacon
 
 
 class PacketCapture(Request, wire.ChannelPayload):
-    command = CommandId.PACKET_CAPTURE
+    command = RequestCommand.PACKET_CAPTURE
     event = CapturedPacket
 
 
 class PacketCaptureChannel(Request, wire.ChannelPayload):
-    command = CommandId.PACKET_CAPTURE_CHANNEL
+    command = RequestCommand.PACKET_CAPTURE_CHANNEL
 
 
 # The tunable name is a Rust field name of the stack's `Tunables` struct (see the
@@ -342,7 +339,7 @@ class PacketCaptureChannel(Request, wire.ChannelPayload):
 # integers as-is, bools as 0/1, durations in microseconds, enums as their
 # discriminant; the firmware rejects unknown names and out-of-range values.
 class SetTunable(Request, wire.SetTunablePayload):
-    command = CommandId.SET_TUNABLE
+    command = RequestCommand.SET_TUNABLE
 
     @classmethod
     def build(cls, name: str, value: int | timedelta) -> SetTunable:
@@ -352,7 +349,7 @@ class SetTunable(Request, wire.SetTunablePayload):
 
 
 class CancelRequest(Request, wire.CancelRequestPayload):
-    command = CommandId.CANCEL_REQUEST
+    command = RequestCommand.CANCEL_REQUEST
     response = CancelResult
 
 
@@ -433,46 +430,50 @@ class ApsFrameCounter(Notification, wire.ApsFrameCounterPayload):
 # Notification id -> struct, for decoding unsolicited frames. `SendConfirm`,
 # `ApsAckConfirm` and `BroadcastConfirm` are handled specially (they resolve a pending
 # send by request id).
-NOTIFICATIONS: dict[CommandId, type[Notification]] = {
-    CommandId.HELLO: Hello,
-    CommandId.LAST_RESET: LastReset,
-    CommandId.RECEIVED_APS: ReceivedAps,
-    CommandId.SEND_CONFIRM: SendConfirm,
-    CommandId.APS_ACK_CONFIRM: ApsAckConfirm,
-    CommandId.BROADCAST_CONFIRM: BroadcastConfirm,
-    CommandId.DEVICE_JOINED: DeviceJoined,
-    CommandId.DEVICE_LEFT: DeviceLeft,
-    CommandId.FRAME_COUNTER: FrameCounter,
-    CommandId.LINK_KEY: LinkKey,
-    CommandId.APS_DECRYPT_FAILURE: ApsDecryptFailure,
-    CommandId.ROUTE_RECORD: RouteRecord,
-    CommandId.APS_FRAME_COUNTER: ApsFrameCounter,
+NOTIFICATIONS: dict[NotificationCommand, type[Notification]] = {
+    NotificationCommand.HELLO: Hello,
+    NotificationCommand.LAST_RESET: LastReset,
+    NotificationCommand.RECEIVED_APS: ReceivedAps,
+    NotificationCommand.SEND_CONFIRM: SendConfirm,
+    NotificationCommand.APS_ACK_CONFIRM: ApsAckConfirm,
+    NotificationCommand.BROADCAST_CONFIRM: BroadcastConfirm,
+    NotificationCommand.DEVICE_JOINED: DeviceJoined,
+    NotificationCommand.DEVICE_LEFT: DeviceLeft,
+    NotificationCommand.FRAME_COUNTER: FrameCounter,
+    NotificationCommand.LINK_KEY: LinkKey,
+    NotificationCommand.APS_DECRYPT_FAILURE: ApsDecryptFailure,
+    NotificationCommand.ROUTE_RECORD: RouteRecord,
+    NotificationCommand.APS_FRAME_COUNTER: ApsFrameCounter,
 }
 
 
 def encode_request(request: Request, request_id: int) -> bytes:
-    """Serialize a request frame (3-byte header: command, request id)."""
-    return (
-        bytes([request.command])
-        + t.uint16_t(request_id).serialize()
-        + request.serialize()
+    """Serialize a request frame (3-byte header, then the payload)."""
+    header = Header(
+        command=t.uint8_t(request.command),
+        frame_type=FrameType.REQUEST,
+        request_id=t.uint16_t(request_id),
     )
+    return header.serialize() + request.serialize()
 
 
 def encode_reply(
-    frame_type: FrameType, command: CommandId, request_id: int, body: bytes = b""
+    frame_type: FrameType,
+    command: RequestCommand | NotificationCommand,
+    request_id: int,
+    body: bytes = b"",
 ) -> bytes:
-    """Serialize a device -> host frame (4-byte header, then the body)."""
-    header = ReplyHeader(
-        frame_type=frame_type,
+    """Serialize a device -> host frame (3-byte header, then the body)."""
+    header = Header(
         command=t.uint8_t(command),
+        frame_type=frame_type,
         request_id=t.uint16_t(request_id),
     )
     return header.serialize() + body
 
 
 # Command id -> request type, for parsing an outbound frame back into a struct.
-REQUESTS: dict[CommandId, type[Request]] = {
+REQUESTS: dict[RequestCommand, type[Request]] = {
     cls.command: cls for cls in Request.__subclasses__()
 }
 
@@ -480,13 +481,12 @@ REQUESTS: dict[CommandId, type[Request]] = {
 class ProtocolError(DeliveryError):
     """A firmware error response (non-OK status)."""
 
-    # The message keeps the JSON path's "<code>: <message>" format (code = lowercased
-    # status name) so existing str(exc).startswith(...) checks still work.
-    def __init__(self, status: Status, message: str) -> None:
+    # `detail` is client-side context (e.g. the rate-limit retry delay); the wire
+    # carries only the status code.
+    def __init__(self, status: Status, detail: str = "") -> None:
         code = status.name.lower()
-        super().__init__(f"{code}: {message}" if message else f"{code}: ")
+        super().__init__(f"{code}: {detail}" if detail else code)
         self.status = status
-        self.message = message
 
 
 class RateLimitedError(ProtocolError):

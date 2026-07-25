@@ -90,8 +90,9 @@ class ZigguratApi:
             self._on_disconnect(exc)
 
     def _next_id(self) -> int:
+        # Request ids are 14 bits on the wire; 0 is left to unsolicited notifications.
         request_id = self._request_id
-        self._request_id = (self._request_id % 0xFFFF) + 1
+        self._request_id = (self._request_id % 0x3FFF) + 1
         return request_id
 
     async def _cancel_send(self, request_id: int) -> None:
@@ -184,7 +185,7 @@ class ZigguratApi:
     # -- inbound frame handling ----------------------------------------------------
 
     def _handle_frame(self, frame: bytes) -> None:
-        header, body = p.ReplyHeader.deserialize(frame)
+        header, body = p.Header.deserialize(frame)
         request_id = header.request_id
 
         if header.frame_type == p.FrameType.RESPONSE:
@@ -192,7 +193,7 @@ class ZigguratApi:
         elif header.frame_type == p.FrameType.EVENT:
             self._handle_event(request_id, body)
         elif header.frame_type == p.FrameType.NOTIFICATION:
-            command = p.CommandId(header.command)
+            command = p.NotificationCommand(header.command)
             if command not in p.NOTIFICATIONS:
                 _LOGGER.debug("Unhandled notification %r", command)
                 return
@@ -216,9 +217,8 @@ class ZigguratApi:
             )
             pending.response.set_exception(p.RateLimitedError(retry_in))
         elif status != p.Status.OK:
-            err = p.ErrorPayload.deserialize(body)[0]
-            _LOGGER.debug("Received error response (id=%d): %r", request_id, err)
-            pending.response.set_exception(p.ProtocolError(status, err.message))
+            _LOGGER.debug("Received error response (id=%d): %r", request_id, status)
+            pending.response.set_exception(p.ProtocolError(status))
         else:
             response = (
                 pending.request.response.deserialize(body[1:])[0]

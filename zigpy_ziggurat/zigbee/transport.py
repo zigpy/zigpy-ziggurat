@@ -278,13 +278,14 @@ class WebSocketTransport(_WebSocketBase):
 
 # JSON error code -> binary status
 _STATUS_BY_CODE: dict[str, p.Status] = {
-    "parse": p.Status.PARSE,
+    "parse": p.Status.MALFORMED_PAYLOAD,
     "unknown_command": p.Status.UNKNOWN_COMMAND,
-    "invalid_state": p.Status.INVALID_STATE,
+    # The legacy server's lone state error is a load after the network started.
+    "invalid_state": p.Status.ALREADY_STARTED,
     "not_configured": p.Status.NOT_CONFIGURED,
     "radio_error": p.Status.RADIO_ERROR,
     "network_start_failed": p.Status.NETWORK_START_FAILED,
-    "transmit_failed": p.Status.TRANSMIT_FAILED,
+    "transmit_failed": p.Status.RADIO_ERROR,
     "scan_failed": p.Status.SCAN_FAILED,
     "invalid_request": p.Status.INVALID_REQUEST,
 }
@@ -310,7 +311,7 @@ class LegacyWebSocketTransport(_WebSocketBase):
     def __init__(self, on_frame: OnFrame, on_lost: OnLost) -> None:
         super().__init__(on_frame, on_lost)
         # request id -> command, so a JSON response builds the right binary reply
-        self._pending_commands: dict[int, p.CommandId] = {}
+        self._pending_commands: dict[int, p.RequestCommand] = {}
         # The binary protocol splits `configure` (Configure + LoadKeyTable* +
         # StartNetwork) that the JSON server takes as one call; coalesce it.
         self._pending_configure: p.Configure | None = None
@@ -322,56 +323,57 @@ class LegacyWebSocketTransport(_WebSocketBase):
     # -- outbound: binary frame -> JSON request ------------------------------------
 
     async def send_frame(self, frame: bytes) -> None:
-        command = p.CommandId(frame[0])
-        request_id = int.from_bytes(frame[1:3], "little")
-        request = p.REQUESTS[command].deserialize(frame[3:])[0]
+        header, body = p.Header.deserialize(frame)
+        command = p.RequestCommand(header.command)
+        request_id = int(header.request_id)
+        request = p.REQUESTS[command].deserialize(body)[0]
 
-        if command in (p.CommandId.SHUTDOWN, p.CommandId.RESET):
+        if command in (p.RequestCommand.SHUTDOWN, p.RequestCommand.RESET):
             # The legacy server has neither shutdown nor reset; it replaces the stack
             # on `configure`. OK them locally so callers don't depend on either.
             self._emit_ok(command, request_id)
-        elif command == p.CommandId.CONFIGURE:
+        elif command == p.RequestCommand.CONFIGURE:
             self._pending_configure = cast(p.Configure, request)
             self._pending_keys = []
             self._emit_ok(command, request_id)
-        elif command == p.CommandId.LOAD_KEY_TABLE:
+        elif command == p.RequestCommand.LOAD_KEY_TABLE:
             self._pending_keys.extend(cast(p.LoadKeyTable, request).entries)
             self._emit_ok(command, request_id)
         elif command in (
-            p.CommandId.LOAD_CHILDREN,
-            p.CommandId.LOAD_ADDRESS_CACHE,
-            p.CommandId.LOAD_ROUTE_TABLE,
-            p.CommandId.LOAD_SOURCE_ROUTES,
+            p.RequestCommand.LOAD_CHILDREN,
+            p.RequestCommand.LOAD_ADDRESS_CACHE,
+            p.RequestCommand.LOAD_ROUTE_TABLE,
+            p.RequestCommand.LOAD_SOURCE_ROUTES,
         ):
             # The legacy server re-learns its topology tables, so acknowledge these
             # restore loads locally and drop them.
             self._emit_ok(command, request_id)
-        elif command == p.CommandId.START_NETWORK:
+        elif command == p.RequestCommand.START_NETWORK:
             assert self._pending_configure is not None
             params = self._configure_params(self._pending_configure, self._pending_keys)
             self._pending_configure = None
             self._pending_keys = []
             self._pending_commands[request_id] = command
             await self._send_json(request_id, "configure", params)
-        elif command == p.CommandId.GET_NETWORK_INFO:
+        elif command == p.RequestCommand.GET_NETWORK_INFO:
             self._pending_commands[request_id] = command
             await self._send_json(request_id, "get_network_info", {})
-        elif command == p.CommandId.SCAN_KEY_TABLE:
+        elif command == p.RequestCommand.SCAN_KEY_TABLE:
             for entry in self._scan_keys:
                 self._emit(p.FrameType.EVENT, command, request_id, entry.serialize())
             count = p.ScanCount(count=t.uint16_t(len(self._scan_keys)))
             self._emit_ok(command, request_id, count)
             self._scan_keys = []
         elif command in (
-            p.CommandId.SCAN_CHILDREN,
-            p.CommandId.SCAN_ADDRESS_CACHE,
-            p.CommandId.SCAN_ROUTE_TABLE,
+            p.RequestCommand.SCAN_CHILDREN,
+            p.RequestCommand.SCAN_ADDRESS_CACHE,
+            p.RequestCommand.SCAN_ROUTE_TABLE,
         ):
             # The JSON server surfaces only the key table (inline in get_network_info);
             # it has no children/address/route scans, so these stream empty. The app
             # re-learns that topology from join notifications during the transition.
             self._emit_ok(command, request_id, p.ScanCount(count=t.uint16_t(0)))
-        elif command == p.CommandId.CANCEL_REQUEST:
+        elif command == p.RequestCommand.CANCEL_REQUEST:
             # The legacy server has no request-cancel concept, so the best-effort
             # cancel from `ZigguratApi._cancel_send` is dropped here.
             pass
@@ -388,13 +390,15 @@ class LegacyWebSocketTransport(_WebSocketBase):
         )
 
     def _encode_request(
-        self, command: p.CommandId, request: p.Request
+        self, command: p.RequestCommand, request: p.Request
     ) -> tuple[str, dict[str, Any]]:
-        if command == p.CommandId.PING:
+        if command == p.RequestCommand.GET_FIRMWARE_INFO:
+            # The legacy server has no firmware-info call; `ping` keeps the liveness
+            # probe end-to-end and the response is fabricated in `_handle_response`.
             return "ping", {}
-        if command == p.CommandId.GET_HW_ADDRESS:
+        if command == p.RequestCommand.GET_HW_ADDRESS:
             return "get_hw_address", {}
-        if command == p.CommandId.PERMIT_JOINS:
+        if command == p.RequestCommand.PERMIT_JOINS:
             permit = cast(p.PermitJoins, request)
             return (
                 "permit_joins",
@@ -403,22 +407,22 @@ class LegacyWebSocketTransport(_WebSocketBase):
                     accept_direct_joins=bool(permit.accept_direct_joins),
                 ).to_dict(),
             )
-        if command == p.CommandId.SET_CHANNEL:
+        if command == p.RequestCommand.SET_CHANNEL:
             channel = int(cast(p.SetChannel, request).channel)
             return "set_channel", legacy.SetChannel(channel=channel).to_dict()
-        if command == p.CommandId.SET_NWK_UPDATE_ID:
+        if command == p.RequestCommand.SET_NWK_UPDATE_ID:
             update_id = int(cast(p.SetNwkUpdateId, request).nwk_update_id)
             return (
                 "set_nwk_update_id",
                 legacy.SetNwkUpdateId(nwk_update_id=update_id).to_dict(),
             )
-        if command == p.CommandId.SET_PROVISIONAL_KEY:
+        if command == p.RequestCommand.SET_PROVISIONAL_KEY:
             key = cast(p.SetProvisionalKey, request)
             return (
                 "set_provisional_key",
                 legacy.SetProvisionalKey(ieee=key.ieee, key=key.key).to_dict(),
             )
-        if command == p.CommandId.ENERGY_SCAN:
+        if command == p.RequestCommand.ENERGY_SCAN:
             scan = cast(p.EnergyScan, request)
             return (
                 "energy_scan",
@@ -427,7 +431,7 @@ class LegacyWebSocketTransport(_WebSocketBase):
                     duration_per_channel_ms=int(scan.duration_per_channel_ms),
                 ).to_dict(),
             )
-        if command == p.CommandId.NETWORK_SCAN:
+        if command == p.RequestCommand.NETWORK_SCAN:
             net_scan = cast(p.NetworkScan, request)
             return (
                 "network_scan",
@@ -436,22 +440,22 @@ class LegacyWebSocketTransport(_WebSocketBase):
                     duration_per_channel_ms=int(net_scan.duration_per_channel_ms),
                 ).to_dict(),
             )
-        if command == p.CommandId.PACKET_CAPTURE:
+        if command == p.RequestCommand.PACKET_CAPTURE:
             channel = int(cast(p.PacketCapture, request).channel)
             return "packet_capture", legacy.PacketCapture(channel=channel).to_dict()
-        if command == p.CommandId.PACKET_CAPTURE_CHANNEL:
+        if command == p.RequestCommand.PACKET_CAPTURE_CHANNEL:
             channel = int(cast(p.PacketCaptureChannel, request).channel)
             return (
                 "packet_capture_change_channel",
                 legacy.PacketCaptureChangeChannel(channel=channel).to_dict(),
             )
-        if command == p.CommandId.SEND_UNICAST:
+        if command == p.RequestCommand.SEND_UNICAST:
             return "send_aps", self._send_unicast_params(cast(p.SendUnicast, request))
-        if command == p.CommandId.SEND_BROADCAST:
+        if command == p.RequestCommand.SEND_BROADCAST:
             return "send_aps", self._send_broadcast_params(
                 cast(p.SendBroadcast, request)
             )
-        if command == p.CommandId.SEND_GROUPCAST:
+        if command == p.RequestCommand.SEND_GROUPCAST:
             return "send_aps", self._send_groupcast_params(
                 cast(p.SendGroupcast, request)
             )
@@ -565,19 +569,32 @@ class LegacyWebSocketTransport(_WebSocketBase):
         if "error" in message:
             error = message["error"]
             code = error["code"]
-            if code in _STATUS_BY_CODE:
-                status = _STATUS_BY_CODE[code]
-                text = error["message"]
-            else:
-                # No binary status for this JSON code (a host-side failure the firmware
-                # can't produce): keep the code in the message so callers still see it.
-                status = p.Status.INVALID_REQUEST
-                text = f"{code}: {error['message']}"
-            body = p.ErrorPayload(status=status, message=t.LongCharacterString(text))
-            self._emit(p.FrameType.RESPONSE, command, request_id, body.serialize())
-        elif command == p.CommandId.GET_NETWORK_INFO:
+            # A JSON code with no binary status (a host-side failure the firmware
+            # can't produce) degrades to a generic invalid-request.
+            status = _STATUS_BY_CODE.get(code, p.Status.INVALID_REQUEST)
+            # The binary protocol carries only the status; the diagnostic text
+            # becomes a log line, like the binary server's own warnings.
+            _LOGGER.warning(
+                "Legacy server error for %r (id=%d): %s: %s",
+                command,
+                request_id,
+                code,
+                error["message"],
+            )
+            self._emit(p.FrameType.RESPONSE, command, request_id, bytes([status]))
+        elif command == p.RequestCommand.GET_FIRMWARE_INFO:
+            # Transcoded to a JSON `ping`, which has no result: fabricate the payload.
+            self._emit_ok(
+                command,
+                request_id,
+                p.FirmwareInfo(
+                    protocol_version=t.uint8_t(p.PROTOCOL_VERSION),
+                    version=t.LongCharacterString("ziggurat/legacy"),
+                ),
+            )
+        elif command == p.RequestCommand.GET_NETWORK_INFO:
             self._emit_ok(command, request_id, self._network_info(message["result"]))
-        elif command == p.CommandId.GET_HW_ADDRESS:
+        elif command == p.RequestCommand.GET_HW_ADDRESS:
             hw = legacy.HwAddress.from_dict(message["result"])
             self._emit_ok(command, request_id, p.HwAddress(ieee=hw.ieee_address))
         else:
@@ -590,7 +607,7 @@ class LegacyWebSocketTransport(_WebSocketBase):
             # The legacy send handoff, delivered as a bare event; the binary protocol
             # models it as a `send_confirm` notification keyed by request id.
             self._emit_notification(
-                p.CommandId.SEND_CONFIRM,
+                p.NotificationCommand.SEND_CONFIRM,
                 request_id,
                 p.SendConfirm(status=p.SendStatus.SUCCESS),
             )
@@ -600,10 +617,10 @@ class LegacyWebSocketTransport(_WebSocketBase):
             payload: p.Response = p.EnergyResult(
                 channel=t.uint8_t(result.channel), rssi=t.int8s(result.rssi)
             )
-            command = p.CommandId.ENERGY_SCAN
+            command = p.RequestCommand.ENERGY_SCAN
         elif event == "network_found":
             payload = self._beacon(message["data"])
-            command = p.CommandId.NETWORK_SCAN
+            command = p.RequestCommand.NETWORK_SCAN
         elif event == "captured_packet":
             packet = legacy.CapturedPacketEvent.from_dict(message["data"])
             payload = p.CapturedPacket(
@@ -612,7 +629,7 @@ class LegacyWebSocketTransport(_WebSocketBase):
                 lqi=t.uint8_t(packet.lqi),
                 psdu=t.LongOctetString(bytes.fromhex(packet.data)),
             )
-            command = p.CommandId.PACKET_CAPTURE
+            command = p.RequestCommand.PACKET_CAPTURE
         else:
             # `accepted` and any other bare event have no binary equivalent.
             return
@@ -625,32 +642,36 @@ class LegacyWebSocketTransport(_WebSocketBase):
             self._handle_log(data)
         elif event == "send_confirm":
             self._emit_notification(
-                p.CommandId.SEND_CONFIRM, data["id"], self._send_confirm(data)
+                p.NotificationCommand.SEND_CONFIRM, data["id"], self._send_confirm(data)
             )
         elif event == "aps_ack_confirm":
             self._emit_notification(
-                p.CommandId.APS_ACK_CONFIRM, data["id"], self._aps_ack_confirm(data)
+                p.NotificationCommand.APS_ACK_CONFIRM,
+                data["id"],
+                self._aps_ack_confirm(data),
             )
         elif event == "received_aps_command":
             self._emit_notification(
-                p.CommandId.RECEIVED_APS, 0, self._received_aps(data)
+                p.NotificationCommand.RECEIVED_APS, 0, self._received_aps(data)
             )
         elif event == "frame_counter_update":
             counter = legacy.FrameCounterUpdate.from_dict(data)
             self._emit_notification(
-                p.CommandId.FRAME_COUNTER,
+                p.NotificationCommand.FRAME_COUNTER,
                 0,
                 p.FrameCounter(frame_counter=t.uint32_t(counter.frame_counter)),
             )
         elif event == "link_key_update":
             link = legacy.LinkKeyUpdate.from_dict(data)
             self._emit_notification(
-                p.CommandId.LINK_KEY, 0, p.LinkKey(ieee=link.ieee, key=link.key)
+                p.NotificationCommand.LINK_KEY,
+                0,
+                p.LinkKey(ieee=link.ieee, key=link.key),
             )
         elif event == "device_joined":
             joined = legacy.DeviceJoined.from_dict(data)
             self._emit_notification(
-                p.CommandId.DEVICE_JOINED,
+                p.NotificationCommand.DEVICE_JOINED,
                 0,
                 p.DeviceJoined(
                     nwk=joined.nwk,
@@ -663,10 +684,14 @@ class LegacyWebSocketTransport(_WebSocketBase):
                 ),
             )
         elif event == "device_left":
-            self._emit_notification(p.CommandId.DEVICE_LEFT, 0, self._device_left(data))
+            self._emit_notification(
+                p.NotificationCommand.DEVICE_LEFT, 0, self._device_left(data)
+            )
         elif event == "aps_decryption_failure":
             self._emit_notification(
-                p.CommandId.APS_DECRYPT_FAILURE, 0, self._aps_decrypt_failure(data)
+                p.NotificationCommand.APS_DECRYPT_FAILURE,
+                0,
+                self._aps_decrypt_failure(data),
             )
 
     def _handle_log(self, data: dict[str, Any]) -> None:
@@ -805,14 +830,17 @@ class LegacyWebSocketTransport(_WebSocketBase):
     def _emit(
         self,
         frame_type: p.FrameType,
-        command: p.CommandId,
+        command: p.RequestCommand | p.NotificationCommand,
         request_id: int,
         body: bytes = b"",
     ) -> None:
         self._on_frame(p.encode_reply(frame_type, command, request_id, body))
 
     def _emit_ok(
-        self, command: p.CommandId, request_id: int, payload: p.Response | None = None
+        self,
+        command: p.RequestCommand,
+        request_id: int,
+        payload: p.Response | None = None,
     ) -> None:
         body = bytes([p.Status.OK]) + (
             payload.serialize() if payload is not None else b""
@@ -820,6 +848,6 @@ class LegacyWebSocketTransport(_WebSocketBase):
         self._emit(p.FrameType.RESPONSE, command, request_id, body)
 
     def _emit_notification(
-        self, command: p.CommandId, request_id: int, payload: p.Notification
+        self, command: p.NotificationCommand, request_id: int, payload: p.Notification
     ) -> None:
         self._emit(p.FrameType.NOTIFICATION, command, request_id, payload.serialize())

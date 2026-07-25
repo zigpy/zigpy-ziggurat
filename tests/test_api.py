@@ -45,16 +45,15 @@ class SyntheticBinaryTransport:
         self.requests: list[p.Request] = []
         self.request_ids: list[int] = []
         self.hw_ieee = t.EUI64.convert("11:22:33:44:55:66:77:88")
-        self.handlers: dict[p.CommandId, Handler] = {
-            p.CommandId.PING: self._empty_ok,
-            p.CommandId.RESET: self._empty_ok,
-            p.CommandId.SHUTDOWN: self._empty_ok,
-            p.CommandId.PERMIT_JOINS: self._empty_ok,
-            p.CommandId.SET_TUNABLE: self._empty_ok,
-            p.CommandId.GET_HW_ADDRESS: self._hw_address,
-            p.CommandId.SEND_UNICAST: self._send_aps,
-            p.CommandId.ENERGY_SCAN: self._energy_scan,
-            p.CommandId.CANCEL_REQUEST: self._cancel_request,
+        self.handlers: dict[p.RequestCommand, Handler] = {
+            p.RequestCommand.RESET: self._empty_ok,
+            p.RequestCommand.SHUTDOWN: self._empty_ok,
+            p.RequestCommand.PERMIT_JOINS: self._empty_ok,
+            p.RequestCommand.SET_TUNABLE: self._empty_ok,
+            p.RequestCommand.GET_HW_ADDRESS: self._hw_address,
+            p.RequestCommand.SEND_UNICAST: self._send_aps,
+            p.RequestCommand.ENERGY_SCAN: self._energy_scan,
+            p.RequestCommand.CANCEL_REQUEST: self._cancel_request,
         }
 
     async def factory(
@@ -74,9 +73,11 @@ class SyntheticBinaryTransport:
         pass
 
     async def send_frame(self, frame: bytes) -> None:
-        command = p.CommandId(frame[0])
-        request_id = int.from_bytes(frame[1:3], "little")
-        request = p.REQUESTS[command].deserialize(frame[3:])[0]
+        header, body = p.Header.deserialize(frame)
+        assert header.frame_type == p.FrameType.REQUEST
+        command = p.RequestCommand(header.command)
+        request_id = int(header.request_id)
+        request = p.REQUESTS[command].deserialize(body)[0]
         self.requests.append(request)
         self.request_ids.append(request_id)
         await self.handlers[command](request, request_id)
@@ -87,34 +88,37 @@ class SyntheticBinaryTransport:
     # -- frame injection -----------------------------------------------------------
 
     def ok(
-        self, command: p.CommandId, request_id: int, payload: p.Response | None = None
+        self,
+        command: p.RequestCommand,
+        request_id: int,
+        payload: p.Response | None = None,
     ) -> None:
         body = bytes([p.Status.OK]) + (payload.serialize() if payload else b"")
         self._on_frame(p.encode_reply(p.FrameType.RESPONSE, command, request_id, body))
 
     def error(
-        self, command: p.CommandId, request_id: int, status: p.Status, message: str = ""
+        self, command: p.RequestCommand, request_id: int, status: p.Status
     ) -> None:
-        body = p.ErrorPayload(
-            status=status, message=t.LongCharacterString(message)
-        ).serialize()
+        body = bytes([status])
         self._on_frame(p.encode_reply(p.FrameType.RESPONSE, command, request_id, body))
 
     def rate_limited(
-        self, command: p.CommandId, request_id: int, retry_in_ms: int
+        self, command: p.RequestCommand, request_id: int, retry_in_ms: int
     ) -> None:
         body = p.RateLimitedPayload(
             status=p.Status.RATE_LIMITED, retry_in_ms=t.uint32_t(retry_in_ms)
         ).serialize()
         self._on_frame(p.encode_reply(p.FrameType.RESPONSE, command, request_id, body))
 
-    def event(self, command: p.CommandId, request_id: int, payload: p.Response) -> None:
+    def event(
+        self, command: p.RequestCommand, request_id: int, payload: p.Response
+    ) -> None:
         self._on_frame(
             p.encode_reply(p.FrameType.EVENT, command, request_id, payload.serialize())
         )
 
     def notify(
-        self, command: p.CommandId, request_id: int, payload: p.Notification
+        self, command: p.NotificationCommand, request_id: int, payload: p.Notification
     ) -> None:
         self._on_frame(
             p.encode_reply(
@@ -126,7 +130,7 @@ class SyntheticBinaryTransport:
         self, request_id: int, *, status: p.SendStatus = p.SendStatus.SUCCESS
     ) -> None:
         self.notify(
-            p.CommandId.SEND_CONFIRM,
+            p.NotificationCommand.SEND_CONFIRM,
             request_id,
             p.SendConfirm(status=status),
         )
@@ -135,7 +139,7 @@ class SyntheticBinaryTransport:
         self, request_id: int, *, status: p.SendStatus = p.SendStatus.SUCCESS
     ) -> None:
         self.notify(
-            p.CommandId.APS_ACK_CONFIRM,
+            p.NotificationCommand.APS_ACK_CONFIRM,
             request_id,
             p.ApsAckConfirm(status=status),
         )
@@ -166,7 +170,7 @@ class SyntheticBinaryTransport:
     async def _energy_scan(self, request: p.Request, request_id: int) -> None:
         for channel in request.channels:  # type: ignore[attr-defined]
             self.event(
-                p.CommandId.ENERGY_SCAN,
+                p.RequestCommand.ENERGY_SCAN,
                 request_id,
                 p.EnergyResult(channel=t.uint8_t(channel), rssi=t.int8s(-85)),
             )
@@ -201,7 +205,7 @@ async def api(transport: SyntheticBinaryTransport) -> AsyncIterator[RecordingApi
 
 async def test_request(api: RecordingApi, transport: SyntheticBinaryTransport) -> None:
     # An empty OK reply returns None
-    assert await api.request(p.Ping()) is None
+    assert await api.request(p.Shutdown()) is None
 
     hw = await api.request(p.GetHwAddress())
     assert isinstance(hw, p.HwAddress)
@@ -227,14 +231,15 @@ async def test_error_response(
     api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:
     async def fail(request: p.Request, request_id: int) -> None:
-        transport.error(
-            request.command, request_id, p.Status.RADIO_ERROR, "it burned down"
-        )
+        transport.error(request.command, request_id, p.Status.RADIO_ERROR)
 
-    transport.handlers[p.CommandId.PING] = fail
+    transport.handlers[p.RequestCommand.SHUTDOWN] = fail
 
-    with pytest.raises(DeliveryError, match="radio_error: it burned down"):
-        await api.request(p.Ping())
+    with pytest.raises(DeliveryError, match="radio_error") as exc:
+        await api.request(p.Shutdown())
+
+    assert isinstance(exc.value, p.ProtocolError)
+    assert exc.value.status == p.Status.RADIO_ERROR
 
 
 async def test_rate_limited_response(
@@ -243,7 +248,7 @@ async def test_rate_limited_response(
     async def rate_limit(request: p.Request, request_id: int) -> None:
         transport.rate_limited(request.command, request_id, retry_in_ms=1800)
 
-    transport.handlers[p.CommandId.SEND_UNICAST] = rate_limit
+    transport.handlers[p.RequestCommand.SEND_UNICAST] = rate_limit
 
     with pytest.raises(p.RateLimitedError, match="rate_limited: retry in 1.8s") as exc:
         await api.request_confirmed(_send_aps(aps_ack=False))
@@ -270,7 +275,7 @@ async def test_cancel_on_abandon(
         send_ids.append(request_id)
         transport.ok(request.command, request_id)  # accepted, never confirmed
 
-    transport.handlers[p.CommandId.SEND_UNICAST] = accept_only
+    transport.handlers[p.RequestCommand.SEND_UNICAST] = accept_only
 
     task = asyncio.create_task(api.request_confirmed(_send_aps(aps_ack=False)))
     while not transport.sent(p.SendUnicast):
@@ -301,7 +306,7 @@ async def test_cancel_on_timeout(
         send_ids.append(request_id)
         transport.ok(request.command, request_id)  # accepted, never confirmed
 
-    transport.handlers[p.CommandId.SEND_UNICAST] = accept_only
+    transport.handlers[p.RequestCommand.SEND_UNICAST] = accept_only
 
     with pytest.raises(TimeoutError):
         await api.request_confirmed(_send_aps(aps_ack=False))
@@ -330,13 +335,11 @@ async def test_request_confirmed_rejected(
     """The stack rejects the frame, so the send raises before any confirm."""
 
     async def reject(request: p.Request, request_id: int) -> None:
-        transport.error(
-            request.command, request_id, p.Status.TRANSMIT_FAILED, "channel busy"
-        )
+        transport.error(request.command, request_id, p.Status.PAYLOAD_TOO_LONG)
 
-    transport.handlers[p.CommandId.SEND_UNICAST] = reject
+    transport.handlers[p.RequestCommand.SEND_UNICAST] = reject
 
-    with pytest.raises(DeliveryError, match="transmit_failed"):
+    with pytest.raises(DeliveryError, match="payload_too_long"):
         await api.request_confirmed(_send_aps(aps_ack=True))
 
 
@@ -350,7 +353,7 @@ async def test_request_confirmed_failure(
         transport.send_confirm(request_id, status=p.SendStatus.SUCCESS)
         transport.aps_ack_confirm(request_id, status=p.SendStatus.APS_ACK_TIMEOUT)
 
-    transport.handlers[p.CommandId.SEND_UNICAST] = ack_timeout
+    transport.handlers[p.RequestCommand.SEND_UNICAST] = ack_timeout
 
     with pytest.raises(DeliveryError, match="APS_ACK_TIMEOUT"):
         await api.request_confirmed(_send_aps(aps_ack=True))
@@ -371,7 +374,7 @@ async def test_notifications(
     api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:
     transport.notify(
-        p.CommandId.RECEIVED_APS,
+        p.NotificationCommand.RECEIVED_APS,
         0,
         p.ReceivedAps(
             source=t.NWK(0xAB12),
@@ -388,10 +391,12 @@ async def test_notifications(
         ),
     )
     transport.notify(
-        p.CommandId.FRAME_COUNTER, 0, p.FrameCounter(frame_counter=t.uint32_t(1000))
+        p.NotificationCommand.FRAME_COUNTER,
+        0,
+        p.FrameCounter(frame_counter=t.uint32_t(1000)),
     )
     transport.notify(
-        p.CommandId.DEVICE_JOINED,
+        p.NotificationCommand.DEVICE_JOINED,
         0,
         p.DeviceJoined(
             nwk=t.NWK(0xAB12),
@@ -417,17 +422,23 @@ async def test_unsolicited_frames_are_ignored(
     api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:
     # A response and an event for an unknown request id
-    transport.ok(p.CommandId.PING, 9999)
+    transport.ok(p.RequestCommand.SHUTDOWN, 9999)
     transport.event(
-        p.CommandId.ENERGY_SCAN,
+        p.RequestCommand.ENERGY_SCAN,
         9999,
         p.EnergyResult(channel=t.uint8_t(1), rssi=t.int8s(-10)),
     )
     # A frame with an unknown command byte
-    transport._on_frame(bytes([p.FrameType.NOTIFICATION, 0xEE, 0x00, 0x00]))
+    transport.raw(
+        p.Header(
+            command=t.uint8_t(0xEE),
+            frame_type=p.FrameType.NOTIFICATION,
+            request_id=t.uint16_t(0),
+        ).serialize()
+    )
 
     # The connection survives all of it
-    assert await api.request(p.Ping()) is None
+    assert await api.request(p.Shutdown()) is None
 
 
 async def test_connection_lost_fails_pending_requests(
@@ -436,9 +447,9 @@ async def test_connection_lost_fails_pending_requests(
     async def withhold(request: p.Request, request_id: int) -> None:
         return None
 
-    transport.handlers[p.CommandId.PING] = withhold
+    transport.handlers[p.RequestCommand.SHUTDOWN] = withhold
 
-    request = asyncio.ensure_future(api.request(p.Ping()))
+    request = asyncio.ensure_future(api.request(p.Shutdown()))
     await asyncio.sleep(0)
     transport.lose(None)
 
@@ -454,16 +465,18 @@ async def test_hello_reported_as_disconnect(
     async def withhold(request: p.Request, request_id: int) -> None:
         return None
 
-    transport.handlers[p.CommandId.PING] = withhold
-    request = asyncio.ensure_future(api.request(p.Ping()))
+    transport.handlers[p.RequestCommand.SHUTDOWN] = withhold
+    request = asyncio.ensure_future(api.request(p.Shutdown()))
     await asyncio.sleep(0)
 
     # A firmware reboot (`hello`) wipes the stack, so it must surface as a disconnect
     # that fails in-flight requests, not as an ordinary notification.
     transport.notify(
-        p.CommandId.HELLO,
+        p.NotificationCommand.HELLO,
         0,
-        p.Hello(protocol_version=t.uint8_t(1), configured=t.Bool(False)),
+        p.Hello(
+            protocol_version=t.uint8_t(p.PROTOCOL_VERSION), configured=t.Bool(False)
+        ),
     )
 
     with pytest.raises(ConnectionError):
@@ -480,12 +493,12 @@ async def test_timed_out_request_failed_late(
     async def withhold(request: p.Request, request_id: int) -> None:
         return None
 
-    transport.handlers[p.CommandId.PING] = withhold
+    transport.handlers[p.RequestCommand.SHUTDOWN] = withhold
 
     # The caller gave up before any response arrived (zigpy wraps requests in
     # timeouts); disconnecting must tolerate the abandoned, cancelled future
     with pytest.raises(TimeoutError):
-        await asyncio.wait_for(api.request(p.Ping()), 0.05)
+        await asyncio.wait_for(api.request(p.Shutdown()), 0.05)
 
     await api.disconnect()
     await asyncio.sleep(0)
@@ -498,7 +511,7 @@ async def test_confirmed_send_delivery_failure(
         transport.ok(request.command, request_id)
         transport.send_confirm(request_id, status=p.SendStatus.ROUTE_DISCOVERY_TIMEOUT)
 
-    transport.handlers[p.CommandId.SEND_UNICAST] = failed_confirm
+    transport.handlers[p.RequestCommand.SEND_UNICAST] = failed_confirm
 
     with pytest.raises(DeliveryError, match="ROUTE_DISCOVERY_TIMEOUT"):
         await api.request_confirmed(_send_aps(aps_ack=False))
@@ -511,7 +524,7 @@ async def test_connection_lost_fails_pending_confirm(
         # Accept the send but never confirm, leaving a pending confirmation.
         transport.ok(request.command, request_id)
 
-    transport.handlers[p.CommandId.SEND_UNICAST] = accept_only
+    transport.handlers[p.RequestCommand.SEND_UNICAST] = accept_only
 
     request = asyncio.ensure_future(api.request_confirmed(_send_aps(aps_ack=False)))
     while not transport.sent(p.SendUnicast):
@@ -525,9 +538,9 @@ async def test_connection_lost_fails_pending_confirm(
 async def test_unknown_notification_command_ignored(
     api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:
-    frame = p.ReplyHeader(
-        frame_type=p.FrameType.NOTIFICATION,
+    frame = p.Header(
         command=t.uint8_t(0x06),
+        frame_type=p.FrameType.NOTIFICATION,
         request_id=t.uint16_t(0),
     ).serialize()
     transport.raw(frame)
@@ -549,7 +562,7 @@ async def test_last_reset_logged(
 ) -> None:
     with caplog.at_level("WARNING", logger="ziggurat.fw"):
         transport.notify(
-            p.CommandId.LAST_RESET,
+            p.NotificationCommand.LAST_RESET,
             0,
             p.LastReset(message=t.LongCharacterString("brownout")),
         )

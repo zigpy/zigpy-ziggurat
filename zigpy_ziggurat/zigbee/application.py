@@ -193,8 +193,8 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
         try:
             info = cast(p.NetworkInfo, await self._api.request(p.GetNetworkInfo()))
-        except DeliveryError as exc:
-            if not str(exc).startswith("not_configured"):
+        except p.ProtocolError as exc:
+            if exc.status != p.Status.NOT_CONFIGURED:
                 raise
 
             # The server is stateless and has no network running (e.g. it just
@@ -565,7 +565,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
     async def _watchdog_feed(self) -> None:
         assert self._api is not None
-        await self._api.request(p.Ping())
+        await self._api.request(p.GetFirmwareInfo())
 
     def packet_received(self, packet: t.ZigbeePacket) -> None:
         # ZDO requests addressed to the coordinator have to be answered here: there is

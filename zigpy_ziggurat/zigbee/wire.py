@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import cast
+from typing import Self, cast
 
 import zigpy.types as t
 
@@ -13,71 +13,81 @@ class DeliveryMode(t.enum2):
     MULTICAST = 3
 
 
-class CommandId(t.enum8):
-    HELLO = 0x00
-    PING = 0x01
-    RESET = 0x02
-    GET_FIRMWARE_INFO = 0x03
-    GET_HW_ADDRESS = 0x04
-    SHUTDOWN = 0x05
+PROTOCOL_VERSION = 2
+
+
+class RequestCommand(t.enum8):
+    RESET = 0x00
+    GET_FIRMWARE_INFO = 0x01
+    GET_HW_ADDRESS = 0x02
+    SHUTDOWN = 0x03
     CONFIGURE = 0x10
     LOAD_KEY_TABLE = 0x11
     LOAD_CHILDREN = 0x12
     LOAD_ADDRESS_CACHE = 0x13
-    START_NETWORK = 0x14
-    LOAD_ROUTE_TABLE = 0x15
-    LOAD_SOURCE_ROUTES = 0x16
-    GET_NETWORK_INFO = 0x18
-    SCAN_KEY_TABLE = 0x19
-    SCAN_CHILDREN = 0x1A
-    SCAN_ADDRESS_CACHE = 0x1B
-    SCAN_ROUTE_TABLE = 0x1C
-    SEND_UNICAST = 0x20
-    PERMIT_JOINS = 0x21
-    SET_CHANNEL = 0x22
-    SET_NWK_UPDATE_ID = 0x23
-    SET_PROVISIONAL_KEY = 0x24
-    ENERGY_SCAN = 0x25
-    NETWORK_SCAN = 0x26
-    PACKET_CAPTURE = 0x27
-    PACKET_CAPTURE_CHANNEL = 0x28
-    SET_TUNABLE = 0x29
-    CANCEL_REQUEST = 0x2A
-    SEND_BROADCAST = 0x2B
-    SEND_GROUPCAST = 0x2C
-    RECEIVED_APS = 0x30
-    SEND_CONFIRM = 0x31
-    APS_ACK_CONFIRM = 0x32
-    DEVICE_JOINED = 0x33
-    DEVICE_LEFT = 0x34
-    FRAME_COUNTER = 0x35
-    LINK_KEY = 0x36
-    APS_DECRYPT_FAILURE = 0x37
-    LAST_RESET = 0x38
-    ROUTE_RECORD = 0x3A
-    APS_FRAME_COUNTER = 0x3B
-    BROADCAST_CONFIRM = 0x3C
+    LOAD_ROUTE_TABLE = 0x14
+    LOAD_SOURCE_ROUTES = 0x15
+    START_NETWORK = 0x16
+    GET_NETWORK_INFO = 0x20
+    SCAN_KEY_TABLE = 0x21
+    SCAN_CHILDREN = 0x22
+    SCAN_ADDRESS_CACHE = 0x23
+    SCAN_ROUTE_TABLE = 0x24
+    SEND_UNICAST = 0x30
+    SEND_BROADCAST = 0x31
+    SEND_GROUPCAST = 0x32
+    CANCEL_REQUEST = 0x33
+    PERMIT_JOINS = 0x34
+    SET_CHANNEL = 0x35
+    SET_NWK_UPDATE_ID = 0x36
+    SET_PROVISIONAL_KEY = 0x37
+    SET_TUNABLE = 0x38
+    ENERGY_SCAN = 0x40
+    NETWORK_SCAN = 0x41
+    PACKET_CAPTURE = 0x42
+    PACKET_CAPTURE_CHANNEL = 0x43
 
 
-class FrameType(t.enum8):
+class NotificationCommand(t.enum8):
+    HELLO = 0x00
+    LAST_RESET = 0x01
+    RECEIVED_APS = 0x10
+    SEND_CONFIRM = 0x11
+    APS_ACK_CONFIRM = 0x12
+    BROADCAST_CONFIRM = 0x13
+    DEVICE_JOINED = 0x20
+    DEVICE_LEFT = 0x21
+    FRAME_COUNTER = 0x30
+    APS_FRAME_COUNTER = 0x31
+    LINK_KEY = 0x32
+    APS_DECRYPT_FAILURE = 0x33
+    ROUTE_RECORD = 0x34
+
+
+class FrameType(t.enum2):
+    REQUEST = 0
     RESPONSE = 1
     EVENT = 2
     NOTIFICATION = 3
 
 
 class Status(t.enum8):
-    OK = 0
-    PARSE = 1
-    UNKNOWN_COMMAND = 2
-    INVALID_STATE = 3
-    NOT_CONFIGURED = 4
-    RADIO_ERROR = 5
-    NETWORK_START_FAILED = 6
-    TRANSMIT_FAILED = 7
-    SCAN_FAILED = 8
-    INVALID_REQUEST = 9
-    RATE_LIMITED = 10
-    BUDGET_EXHAUSTED = 11
+    OK = 0x00
+    MALFORMED_PAYLOAD = 0x01
+    UNKNOWN_COMMAND = 0x02
+    INVALID_REQUEST = 0x03
+    NOT_CONFIGURED = 0x10
+    NOT_STARTED = 0x11
+    ALREADY_STARTED = 0x12
+    RATE_LIMITED = 0x20
+    BUDGET_EXHAUSTED = 0x21
+    PAYLOAD_TOO_LONG = 0x22
+    SECURITY_UNAVAILABLE = 0x23
+    NO_ROUTE = 0x24
+    RADIO_ERROR = 0x30
+    NETWORK_START_FAILED = 0x31
+    SCAN_FAILED = 0x32
+    RESPONSE_TOO_LARGE = 0x40
 
 
 class NodeRole(t.enum8):
@@ -109,15 +119,29 @@ class LeaveReason(t.enum8):
     KEEPALIVE_TIMEOUT = 2
 
 
-class RequestHeader(t.Struct):
+# The 3-byte header leading every frame in both directions: the command byte, then
+# a little-endian u16 equal to `request_id << 2 | frame_type`.
+class Header(t.Struct):
     command: t.uint8_t
-    request_id: t.uint16_t
-
-
-class ReplyHeader(t.Struct):
     frame_type: FrameType
-    command: t.uint8_t
     request_id: t.uint16_t
+
+    def serialize(self) -> bytes:
+        word = t.uint16_t((self.request_id << 2) | self.frame_type)
+        return self.command.serialize() + word.serialize()
+
+    @classmethod
+    def deserialize(cls, data: bytes) -> tuple[Self, bytes]:
+        command, data = t.uint8_t.deserialize(data)
+        word, data = t.uint16_t.deserialize(data)
+        return (
+            cls(
+                command=command,
+                frame_type=FrameType(word & 0b11),
+                request_id=t.uint16_t(word >> 2),
+            ),
+            data,
+        )
 
 
 class ResetPayload(t.Struct):
@@ -346,11 +370,6 @@ class CapturedPacketPayload(t.Struct):
     rssi: t.int8s
     lqi: t.uint8_t
     psdu: t.LongOctetString
-
-
-class ErrorPayload(t.Struct):
-    status: Status
-    message: t.LongCharacterString
 
 
 class RateLimitedPayload(t.Struct):

@@ -52,18 +52,18 @@ async def test_probe_selects_binary(binary_server: SyntheticBinaryZiggurat) -> N
     )
     try:
         assert isinstance(transport, WebSocketTransport)
-        await transport.send_frame(p.encode_request(p.Ping(), 1))
+        await transport.send_frame(p.encode_request(p.Shutdown(), 1))
         await _wait_for(frames)
     finally:
         await transport.disconnect()
 
     # The opening hello is consumed by the probe, so the only frame is the response.
     assert len(frames) == 1
-    header, body = p.ReplyHeader.deserialize(frames[0])
+    header, body = p.Header.deserialize(frames[0])
     assert header.frame_type == p.FrameType.RESPONSE
-    assert header.command == p.CommandId.PING
+    assert header.command == p.RequestCommand.SHUTDOWN
     assert body == bytes([p.Status.OK])
-    assert isinstance(binary_server.requests[0], p.Ping)
+    assert isinstance(binary_server.requests[0], p.Shutdown)
 
 
 async def test_probe_selects_legacy(server: SyntheticZiggurat) -> None:
@@ -153,7 +153,7 @@ async def test_websocket_send_after_disconnect(
     )
     await transport.disconnect()
     with pytest.raises(ConnectionError, match="Not connected"):
-        await transport.send_frame(p.encode_request(p.Ping(), 1))
+        await transport.send_frame(p.encode_request(p.Shutdown(), 1))
 
 
 async def test_websocket_receive_loop_error(
@@ -199,13 +199,37 @@ async def test_legacy_encodes_packet_capture(server: SyntheticZiggurat) -> None:
         await transport.disconnect()
 
 
-async def test_legacy_rejects_untranscodable_command(
+async def test_legacy_rejects_unknown_command(
     server: SyntheticZiggurat,
 ) -> None:
     transport, _ = await _legacy(server)
     try:
-        with pytest.raises(ValueError, match="Cannot transcode"):
-            await transport.send_frame(p.encode_request(p.GetFirmwareInfo(), 1))
+        # An unknown command byte fails loudly instead of silently vanishing.
+        frame = p.Header(
+            command=t.uint8_t(0xEE),
+            frame_type=p.FrameType.REQUEST,
+            request_id=t.uint16_t(1),
+        ).serialize()
+        with pytest.raises(KeyError):
+            await transport.send_frame(frame)
+    finally:
+        await transport.disconnect()
+
+
+async def test_legacy_firmware_info_via_ping(server: SyntheticZiggurat) -> None:
+    transport, frames = await _legacy(server)
+    try:
+        # The legacy server has no firmware-info call: the shim probes it with a
+        # JSON `ping` and fabricates the response payload.
+        await transport.send_frame(p.encode_request(p.GetFirmwareInfo(), 1))
+        await server.wait_for(commands.Ping)
+        await _wait_for(frames)
+        header, body = p.Header.deserialize(frames[0])
+        assert header.frame_type == p.FrameType.RESPONSE
+        assert header.command == p.RequestCommand.GET_FIRMWARE_INFO
+        assert body[0] == p.Status.OK
+        info = p.FirmwareInfo.deserialize(body[1:])[0]
+        assert info.protocol_version == p.PROTOCOL_VERSION
     finally:
         await transport.disconnect()
 
@@ -222,9 +246,9 @@ async def test_legacy_decodes_captured_packet(server: SyntheticZiggurat) -> None
         )
         await _wait_for(frames)
         assert len(frames) == 1
-        header, body = p.ReplyHeader.deserialize(frames[0])
+        header, body = p.Header.deserialize(frames[0])
         assert header.frame_type == p.FrameType.EVENT
-        assert header.command == p.CommandId.PACKET_CAPTURE
+        assert header.command == p.RequestCommand.PACKET_CAPTURE
         packet = p.CapturedPacket.deserialize(body)[0]
         assert bytes(packet.psdu) == b"\xaa\xbb\xcc"
     finally:
@@ -266,9 +290,9 @@ async def test_legacy_transmitted_becomes_send_confirm(
         # that carries no `data`; it must become a SEND_CONFIRM, not crash.
         await server.send_event(9, "transmitted")
         await _wait_for(frames)
-        header, body = p.ReplyHeader.deserialize(frames[0])
+        header, body = p.Header.deserialize(frames[0])
         assert header.frame_type == p.FrameType.NOTIFICATION
-        assert header.command == p.CommandId.SEND_CONFIRM
+        assert header.command == p.NotificationCommand.SEND_CONFIRM
         assert header.request_id == 9
         assert p.SendConfirm.deserialize(body)[0].status == p.SendStatus.SUCCESS
     finally:
@@ -289,8 +313,8 @@ async def test_legacy_decodes_decrypt_failure_known_key(
             )
         )
         await _wait_for(frames)
-        header, body = p.ReplyHeader.deserialize(frames[0])
-        assert header.command == p.CommandId.APS_DECRYPT_FAILURE
+        header, body = p.Header.deserialize(frames[0])
+        assert header.command == p.NotificationCommand.APS_DECRYPT_FAILURE
         failure = p.ApsDecryptFailure.deserialize(body)[0]
         assert failure.key_id == p.KeyId.NETWORK
     finally:
@@ -311,7 +335,7 @@ async def test_legacy_ignores_binary_and_unknown_response(
         await server.send_confirm(1)
         await _wait_for(frames)
         assert len(frames) == 1
-        header, _ = p.ReplyHeader.deserialize(frames[0])
-        assert header.command == p.CommandId.SEND_CONFIRM
+        header, _ = p.Header.deserialize(frames[0])
+        assert header.command == p.NotificationCommand.SEND_CONFIRM
     finally:
         await transport.disconnect()
