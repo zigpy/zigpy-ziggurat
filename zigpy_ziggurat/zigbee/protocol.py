@@ -191,14 +191,13 @@ class ScanRouteTable(Request):
     event = RouteEntry
 
 
-class SendAps(Request, wire.SendApsPayload):
-    command = CommandId.SEND_APS
+class SendUnicast(Request, wire.SendUnicastPayload):
+    command = CommandId.SEND_UNICAST
 
     @classmethod
     def build(
         cls,
         *,
-        delivery_mode: DeliveryMode,
         destination: t.NWK | None,
         destination_eui64: t.EUI64 | None,
         aps_ack: bool,
@@ -215,14 +214,13 @@ class SendAps(Request, wire.SendApsPayload):
         route_control: RouteControl = RouteControl.STACK_DECIDES,
         next_hop: t.NWK | None = None,
         relays: list[t.NWK] | None = None,
-    ) -> SendAps:
+    ) -> SendUnicast:
         return cls(
             has_eui64=t.uint1_t(destination_eui64 is not None),
             aps_ack=t.uint1_t(aps_ack),
             aps_encryption=t.uint1_t(aps_encryption),
-            delivery_mode=delivery_mode,
             sleepy_destination=t.uint1_t(sleepy_destination),
-            reserved=t.uint2_t(0),
+            reserved=t.uint4_t(0),
             # 0xFFFE stands in for "no short address"; the firmware resolves the EUI64.
             destination=destination if destination is not None else t.NWK(0xFFFE),
             destination_eui64=destination_eui64 or t.EUI64([0] * 8),
@@ -240,6 +238,66 @@ class SendAps(Request, wire.SendApsPayload):
                 if relays is not None
                 else None
             ),
+            asdu=t.LongOctetString(asdu),
+        )
+
+
+class SendBroadcast(Request, wire.SendBroadcastPayload):
+    command = CommandId.SEND_BROADCAST
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        destination: t.NWK,
+        profile_id: int,
+        cluster_id: int,
+        src_ep: int,
+        dst_ep: int,
+        aps_seq: int,
+        radius: int,
+        priority: int,
+        asdu: bytes,
+    ) -> SendBroadcast:
+        return cls(
+            reserved=t.uint8_t(0),
+            destination=destination,
+            profile_id=t.uint16_t(profile_id),
+            cluster_id=t.uint16_t(cluster_id),
+            src_ep=t.uint8_t(src_ep),
+            dst_ep=t.uint8_t(dst_ep),
+            aps_seq=t.uint8_t(aps_seq),
+            radius=t.uint8_t(radius),
+            priority=t.int8s(priority),
+            asdu=t.LongOctetString(asdu),
+        )
+
+
+class SendGroupcast(Request, wire.SendGroupcastPayload):
+    command = CommandId.SEND_GROUPCAST
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        group_id: int,
+        profile_id: int,
+        cluster_id: int,
+        src_ep: int,
+        aps_seq: int,
+        radius: int,
+        priority: int,
+        asdu: bytes,
+    ) -> SendGroupcast:
+        return cls(
+            reserved=t.uint8_t(0),
+            group_id=t.uint16_t(group_id),
+            profile_id=t.uint16_t(profile_id),
+            cluster_id=t.uint16_t(cluster_id),
+            src_ep=t.uint8_t(src_ep),
+            aps_seq=t.uint8_t(aps_seq),
+            radius=t.uint8_t(radius),
+            priority=t.int8s(priority),
             asdu=t.LongOctetString(asdu),
         )
 
@@ -323,6 +381,10 @@ class ApsAckConfirm(Notification, wire.ApsAckConfirmPayload):
     pass
 
 
+class BroadcastConfirm(Notification, wire.BroadcastConfirmPayload):
+    pass
+
+
 class DeviceJoined(Notification, wire.DeviceJoinedPayload):
     pass
 
@@ -368,14 +430,16 @@ class ApsFrameCounter(Notification, wire.ApsFrameCounterPayload):
     pass
 
 
-# Notification id -> struct, for decoding unsolicited frames. `SendConfirm` and
-# `ApsAckConfirm` are handled specially (they resolve a pending send by request id).
+# Notification id -> struct, for decoding unsolicited frames. `SendConfirm`,
+# `ApsAckConfirm` and `BroadcastConfirm` are handled specially (they resolve a pending
+# send by request id).
 NOTIFICATIONS: dict[CommandId, type[Notification]] = {
     CommandId.HELLO: Hello,
     CommandId.LAST_RESET: LastReset,
     CommandId.RECEIVED_APS: ReceivedAps,
     CommandId.SEND_CONFIRM: SendConfirm,
     CommandId.APS_ACK_CONFIRM: ApsAckConfirm,
+    CommandId.BROADCAST_CONFIRM: BroadcastConfirm,
     CommandId.DEVICE_JOINED: DeviceJoined,
     CommandId.DEVICE_LEFT: DeviceLeft,
     CommandId.FRAME_COUNTER: FrameCounter,

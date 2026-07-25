@@ -810,14 +810,8 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         if dst.addr_mode == t.AddrMode.IEEE:
             # The server resolves the EUI64 to a network address
             destination_eui64 = cast(t.EUI64, dst.address)
-            delivery_mode = p.DeliveryMode.UNICAST
         else:
             destination = t.NWK(dst.address)
-            delivery_mode = {
-                t.AddrMode.NWK: p.DeliveryMode.UNICAST,
-                t.AddrMode.Group: p.DeliveryMode.MULTICAST,
-                t.AddrMode.Broadcast: p.DeliveryMode.BROADCAST,
-            }[dst.addr_mode]
 
         if (
             t.TransmitOptions.APS_Encryption in packet.tx_options
@@ -827,40 +821,70 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 "Cannot send an encrypted packet without a destination EUI64"
             )
 
-        # Resolves once the send is confirmed: passive-ack quorum for a broadcast,
-        # next-hop acceptance for a no-ack unicast, or the end-to-end APS ack. A
-        # rejected or failed send raises `DeliveryError`.
+        # Resolves once the send is confirmed: passive-ack quorum for a broadcast or
+        # groupcast, next-hop acceptance for a no-ack unicast, or the end-to-end APS
+        # ack. A rejected or failed send raises `DeliveryError`.
         assert self._api is not None
+        priority = packet.priority if packet.priority is not None else 0
+        radius = packet.radius or 30
+        asdu = packet.data.serialize()
+
+        send: p.SendUnicast | p.SendBroadcast | p.SendGroupcast
         async with self._limit_concurrency(priority=packet.priority):
-            route_control = p.RouteControl.STACK_DECIDES
-            next_hop = None
-            relays = None
+            if dst.addr_mode == t.AddrMode.Group:
+                assert destination is not None
+                send = p.SendGroupcast.build(
+                    group_id=int(destination),
+                    profile_id=packet.profile_id,
+                    cluster_id=packet.cluster_id or 0x0000,
+                    src_ep=packet.src_ep or 0,
+                    aps_seq=packet.tsn,
+                    radius=radius,
+                    priority=priority,
+                    asdu=asdu,
+                )
+            elif dst.addr_mode == t.AddrMode.Broadcast:
+                assert destination is not None
+                send = p.SendBroadcast.build(
+                    destination=destination,
+                    profile_id=packet.profile_id,
+                    cluster_id=packet.cluster_id or 0x0000,
+                    src_ep=packet.src_ep or 0,
+                    dst_ep=packet.dst_ep or 0,
+                    aps_seq=packet.tsn,
+                    radius=radius,
+                    priority=priority,
+                    asdu=asdu,
+                )
+            else:
+                route_control = p.RouteControl.STACK_DECIDES
+                next_hop = None
+                relays = None
 
-            # If we are within the network startup period, provide route hints to the
-            # stack to reduce routing congestion
-            if (
-                device is not None
-                and datetime.now(timezone.utc) - self._start_time < ROUTE_HINT_DURATION
-            ):
-                maybe_relays = self.build_source_route_to(device)
+                # Within the network startup period, provide route hints to the
+                # stack to reduce routing congestion
+                if (
+                    device is not None
+                    and datetime.now(timezone.utc) - self._start_time
+                    < ROUTE_HINT_DURATION
+                ):
+                    maybe_relays = self.build_source_route_to(device)
 
-                if maybe_relays is None:
-                    maybe_next_hop = None
-                elif not maybe_relays:
-                    maybe_next_hop = device.nwk
-                else:
-                    maybe_next_hop = maybe_relays[0]
+                    if maybe_relays is None:
+                        maybe_next_hop = None
+                    elif not maybe_relays:
+                        maybe_next_hop = device.nwk
+                    else:
+                        maybe_next_hop = maybe_relays[0]
 
-                if self.config[zigpy.config.CONF_SOURCE_ROUTING] and maybe_relays:
-                    route_control = p.RouteControl.HINT_SOURCE_ROUTE
-                    relays = maybe_relays
-                elif maybe_next_hop is not None:
-                    route_control = p.RouteControl.HINT_NEXT_HOP
-                    next_hop = maybe_next_hop
+                    if self.config[zigpy.config.CONF_SOURCE_ROUTING] and maybe_relays:
+                        route_control = p.RouteControl.HINT_SOURCE_ROUTE
+                        relays = maybe_relays
+                    elif maybe_next_hop is not None:
+                        route_control = p.RouteControl.HINT_NEXT_HOP
+                        next_hop = maybe_next_hop
 
-            await self._api.request_confirmed(
-                p.SendAps.build(
-                    delivery_mode=delivery_mode,
+                send = p.SendUnicast.build(
                     destination=destination,
                     destination_eui64=destination_eui64,
                     aps_ack=t.TransmitOptions.ACK in packet.tx_options,
@@ -873,11 +897,12 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     src_ep=packet.src_ep or 0,
                     dst_ep=packet.dst_ep or 0,
                     aps_seq=packet.tsn,
-                    radius=packet.radius or 30,
-                    priority=packet.priority if packet.priority is not None else 0,
+                    radius=radius,
+                    priority=priority,
                     route_control=route_control,
                     next_hop=next_hop,
                     relays=relays,
-                    asdu=packet.data.serialize(),
+                    asdu=asdu,
                 )
-            )
+
+            await self._api.request_confirmed(send)

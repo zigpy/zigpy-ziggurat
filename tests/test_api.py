@@ -17,9 +17,8 @@ RequestT = TypeVar("RequestT", bound=p.Request)
 Handler = Callable[[p.Request, int], Awaitable[None]]
 
 
-def _send_aps(*, aps_ack: bool) -> p.SendAps:
-    return p.SendAps.build(
-        delivery_mode=p.DeliveryMode.UNICAST,
+def _send_aps(*, aps_ack: bool) -> p.SendUnicast:
+    return p.SendUnicast.build(
         destination=t.NWK(0x1234),
         destination_eui64=None,
         aps_ack=aps_ack,
@@ -53,7 +52,7 @@ class SyntheticBinaryTransport:
             p.CommandId.PERMIT_JOINS: self._empty_ok,
             p.CommandId.SET_TUNABLE: self._empty_ok,
             p.CommandId.GET_HW_ADDRESS: self._hw_address,
-            p.CommandId.SEND_APS: self._send_aps,
+            p.CommandId.SEND_UNICAST: self._send_aps,
             p.CommandId.ENERGY_SCAN: self._energy_scan,
             p.CommandId.CANCEL_REQUEST: self._cancel_request,
         }
@@ -244,7 +243,7 @@ async def test_rate_limited_response(
     async def rate_limit(request: p.Request, request_id: int) -> None:
         transport.rate_limited(request.command, request_id, retry_in_ms=1800)
 
-    transport.handlers[p.CommandId.SEND_APS] = rate_limit
+    transport.handlers[p.CommandId.SEND_UNICAST] = rate_limit
 
     with pytest.raises(p.RateLimitedError, match="rate_limited: retry in 1.8s") as exc:
         await api.request_confirmed(_send_aps(aps_ack=False))
@@ -258,7 +257,7 @@ async def test_request_confirmed(
 ) -> None:
     """An APS-ack send resolves once the end-to-end APS ack arrives."""
     await api.request_confirmed(_send_aps(aps_ack=True))
-    assert transport.sent(p.SendAps)[-1].aps_seq == 55
+    assert transport.sent(p.SendUnicast)[-1].aps_seq == 55
 
 
 async def test_cancel_on_abandon(
@@ -271,10 +270,10 @@ async def test_cancel_on_abandon(
         send_ids.append(request_id)
         transport.ok(request.command, request_id)  # accepted, never confirmed
 
-    transport.handlers[p.CommandId.SEND_APS] = accept_only
+    transport.handlers[p.CommandId.SEND_UNICAST] = accept_only
 
     task = asyncio.create_task(api.request_confirmed(_send_aps(aps_ack=False)))
-    while not transport.sent(p.SendAps):
+    while not transport.sent(p.SendUnicast):
         await asyncio.sleep(0)
 
     task.cancel()
@@ -302,7 +301,7 @@ async def test_cancel_on_timeout(
         send_ids.append(request_id)
         transport.ok(request.command, request_id)  # accepted, never confirmed
 
-    transport.handlers[p.CommandId.SEND_APS] = accept_only
+    transport.handlers[p.CommandId.SEND_UNICAST] = accept_only
 
     with pytest.raises(TimeoutError):
         await api.request_confirmed(_send_aps(aps_ack=False))
@@ -335,7 +334,7 @@ async def test_request_confirmed_rejected(
             request.command, request_id, p.Status.TRANSMIT_FAILED, "channel busy"
         )
 
-    transport.handlers[p.CommandId.SEND_APS] = reject
+    transport.handlers[p.CommandId.SEND_UNICAST] = reject
 
     with pytest.raises(DeliveryError, match="transmit_failed"):
         await api.request_confirmed(_send_aps(aps_ack=True))
@@ -351,7 +350,7 @@ async def test_request_confirmed_failure(
         transport.send_confirm(request_id, status=p.SendStatus.SUCCESS)
         transport.aps_ack_confirm(request_id, status=p.SendStatus.APS_ACK_TIMEOUT)
 
-    transport.handlers[p.CommandId.SEND_APS] = ack_timeout
+    transport.handlers[p.CommandId.SEND_UNICAST] = ack_timeout
 
     with pytest.raises(DeliveryError, match="APS_ACK_TIMEOUT"):
         await api.request_confirmed(_send_aps(aps_ack=True))
@@ -499,7 +498,7 @@ async def test_confirmed_send_delivery_failure(
         transport.ok(request.command, request_id)
         transport.send_confirm(request_id, status=p.SendStatus.ROUTE_DISCOVERY_TIMEOUT)
 
-    transport.handlers[p.CommandId.SEND_APS] = failed_confirm
+    transport.handlers[p.CommandId.SEND_UNICAST] = failed_confirm
 
     with pytest.raises(DeliveryError, match="ROUTE_DISCOVERY_TIMEOUT"):
         await api.request_confirmed(_send_aps(aps_ack=False))
@@ -512,10 +511,10 @@ async def test_connection_lost_fails_pending_confirm(
         # Accept the send but never confirm, leaving a pending confirmation.
         transport.ok(request.command, request_id)
 
-    transport.handlers[p.CommandId.SEND_APS] = accept_only
+    transport.handlers[p.CommandId.SEND_UNICAST] = accept_only
 
     request = asyncio.ensure_future(api.request_confirmed(_send_aps(aps_ack=False)))
-    while not transport.sent(p.SendAps):
+    while not transport.sent(p.SendUnicast):
         await asyncio.sleep(0)
     transport.lose(None)
 

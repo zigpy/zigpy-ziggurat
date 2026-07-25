@@ -52,7 +52,7 @@ class ZigguratApi:
         self._request_id = 1
         self._pending: dict[int, _Pending] = {}
         self._pending_confirms: dict[
-            int, asyncio.Future[p.SendConfirm | p.ApsAckConfirm]
+            int, asyncio.Future[p.SendConfirm | p.ApsAckConfirm | p.BroadcastConfirm]
         ] = {}
         self._awaiting_aps_ack: set[int] = set()
         self._transport: Transport | None = None
@@ -121,20 +121,23 @@ class ZigguratApi:
         finally:
             self._pending.pop(request_id, None)
 
-    async def request_confirmed(self, send: p.SendAps) -> None:
+    async def request_confirmed(
+        self, send: p.SendUnicast | p.SendBroadcast | p.SendGroupcast
+    ) -> None:
         """Send and await the terminal confirmation."""
 
         # The terminal confirmation is the end-to-end APS ack for an ack-requested
-        # unicast, otherwise the local handoff. A rejected frame raises `DeliveryError`
-        # before any confirm; a failed confirmation raises it too.
+        # unicast, the passive-ack quorum for a broadcast/groupcast, otherwise the local
+        # handoff. A rejected frame raises `DeliveryError` before any confirm; a failed
+        # confirmation raises it too.
         request_id = self._next_id()
         pending = _Pending(send, streaming=False)
         self._pending[request_id] = pending
-        confirm: asyncio.Future[p.SendConfirm | p.ApsAckConfirm] = (
-            asyncio.get_running_loop().create_future()
-        )
+        confirm: asyncio.Future[
+            p.SendConfirm | p.ApsAckConfirm | p.BroadcastConfirm
+        ] = asyncio.get_running_loop().create_future()
         self._pending_confirms[request_id] = confirm
-        if send.aps_ack:
+        if isinstance(send, p.SendUnicast) and send.aps_ack:
             self._awaiting_aps_ack.add(request_id)
 
         _LOGGER.debug("Sending request with confirmation (id=%d): %r", request_id, send)
@@ -252,7 +255,7 @@ class ZigguratApi:
                 return
             self._awaiting_aps_ack.discard(request_id)
             confirm.set_result(notification)
-        elif isinstance(notification, p.ApsAckConfirm):
+        elif isinstance(notification, (p.ApsAckConfirm, p.BroadcastConfirm)):
             self._awaiting_aps_ack.discard(request_id)
             confirm = self._pending_confirms.get(request_id)
             if confirm is not None and not confirm.done():

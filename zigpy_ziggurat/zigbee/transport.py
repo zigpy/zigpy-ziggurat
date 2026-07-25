@@ -445,16 +445,24 @@ class LegacyWebSocketTransport(_WebSocketBase):
                 "packet_capture_change_channel",
                 legacy.PacketCaptureChangeChannel(channel=channel).to_dict(),
             )
-        if command == p.CommandId.SEND_APS:
-            return "send_aps", self._send_aps_params(cast(p.SendAps, request))
+        if command == p.CommandId.SEND_UNICAST:
+            return "send_aps", self._send_unicast_params(cast(p.SendUnicast, request))
+        if command == p.CommandId.SEND_BROADCAST:
+            return "send_aps", self._send_broadcast_params(
+                cast(p.SendBroadcast, request)
+            )
+        if command == p.CommandId.SEND_GROUPCAST:
+            return "send_aps", self._send_groupcast_params(
+                cast(p.SendGroupcast, request)
+            )
         raise ValueError(f"Cannot transcode {command!r} to JSON")
 
-    def _send_aps_params(self, request: p.SendAps) -> dict[str, Any]:
+    def _send_unicast_params(self, request: p.SendUnicast) -> dict[str, Any]:
         destination = (
             None if request.destination == t.NWK(0xFFFE) else t.NWK(request.destination)
         )
         return legacy.SendAps(
-            delivery_mode=request.delivery_mode.name.lower(),
+            delivery_mode="unicast",
             destination_eui64=request.destination_eui64 if request.has_eui64 else None,
             destination=destination,
             profile_id=int(request.profile_id),
@@ -465,6 +473,41 @@ class LegacyWebSocketTransport(_WebSocketBase):
             aps_seq=int(request.aps_seq),
             radius=int(request.radius),
             aps_encryption=bool(request.aps_encryption),
+            priority=int(request.priority),
+            data=bytes(request.asdu),
+        ).to_dict()
+
+    def _send_broadcast_params(self, request: p.SendBroadcast) -> dict[str, Any]:
+        return legacy.SendAps(
+            delivery_mode="broadcast",
+            destination_eui64=None,
+            destination=t.NWK(request.destination),
+            profile_id=int(request.profile_id),
+            cluster_id=int(request.cluster_id),
+            src_ep=int(request.src_ep),
+            dst_ep=int(request.dst_ep),
+            aps_ack=False,
+            aps_seq=int(request.aps_seq),
+            radius=int(request.radius),
+            aps_encryption=False,
+            priority=int(request.priority),
+            data=bytes(request.asdu),
+        ).to_dict()
+
+    def _send_groupcast_params(self, request: p.SendGroupcast) -> dict[str, Any]:
+        # The legacy server carried the group id in `destination` for a multicast.
+        return legacy.SendAps(
+            delivery_mode="multicast",
+            destination_eui64=None,
+            destination=t.NWK(request.group_id),
+            profile_id=int(request.profile_id),
+            cluster_id=int(request.cluster_id),
+            src_ep=int(request.src_ep),
+            dst_ep=0,
+            aps_ack=False,
+            aps_seq=int(request.aps_seq),
+            radius=int(request.radius),
+            aps_encryption=False,
             priority=int(request.priority),
             data=bytes(request.asdu),
         ).to_dict()

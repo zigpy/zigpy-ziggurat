@@ -32,7 +32,7 @@ class CommandId(t.enum8):
     SCAN_CHILDREN = 0x1A
     SCAN_ADDRESS_CACHE = 0x1B
     SCAN_ROUTE_TABLE = 0x1C
-    SEND_APS = 0x20
+    SEND_UNICAST = 0x20
     PERMIT_JOINS = 0x21
     SET_CHANNEL = 0x22
     SET_NWK_UPDATE_ID = 0x23
@@ -43,6 +43,8 @@ class CommandId(t.enum8):
     PACKET_CAPTURE_CHANNEL = 0x28
     SET_TUNABLE = 0x29
     CANCEL_REQUEST = 0x2A
+    SEND_BROADCAST = 0x2B
+    SEND_GROUPCAST = 0x2C
     RECEIVED_APS = 0x30
     SEND_CONFIRM = 0x31
     APS_ACK_CONFIRM = 0x32
@@ -54,6 +56,7 @@ class CommandId(t.enum8):
     LAST_RESET = 0x38
     ROUTE_RECORD = 0x3A
     APS_FRAME_COUNTER = 0x3B
+    BROADCAST_CONFIRM = 0x3C
 
 
 class FrameType(t.enum8):
@@ -228,13 +231,12 @@ class SourceRouteRelays(t.Struct):
     relays: t.LVList[t.NWK, t.uint8_t]
 
 
-class SendApsPayload(t.Struct):
+class SendUnicastPayload(t.Struct):
     has_eui64: t.uint1_t
     aps_ack: t.uint1_t
     aps_encryption: t.uint1_t
-    delivery_mode: DeliveryMode
     sleepy_destination: t.uint1_t
-    reserved: t.uint2_t
+    reserved: t.uint4_t
     destination: t.NWK
     destination_eui64: t.EUI64
     profile_id: t.uint16_t
@@ -246,13 +248,38 @@ class SendApsPayload(t.Struct):
     priority: t.int8s
     route: RouteControl
     next_hop: t.NWK = t.StructField(  # type: ignore[assignment]
-        requires=lambda s: cast(SendApsPayload, s).route
+        requires=lambda s: cast(SendUnicastPayload, s).route
         in (RouteControl.HINT_NEXT_HOP, RouteControl.FORCE_NEXT_HOP)
     )
     relays: SourceRouteRelays = t.StructField(  # type: ignore[assignment]
-        requires=lambda s: cast(SendApsPayload, s).route
+        requires=lambda s: cast(SendUnicastPayload, s).route
         in (RouteControl.HINT_SOURCE_ROUTE, RouteControl.FORCE_SOURCE_ROUTE)
     )
+    asdu: t.LongOctetString
+
+
+class SendBroadcastPayload(t.Struct):
+    reserved: t.uint8_t
+    destination: t.NWK
+    profile_id: t.uint16_t
+    cluster_id: t.uint16_t
+    src_ep: t.uint8_t
+    dst_ep: t.uint8_t
+    aps_seq: t.uint8_t
+    radius: t.uint8_t
+    priority: t.int8s
+    asdu: t.LongOctetString
+
+
+class SendGroupcastPayload(t.Struct):
+    reserved: t.uint8_t
+    group_id: t.uint16_t
+    profile_id: t.uint16_t
+    cluster_id: t.uint16_t
+    src_ep: t.uint8_t
+    aps_seq: t.uint8_t
+    radius: t.uint8_t
+    priority: t.int8s
     asdu: t.LongOctetString
 
 
@@ -359,18 +386,15 @@ class SendStatus(t.enum8):
     ROUTE_DISCOVERY_TIMEOUT = 1
     ROUTE_DISCOVERY_NO_ENTRY = 2
     ROUTE_INACTIVE_AFTER_DISCOVERY = 3
-    ROUTE_DISCOVERY_SUPPRESSED = 4
-    NWK_NO_ACK = 5
-    CCA_FAILURE = 6
-    TRANSMIT_FAILED = 7
-    APS_ACK_TIMEOUT = 8
-    PAYLOAD_TOO_LONG = 9
+    NWK_NO_ACK = 4
+    CCA_FAILURE = 5
+    TRANSMIT_FAILED = 6
+    APS_ACK_TIMEOUT = 7
+    BROADCAST_QUORUM_NOT_REACHED = 8
+    INDIRECT_EXPIRED = 9
     FRAME_BUDGET_EXHAUSTED = 10
-    APS_SECURITY_FAILED = 11
-    INDIRECT_EXPIRED = 12
-    BROADCAST_RATE_LIMITED = 13
-    BROADCAST_QUORUM_NOT_REACHED = 14
-    RADIO_ERROR = 15
+    CANCELLED = 11
+    RADIO_ERROR = 12
 
 
 class SendConfirmPayload(t.Struct):
@@ -378,6 +402,10 @@ class SendConfirmPayload(t.Struct):
 
 
 class ApsAckConfirmPayload(t.Struct):
+    status: SendStatus
+
+
+class BroadcastConfirmPayload(t.Struct):
     status: SendStatus
 
 
