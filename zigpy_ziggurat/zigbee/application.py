@@ -105,6 +105,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__(config)
         self._api: ZigguratApi | None = None
+        self._start_time: datetime | None = None
 
     async def connect(self) -> None:
         # The device path is either the WebSocket URL of a ziggurat server or the
@@ -128,6 +129,8 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         await api.request(p.Reset(hard=t.Bool(False)))
 
     async def disconnect(self) -> None:
+        self._start_time = None
+
         if self._api is not None:
             try:
                 await self._api.disconnect()
@@ -863,9 +866,9 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
                 # Within the network startup period, provide route hints to the
                 # stack to reduce routing congestion
-                if (
-                    device is not None
-                    and datetime.now(timezone.utc) - self._start_time
+                if device is not None and (
+                    self._start_time is None
+                    or datetime.now(timezone.utc) - self._start_time
                     < ROUTE_HINT_DURATION
                 ):
                     maybe_relays = self.build_source_route_to(device)
