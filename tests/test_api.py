@@ -319,6 +319,34 @@ async def test_cancel_on_timeout(
     assert cancels[0].request_id == send_ids[0]
 
 
+async def test_cancel_skipped_while_closing(
+    api: RecordingApi, transport: SyntheticBinaryTransport
+) -> None:
+    """Once we are tearing the connection down there is nothing left to cancel on."""
+    send_ids: list[int] = []
+
+    async def accept_only(request: p.Request, request_id: int) -> None:
+        send_ids.append(request_id)
+        transport.ok(request.command, request_id)  # accepted, never confirmed
+
+    transport.handlers[p.RequestCommand.SEND_UNICAST] = accept_only
+
+    task = asyncio.create_task(api.request_confirmed(_send_aps(aps_ack=False)))
+    while not transport.sent(p.SendUnicast):
+        await asyncio.sleep(0)
+
+    await api.disconnect()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert send_ids
+    assert transport.sent(p.CancelRequest) == []
+
+
 async def test_confirmed_success_sends_no_cancel(
     api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:

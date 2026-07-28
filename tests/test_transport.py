@@ -1,42 +1,28 @@
-"""Tests for `connect_transport`, which probes a WebSocket for its protocol."""
+"""Tests for `connect_transport`, which probes a WebSocket for its protocol, and for
+the transports it returns. The legacy JSON transcoding shim is covered separately in
+`test_legacy.py`."""
 
 import asyncio
-import json
-import logging
 
 import aiospinel
 import pytest
-import zigpy.types as t
 
 from tests.common import (
-    COORDINATOR_IEEE,
     ClosingZiggurat,
     ProtocolErrorWebSocket,
-    SyntheticBinaryZiggurat,
     SyntheticSpinelRcp,
     SyntheticZiggurat,
-    binary_server,
     closing_server,
     protocol_error_server,
     server,
     spinel_rcp,
 )
-from zigpy_ziggurat.zigbee import legacy as commands, protocol as p
+from zigpy_ziggurat.zigbee import protocol as p
 from zigpy_ziggurat.zigbee.transport import (
-    LegacyWebSocketTransport,
     SpinelTransport,
     WebSocketTransport,
     connect_transport,
 )
-
-
-async def _legacy(
-    server: SyntheticZiggurat,
-) -> tuple[LegacyWebSocketTransport, list[bytes]]:
-    frames: list[bytes] = []
-    transport = await connect_transport(server.url, frames.append, lambda exc: None)
-    assert isinstance(transport, LegacyWebSocketTransport)
-    return transport, frames
 
 
 async def _wait_for(frames: list[bytes], count: int = 1) -> None:
@@ -45,11 +31,9 @@ async def _wait_for(frames: list[bytes], count: int = 1) -> None:
             await asyncio.sleep(0.01)
 
 
-async def test_probe_selects_binary(binary_server: SyntheticBinaryZiggurat) -> None:
+async def test_probe_selects_binary(server: SyntheticZiggurat) -> None:
     frames: list[bytes] = []
-    transport = await connect_transport(
-        binary_server.url, frames.append, lambda exc: None
-    )
+    transport = await connect_transport(server.url, frames.append, lambda exc: None)
     try:
         assert isinstance(transport, WebSocketTransport)
         await transport.send_frame(p.encode_request(p.Shutdown(), 1))
@@ -63,17 +47,7 @@ async def test_probe_selects_binary(binary_server: SyntheticBinaryZiggurat) -> N
     assert header.frame_type == p.FrameType.RESPONSE
     assert header.command == p.RequestCommand.SHUTDOWN
     assert body == bytes([p.Status.OK])
-    assert isinstance(binary_server.requests[0], p.Shutdown)
-
-
-async def test_probe_selects_legacy(server: SyntheticZiggurat) -> None:
-    transport = await connect_transport(
-        server.url, lambda frame: None, lambda exc: None
-    )
-    try:
-        assert isinstance(transport, LegacyWebSocketTransport)
-    finally:
-        await transport.disconnect()
+    assert isinstance(server.requests[0], p.Shutdown)
 
 
 async def test_probe_rejects_unexpected_handshake(
@@ -145,11 +119,9 @@ async def test_spinel_tunnel_write_rejected() -> None:
         await rcp.stop()
 
 
-async def test_websocket_send_after_disconnect(
-    binary_server: SyntheticBinaryZiggurat,
-) -> None:
+async def test_websocket_send_after_disconnect(server: SyntheticZiggurat) -> None:
     transport = await connect_transport(
-        binary_server.url, lambda frame: None, lambda exc: None
+        server.url, lambda frame: None, lambda exc: None
     )
     await transport.disconnect()
     with pytest.raises(ConnectionError, match="Not connected"):
@@ -174,168 +146,5 @@ async def test_websocket_receive_loop_error(
             await lost_event.wait()
         # The malformed frame ends the receive loop, reporting the loss once.
         assert len(lost) == 1
-    finally:
-        await transport.disconnect()
-
-
-# -- legacy JSON transcoding -----------------------------------------------------
-
-
-async def test_legacy_encodes_packet_capture(server: SyntheticZiggurat) -> None:
-    server.handlers["packet_capture"] = server.on_status
-    server.handlers["packet_capture_change_channel"] = server.on_status
-    transport, _ = await _legacy(server)
-    try:
-        await transport.send_frame(
-            p.encode_request(p.PacketCapture(channel=t.uint8_t(15)), 1)
-        )
-        await server.wait_for(commands.PacketCapture)
-        await transport.send_frame(
-            p.encode_request(p.PacketCaptureChannel(channel=t.uint8_t(20)), 2)
-        )
-        captured = await server.wait_for(commands.PacketCaptureChangeChannel)
-        assert captured.channel == 20
-    finally:
-        await transport.disconnect()
-
-
-async def test_legacy_rejects_unknown_command(
-    server: SyntheticZiggurat,
-) -> None:
-    transport, _ = await _legacy(server)
-    try:
-        # An unknown command byte fails loudly instead of silently vanishing.
-        frame = p.Header(
-            command=t.uint8_t(0xEE),
-            frame_type=p.FrameType.REQUEST,
-            request_id=t.uint16_t(1),
-        ).serialize()
-        with pytest.raises(KeyError):
-            await transport.send_frame(frame)
-    finally:
-        await transport.disconnect()
-
-
-async def test_legacy_firmware_info_via_ping(server: SyntheticZiggurat) -> None:
-    transport, frames = await _legacy(server)
-    try:
-        # The legacy server has no firmware-info call: the shim probes it with a
-        # JSON `ping` and fabricates the response payload.
-        await transport.send_frame(p.encode_request(p.GetFirmwareInfo(), 1))
-        await server.wait_for(commands.Ping)
-        await _wait_for(frames)
-        header, body = p.Header.deserialize(frames[0])
-        assert header.frame_type == p.FrameType.RESPONSE
-        assert header.command == p.RequestCommand.GET_FIRMWARE_INFO
-        assert body[0] == p.Status.OK
-        info = p.FirmwareInfo.deserialize(body[1:])[0]
-        assert info.protocol_version == p.PROTOCOL_VERSION
-    finally:
-        await transport.disconnect()
-
-
-async def test_legacy_decodes_captured_packet(server: SyntheticZiggurat) -> None:
-    transport, frames = await _legacy(server)
-    try:
-        # An unknown event is dropped; the captured packet is transcoded to an event.
-        await server.send_event_data(7, "not_a_real_event", {})
-        await server.send_event_data(
-            7,
-            "captured_packet",
-            {"channel": 15, "rssi": -80, "lqi": 200, "data": "aabbcc"},
-        )
-        await _wait_for(frames)
-        assert len(frames) == 1
-        header, body = p.Header.deserialize(frames[0])
-        assert header.frame_type == p.FrameType.EVENT
-        assert header.command == p.RequestCommand.PACKET_CAPTURE
-        packet = p.CapturedPacket.deserialize(body)[0]
-        assert bytes(packet.psdu) == b"\xaa\xbb\xcc"
-    finally:
-        await transport.disconnect()
-
-
-async def test_legacy_forwards_firmware_log(
-    server: SyntheticZiggurat, caplog: pytest.LogCaptureFixture
-) -> None:
-    transport, _ = await _legacy(server)
-    try:
-        with caplog.at_level(logging.WARNING, logger="ziggurat.fw.foo.bar"):
-            await server.send_raw(
-                json.dumps(
-                    {
-                        "type": "notification",
-                        "event": "log",
-                        "data": {
-                            "level": "WARN",
-                            "target": "foo::bar",
-                            "message": "something happened",
-                        },
-                    }
-                )
-            )
-            async with asyncio.timeout(2):
-                while "something happened" not in caplog.text:
-                    await asyncio.sleep(0.01)
-    finally:
-        await transport.disconnect()
-
-
-async def test_legacy_transmitted_becomes_send_confirm(
-    server: SyntheticZiggurat,
-) -> None:
-    transport, frames = await _legacy(server)
-    try:
-        # The real server signals a send handoff with a bare `transmitted` event
-        # that carries no `data`; it must become a SEND_CONFIRM, not crash.
-        await server.send_event(9, "transmitted")
-        await _wait_for(frames)
-        header, body = p.Header.deserialize(frames[0])
-        assert header.frame_type == p.FrameType.NOTIFICATION
-        assert header.command == p.NotificationCommand.SEND_CONFIRM
-        assert header.request_id == 9
-        assert p.SendConfirm.deserialize(body)[0].status == p.SendStatus.SUCCESS
-    finally:
-        await transport.disconnect()
-
-
-async def test_legacy_decodes_decrypt_failure_known_key(
-    server: SyntheticZiggurat,
-) -> None:
-    transport, frames = await _legacy(server)
-    try:
-        await server.send_notification(
-            commands.ApsDecryptionFailure(
-                source=t.NWK(0x1234),
-                source_ieee=COORDINATOR_IEEE,
-                frame_counter=t.uint32_t(42),
-                key_id="network",
-            )
-        )
-        await _wait_for(frames)
-        header, body = p.Header.deserialize(frames[0])
-        assert header.command == p.NotificationCommand.APS_DECRYPT_FAILURE
-        failure = p.ApsDecryptFailure.deserialize(body)[0]
-        assert failure.key_id == p.KeyId.NETWORK
-    finally:
-        await transport.disconnect()
-
-
-async def test_legacy_ignores_binary_and_unknown_response(
-    server: SyntheticZiggurat,
-) -> None:
-    transport, frames = await _legacy(server)
-    try:
-        # A binary frame and a response for an unknown id are both dropped; a
-        # following confirm still transcodes, proving the loop kept going.
-        await server.ws.send_bytes(b"\x00\x01\x02")
-        await server.send_raw(
-            json.dumps({"type": "response", "id": 9999, "result": {}})
-        )
-        await server.send_confirm(1)
-        await _wait_for(frames)
-        assert len(frames) == 1
-        header, _ = p.Header.deserialize(frames[0])
-        assert header.command == p.NotificationCommand.SEND_CONFIRM
     finally:
         await transport.disconnect()
