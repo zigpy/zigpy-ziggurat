@@ -1,6 +1,4 @@
-"""Typed models for the ziggurat JSON-RPC wire protocol, mirroring the server's
-serde types. Requests and responses share one set of wire formats; notifications
-encode network addresses little-endian."""
+"""Legacy JSON-RPC wire protocol for the WebSocket transport."""
 
 from dataclasses import dataclass
 import enum
@@ -177,6 +175,9 @@ class Configure(Request[Status]):
     tclk_seed: str | None
     tclk_flavor: str | None
 
+    aps_frame_counter: int = 0
+    started: bool = False
+
 
 @dataclass
 class NetworkInfo(Response):
@@ -194,6 +195,9 @@ class NetworkInfo(Response):
     tclk_seed: str | None
     tclk_flavor: str | None
     key_table: list[KeyTableEntry]
+
+    aps_frame_counter: int = 0
+    started: bool = False
 
 
 @dataclass
@@ -304,6 +308,33 @@ class SetProvisionalKey(Request[Status]):
 @dataclass
 class SetChannel(Request[Status]):
     method = "set_channel"
+    response_type = Status
+
+    channel: int
+
+
+@dataclass
+class CapturedPacketEvent(Response):
+    channel: t.uint8_t
+    rssi: t.int8s
+    lqi: t.uint8_t
+    # Hex-encoded 802.15.4 MAC frame (FCS stripped)
+    data: str
+
+
+@dataclass
+class PacketCapture(StreamingRequest[Status, CapturedPacketEvent]):
+    method = "packet_capture"
+    response_type = Status
+    event_type = CapturedPacketEvent
+    event_name = "captured_packet"
+
+    channel: int
+
+
+@dataclass
+class PacketCaptureChangeChannel(Request[Status]):
+    method = "packet_capture_change_channel"
     response_type = Status
 
     channel: int

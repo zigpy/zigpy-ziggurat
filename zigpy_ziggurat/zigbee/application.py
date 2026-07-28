@@ -1,12 +1,14 @@
+from __future__ import annotations
+
 import asyncio
-from collections.abc import AsyncGenerator, Callable
-import json
+from collections.abc import AsyncGenerator
+from datetime import datetime, timedelta, timezone
 import logging
 import math
+import os
 import statistics
 from typing import Any, cast
 
-import aiohttp
 import zigpy.application
 import zigpy.backups
 import zigpy.config
@@ -17,32 +19,9 @@ import zigpy.state
 import zigpy.types as t
 import zigpy.zdo.types as zdo_t
 
-from zigpy_ziggurat.zigbee.commands import (
-    EVENT_T,
-    NOTIFICATIONS,
-    RESPONSE_T,
-    ApsDecryptionFailure,
-    Configure,
-    DeviceJoined,
-    DeviceLeft,
-    EnergyScan,
-    FrameCounterUpdate,
-    GetHwAddress,
-    GetNetworkInfo,
-    KeyTableEntry,
-    LinkKeyUpdate,
-    NetworkScan,
-    Notification,
-    PermitJoins,
-    Ping,
-    ReceivedApsCommand,
-    Request,
-    SendAps,
-    SetChannel,
-    SetNwkUpdateId,
-    SetProvisionalKey,
-    StreamingRequest,
-)
+from zigpy_ziggurat.config import CONF_TUNABLES, CONF_ZIGGURAT_CONFIG, CONFIG_SCHEMA
+from zigpy_ziggurat.zigbee import protocol as p
+from zigpy_ziggurat.zigbee.api import ZigguratApi
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -59,12 +38,28 @@ MFG_ID_OVERRIDES = {
     "54:EF:44": 0x115F,  # Lumi
 }
 
+
+def _max_concurrent_requests(url: str) -> int:
+    if url.startswith(("ws://", "wss://", "ws+unix://")):
+        return 128
+    return 32
+
+
 # 802.15.4 6.3.1: time spent scanning each channel is
 # aBaseSuperframeDuration * (2^n + 1) symbols, at 16 us per symbol
 SYMBOL_PERIOD_MS = 0.016
 BASE_SUPERFRAME_DURATION_SYMBOLS = 960
 
-WEBSOCKET_HEARTBEAT = 15
+KEY_BATCH_SIZE = 12
+
+# On a stateless restart we resume from the last persisted frame counters, which trail
+# the radio's true counters by up to the persist stride (plus any commit lag). Jump both
+# the NWK and APS outgoing counters past that gap so a restart can never roll back and
+# make peers reject our secured frames.
+FRAME_COUNTER_RESTORE_MARGIN = 1000
+
+# How long route hints are supplied to the stack, to reduce startup churn.
+ROUTE_HINT_DURATION = timedelta(minutes=10)
 
 
 def logistic(x: float, *, L: float = 1, x_0: float = 0, k: float = 1) -> float:
@@ -82,261 +77,8 @@ def map_rssi_to_energy(rssi: float) -> float:
     )
 
 
-class PendingRequest:
-    """The in-flight state of one request: an optional `transmitted` stage future and
-    the terminal `response` future."""
-
-    def __init__(
-        self, *, want_transmitted: bool, stream_event: str | None = None
-    ) -> None:
-        loop = asyncio.get_running_loop()
-        self.response: asyncio.Future[dict[str, Any]] = loop.create_future()
-        self.transmitted: asyncio.Future[None] | None = (
-            loop.create_future() if want_transmitted else None
-        )
-        # For a streaming request: the event name carrying results, and a queue those
-        # results land in. `None` enqueued by the terminal response marks the end.
-        self.stream_event = stream_event
-        self.events: asyncio.Queue[dict[str, Any] | None] | None = (
-            asyncio.Queue() if stream_event is not None else None
-        )
-
-    def fail(self, exc: BaseException) -> None:
-        if self.transmitted is not None and not self.transmitted.done():
-            self.transmitted.set_exception(exc)
-
-        if not self.response.done():
-            self.response.set_exception(exc)
-
-
-def _make_late_failure_logger(
-    pending: PendingRequest,
-) -> Callable[[asyncio.Future[dict[str, Any]]], None]:
-    """Consume the terminal result of a request that already resolved at the
-    `transmitted` stage, so delivery failures are visible but not raised. Failures
-    from before transmission were already raised to the caller and are not logged."""
-
-    def log_late_failure(fut: asyncio.Future[dict[str, Any]]) -> None:
-        if fut.cancelled():
-            return
-
-        exc = fut.exception()
-        if exc is None:
-            return
-
-        transmitted = (
-            pending.transmitted is not None
-            and pending.transmitted.done()
-            and pending.transmitted.exception() is None
-        )
-
-        if transmitted:
-            _LOGGER.warning("Delivery failed after transmission: %s", exc)
-
-    return log_late_failure
-
-
-class ZigguratApi:
-    """The Ziggurat WebSocket API: concurrent requests correlated by id, with
-    lifecycle events (`accepted`, `transmitted`) preceding each terminal response."""
-
-    def __init__(
-        self,
-        url: str,
-        on_notification: Callable[[Notification], None],
-        on_disconnect: Callable[[BaseException | None], None],
-    ) -> None:
-        self._url = url
-        self._on_notification = on_notification
-        self._on_disconnect = on_disconnect
-
-        self._session: aiohttp.ClientSession | None = None
-        self._websocket: aiohttp.ClientWebSocketResponse | None = None
-        self._receiver_task: asyncio.Task[None] | None = None
-        self._request_id = 1
-        self._pending: dict[int, PendingRequest] = {}
-
-    async def connect(self) -> None:
-        if self._url.startswith("ws+unix://"):
-            # The URL's path is the socket path; the HTTP-level host is a placeholder
-            connector = aiohttp.UnixConnector(path=self._url.removeprefix("ws+unix://"))
-            url = "ws://localhost/"
-        else:
-            connector = None
-            url = self._url
-
-        self._session = aiohttp.ClientSession(connector=connector)
-        self._websocket = await self._session.ws_connect(
-            url, heartbeat=WEBSOCKET_HEARTBEAT
-        )
-
-        hello = json.loads(await self._websocket.receive_str())
-        _LOGGER.debug("Connected to ziggurat: %r", hello)
-
-        self._receiver_task = asyncio.create_task(self._receive_loop())
-
-    async def disconnect(self) -> None:
-        if self._receiver_task is not None:
-            self._receiver_task.cancel()
-            self._receiver_task = None
-
-        if self._websocket is not None:
-            await self._websocket.close()
-            self._websocket = None
-
-        if self._session is not None:
-            await self._session.close()
-            self._session = None
-
-    async def _receive_loop(self) -> None:
-        websocket = self._websocket
-        assert websocket is not None
-
-        exc: BaseException | None = None
-
-        try:
-            async for msg in websocket:
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    try:
-                        self._handle_message(json.loads(msg.data))
-                    except Exception:
-                        _LOGGER.exception("Failed to handle message: %r", msg.data)
-                elif msg.type == aiohttp.WSMsgType.ERROR:
-                    exc = websocket.exception()
-                    break
-        except asyncio.CancelledError:
-            # A deliberate `disconnect()`, not a connection loss
-            self._fail_pending(ConnectionError("Connection closed"))
-            raise
-        except Exception as e:  # pragma: no cover
-            # aiohttp surfaces connection failures as `ERROR` messages or by ending
-            # the iterator, never by raising; kept as a guard for other versions
-            exc = e
-
-        self._fail_pending(ConnectionError("Connection lost"))
-        self._on_disconnect(exc)
-
-    def _fail_pending(self, exc: BaseException) -> None:
-        for pending in self._pending.values():
-            pending.response.add_done_callback(_make_late_failure_logger(pending))
-            pending.fail(exc)
-
-        self._pending.clear()
-
-    def _handle_message(self, msg: dict[str, Any]) -> None:
-        _LOGGER.debug("Received: %r", msg)
-        msg_type = msg["type"]
-
-        if msg_type == "notification":
-            self._on_notification(NOTIFICATIONS[msg["event"]].from_dict(msg["data"]))
-        elif msg_type == "event":
-            pending = self._pending.get(msg["id"])
-
-            if pending is None:
-                pass
-            elif (
-                msg["event"] == "transmitted"
-                and pending.transmitted is not None
-                and not pending.transmitted.done()
-            ):
-                pending.transmitted.set_result(None)
-            elif pending.events is not None and msg["event"] == pending.stream_event:
-                pending.events.put_nowait(msg["data"])
-        elif msg_type == "response":
-            pending = self._pending.pop(msg["id"], None)
-
-            if pending is None:
-                _LOGGER.debug("Response for unknown request: %r", msg)
-                return
-
-            if "error" in msg:
-                error = msg["error"]
-                pending.fail(DeliveryError(f"{error['code']}: {error['message']}"))
-            elif not pending.response.done():
-                pending.response.set_result(msg["result"])
-
-    async def request(self, command: Request[RESPONSE_T]) -> RESPONSE_T:
-        result = await self._send_request(command, want_transmitted=False)
-        assert result is not None
-
-        # `response_type` is a plain ClassVar: it cannot carry the type variable
-        return cast(RESPONSE_T, command.response_type.from_dict(result))
-
-    async def request_transmitted(self, command: Request[Any]) -> None:
-        """Resolve once the frame is on the air instead of waiting for delivery."""
-        await self._send_request(command, want_transmitted=True)
-
-    async def _send_request(
-        self, command: Request[Any], *, want_transmitted: bool
-    ) -> dict[str, Any] | None:
-        request_id = self._request_id
-        self._request_id = (self._request_id + 1) % 2**32 or 1
-
-        pending = PendingRequest(want_transmitted=want_transmitted)
-        self._pending[request_id] = pending
-
-        message = {
-            "id": request_id,
-            "method": command.method,
-            "params": command.to_dict(),
-        }
-        _LOGGER.debug("Sending: %r", message)
-        assert self._websocket is not None
-        await self._websocket.send_str(json.dumps(message))
-
-        if want_transmitted:
-            # The terminal response continues in the background; an end-to-end
-            # delivery failure after transmission is logged, not raised
-            pending.response.add_done_callback(_make_late_failure_logger(pending))
-            assert pending.transmitted is not None
-            await pending.transmitted
-            return None
-
-        return await pending.response
-
-    async def request_stream(
-        self, command: StreamingRequest[Any, EVENT_T]
-    ) -> AsyncGenerator[EVENT_T, None]:
-        """Issue a request that streams `event_type` results until its terminal
-        response, yielding each result. An error response (or a disconnect) raised once
-        the stream is exhausted."""
-        request_id = self._request_id
-        self._request_id = (self._request_id + 1) % 2**32 or 1
-
-        pending = PendingRequest(
-            want_transmitted=False, stream_event=command.event_name
-        )
-        self._pending[request_id] = pending
-
-        message = {
-            "id": request_id,
-            "method": command.method,
-            "params": command.to_dict(),
-        }
-        _LOGGER.debug("Sending: %r", message)
-        assert self._websocket is not None
-        await self._websocket.send_str(json.dumps(message))
-
-        assert pending.events is not None
-        events = pending.events
-
-        # The terminal response (success, error, or disconnect) ends the stream. Results
-        # are enqueued ahead of it in receive order, so the queue drains fully first.
-        pending.response.add_done_callback(lambda _: events.put_nowait(None))
-
-        try:
-            while (item := await events.get()) is not None:
-                yield cast(EVENT_T, command.event_type.from_dict(item))
-
-            # Surface an error response or disconnect; a success carries only a status
-            await pending.response
-        finally:
-            self._pending.pop(request_id, None)
-
-
 class ZigguratCoordinator(zigpy.device.Device):
-    """Zigpy device representing the coordinator. Ziggurat has no loopback ZDO, so the
-    device is constructed statically instead of being interviewed over the air."""
+    """The coordinator device, constructed statically (Ziggurat has no loopback ZDO)."""
 
     @property
     def manufacturer(self) -> str:
@@ -358,23 +100,32 @@ class ZigguratCoordinator(zigpy.device.Device):
 class ControllerApplication(zigpy.application.ControllerApplication):
     DISPLAY_NAME = "Ziggurat"
     DESCRIPTION = "Ziggurat: An open source, host-side Zigbee stack in Rust"
+    SCHEMA = CONFIG_SCHEMA
 
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__(config)
         self._api: ZigguratApi | None = None
 
     async def connect(self) -> None:
-        # The device path is the WebSocket URL of the ziggurat server
-        url = self._config[zigpy.config.CONF_DEVICE][zigpy.config.CONF_DEVICE_PATH]
+        # The device path is either the WebSocket URL of a ziggurat server or the
+        # serial port of a ziggurat firmware (e.g. an ESP32-C6 over USB-Serial-JTAG).
+        device = self._config[zigpy.config.CONF_DEVICE]
+        url = device[zigpy.config.CONF_DEVICE_PATH]
 
         # zigpy types `connection_lost` as Exception-only but handles None fine
         api = ZigguratApi(
             url,
             self.on_notification,
             self.connection_lost,  # type: ignore[arg-type]
+            baudrate=device[zigpy.config.CONF_DEVICE_BAUDRATE],
+            flow_control=device[zigpy.config.CONF_DEVICE_FLOW_CONTROL],
         )
         await api.connect()
         self._api = api
+
+        # Clear any transient radio state left by a previous client (e.g. a packet
+        # capture still streaming on the firmware) so this session starts from idle.
+        await api.request(p.Reset(hard=t.Bool(False)))
 
     async def disconnect(self) -> None:
         if self._api is not None:
@@ -389,8 +140,20 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             network_info=self.state.network_info, node_info=self.state.node_info
         )
 
+        assert self._api is not None
+
+        for name, value in self._config[CONF_ZIGGURAT_CONFIG][CONF_TUNABLES].items():
+            await self._api.set_tunable(name, value)
+
         self._register_coordinator_device()
         await self.register_endpoints()
+
+        url = self._config[zigpy.config.CONF_DEVICE][zigpy.config.CONF_DEVICE_PATH]
+        self._concurrent_requests_semaphore.max_concurrency = _max_concurrent_requests(
+            url
+        )
+
+        self._start_time = datetime.now(timezone.utc)
 
     def _register_coordinator_device(self) -> None:
         coordinator = ZigguratCoordinator(
@@ -429,9 +192,9 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         assert self._api is not None
 
         try:
-            info = await self._api.request(GetNetworkInfo())
-        except DeliveryError as exc:
-            if not str(exc).startswith("not_configured"):
+            info = cast(p.NetworkInfo, await self._api.request(p.GetNetworkInfo()))
+        except p.ProtocolError as exc:
+            if exc.status != p.Status.NOT_CONFIGURED:
                 raise
 
             # The server is stateless and has no network running (e.g. it just
@@ -439,43 +202,84 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             self._get_network_settings()
             return
 
-        stack_specific = {}
-        if info.tclk_seed is not None:
-            if info.tclk_flavor == "zstack":
-                stack_specific = {"zstack": {"tclk_seed": info.tclk_seed}}
+        state = info.state
+
+        key_table: list[zigpy.state.Key] = []
+        async for key_entry in self._api.request_stream(p.ScanKeyTable()):
+            key_entry = cast(p.KeyEntry, key_entry)
+            key_table.append(
+                zigpy.state.Key(
+                    key=key_entry.key,
+                    partner_ieee=key_entry.partner_ieee,
+                    tx_counter=key_entry.tx_counter,
+                    rx_counter=key_entry.rx_counter,
+                    seq=key_entry.seq,
+                )
+            )
+
+        stack_specific: dict[str, Any] = {}
+        if state.has_tclk_seed:
+            seed_hex = bytes(state.tclk_seed).hex()
+
+            if state.tclk_flavor == p.TclkFlavorId.Z_STACK:
+                stack_specific = {"zstack": {"tclk_seed": seed_hex}}
             else:
-                stack_specific = {"ezsp": {"hashed_tclk": info.tclk_seed}}
+                stack_specific = {"ezsp": {"hashed_tclk": seed_hex}}
+
+        children: list[t.EUI64] = []
+        async for child_entry in self._api.request_stream(p.ScanChildren()):
+            child_entry = cast(p.ChildEntry, child_entry)
+            children.append(child_entry.ieee)
+
+        nwk_addresses: dict[t.EUI64, t.NWK] = {}
+        async for addr_entry in self._api.request_stream(p.ScanAddressCache()):
+            addr_entry = cast(p.AddressEntry, addr_entry)
+            nwk_addresses[addr_entry.ieee] = addr_entry.nwk
+
+        routes = []
+        async for route_entry in self._api.request_stream(p.ScanRouteTable()):
+            route_entry = cast(p.RouteEntry, route_entry)
+            routes.append(
+                {
+                    "destination": route_entry.destination,
+                    "next_hop": route_entry.next_hop,
+                    "path_cost": route_entry.path_cost,
+                }
+            )
+        if routes:
+            stack_specific["ziggurat"] = {"routes": routes}
 
         self.state.node_info = zigpy.state.NodeInfo(
-            nwk=info.nwk_address,
-            ieee=info.ieee_address,
+            nwk=state.nwk_address,
+            ieee=state.ieee_address,
             logical_type=zdo_t.LogicalType.Coordinator,
             manufacturer="Ziggurat",
             model="Coordinator",
         )
         self.state.network_info = zigpy.state.NetworkInfo(
-            extended_pan_id=info.extended_pan_id,
-            pan_id=info.pan_id,
-            nwk_update_id=info.nwk_update_id,
+            extended_pan_id=state.extended_pan_id,
+            pan_id=state.pan_id,
+            nwk_update_id=state.nwk_update_id,
             nwk_manager_id=t.NWK(0x0000),
-            channel=info.channel,
-            tx_power=info.tx_power,
+            channel=state.channel,
+            tx_power=state.tx_power,
             # zigpy mis-annotates the classmethod's `cls` as an instance
-            channel_mask=t.Channels.from_channel_list([info.channel]),  # type: ignore[misc]
+            channel_mask=t.Channels.from_channel_list([state.channel]),  # type: ignore[misc]
             security_level=t.uint8_t(5),
             network_key=zigpy.state.Key(
-                key=info.network_key,
-                seq=info.network_key_seq,
-                tx_counter=info.network_key_tx_counter,
+                key=state.network_key,
+                seq=state.network_key_seq,
+                tx_counter=state.network_key_tx_counter,
             ),
             tc_link_key=zigpy.state.Key(
-                key=info.tc_link_key,
+                key=state.tc_link_key,
                 partner_ieee=self.state.node_info.ieee,
+                # The APS outgoing frame counter lives on the TC link key by convention
+                tx_counter=state.aps_frame_counter,
             ),
-            key_table=[
-                zigpy.state.Key(key=entry.key, partner_ieee=entry.partner_ieee)
-                for entry in info.key_table
-            ],
+            key_table=key_table,
+            children=children,
+            nwk_addresses=nwk_addresses,
             stack_specific=stack_specific,
         )
 
@@ -485,11 +289,18 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         except IndexError as exc:
             raise NetworkNotFormed() from exc
 
-        # The backup's frame counter trails the radio's true counter by however many
-        # frames were sent after the last counter update notification: jump past it
+        # The backup's counters trail the radio's true counters by however many frames
+        # were sent after the last counter notification: jump both past that gap so a
+        # restart never rolls back the NWK or APS outgoing frame counter.
         network_key = latest_backup.network_info.network_key
+        tc_link_key = latest_backup.network_info.tc_link_key
         self.state.network_info = latest_backup.network_info.replace(
-            network_key=network_key.replace(tx_counter=network_key.tx_counter + 500)
+            network_key=network_key.replace(
+                tx_counter=network_key.tx_counter + FRAME_COUNTER_RESTORE_MARGIN
+            ),
+            tc_link_key=tc_link_key.replace(
+                tx_counter=tc_link_key.tx_counter + FRAME_COUNTER_RESTORE_MARGIN
+            ),
         )
         self.state.node_info = latest_backup.node_info
 
@@ -518,8 +329,10 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         # coordinator's own move. The update id goes first so no beacon on the new
         # channel ever advertises the old network instance.
         assert self._api is not None
-        await self._api.request(SetNwkUpdateId(nwk_update_id=new_nwk_update_id))
-        await self._api.request(SetChannel(channel=new_channel))
+        await self._api.request(
+            p.SetNwkUpdateId(nwk_update_id=t.uint8_t(new_nwk_update_id))
+        )
+        await self._api.request(p.SetChannel(channel=t.uint8_t(new_channel)))
 
     async def permit(self, time_s: int = 60, node: t.EUI64 | str | None = None) -> None:
         if node is not None:
@@ -532,7 +345,9 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 await super().permit(time_s, node=node)
                 assert self._api is not None
                 await self._api.request(
-                    PermitJoins(duration=time_s, accept_direct_joins=False)
+                    p.PermitJoins(
+                        duration=t.uint16_t(time_s), accept_direct_joins=t.Bool(False)
+                    )
                 )
                 return
 
@@ -540,13 +355,15 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
     async def permit_ncp(self, time_s: int = 60) -> None:
         assert self._api is not None
-        await self._api.request(PermitJoins(duration=time_s, accept_direct_joins=True))
+        await self._api.request(
+            p.PermitJoins(duration=t.uint16_t(time_s), accept_direct_joins=t.Bool(True))
+        )
 
     async def permit_with_link_key(
         self, node: t.EUI64, link_key: t.KeyData, time_s: int = 60
     ) -> None:
         assert self._api is not None
-        await self._api.request(SetProvisionalKey(ieee=node, key=link_key))
+        await self._api.request(p.SetProvisionalKey(ieee=node, key=link_key))
 
         await super().permit(time_s)
 
@@ -562,11 +379,12 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         assert self._api is not None
         for _ in range(count):
             async for result in self._api.request_stream(
-                EnergyScan(
+                p.EnergyScan(
                     channels=list(channels),
                     duration_per_channel_ms=duration_per_channel_ms,
                 )
             ):
+                result = cast(p.EnergyResult, result)
                 all_results.setdefault(result.channel, []).append(result.rssi)
 
         return {
@@ -583,26 +401,47 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
         assert self._api is not None
         async for beacon in self._api.request_stream(
-            NetworkScan(
+            p.NetworkScan(
                 channels=list(channels),
                 duration_per_channel_ms=duration_per_channel_ms,
             )
         ):
+            beacon = cast(p.Beacon, beacon)
             yield t.NetworkBeacon(
                 pan_id=beacon.pan_id,
                 extended_pan_id=beacon.extended_pan_id,
                 channel=beacon.channel,
-                permit_joining=beacon.permit_joining,
+                permit_joining=bool(beacon.permit_joining),
                 stack_profile=beacon.stack_profile,
                 nwk_update_id=beacon.update_id,
                 lqi=beacon.lqi,
-                src=beacon.source,
+                src=beacon.source_or_none,
                 rssi=beacon.rssi,
                 depth=beacon.device_depth,
-                router_capacity=beacon.router_capacity,
-                device_capacity=beacon.end_device_capacity,
+                router_capacity=bool(beacon.router_capacity),
+                device_capacity=bool(beacon.end_device_capacity),
                 protocol_version=beacon.protocol_version,
             )
+
+    async def _packet_capture(
+        self, channel: int
+    ) -> AsyncGenerator[t.CapturedPacket, None]:
+        assert self._api is not None
+        async for packet in self._api.request_stream(
+            p.PacketCapture(channel=t.uint8_t(channel))
+        ):
+            packet = cast(p.CapturedPacket, packet)
+            yield t.CapturedPacket(
+                timestamp=datetime.now(timezone.utc),
+                rssi=packet.rssi,
+                lqi=packet.lqi,
+                channel=packet.channel,
+                data=packet.psdu,
+            )
+
+    async def _packet_capture_change_channel(self, channel: int) -> None:
+        assert self._api is not None
+        await self._api.request(p.PacketCaptureChannel(channel=t.uint8_t(channel)))
 
     async def write_network_info(
         self,
@@ -610,53 +449,82 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         network_info: zigpy.state.NetworkInfo,
         node_info: zigpy.state.NodeInfo,
     ) -> None:
+        assert self._api is not None
+
         # A TCLK seed carried over from a microcontroller stack: ziggurat derives the
         # unique link keys the previous stack issued to devices from it. Both stacks
         # already store the seed as a plain hex string.
         stack_specific = network_info.stack_specific
         tclk_seed = None
-        tclk_flavor = None
+        tclk_flavor = p.TclkFlavorId.EZSP
 
         if "zstack" in stack_specific and "tclk_seed" in stack_specific["zstack"]:
             tclk_seed = stack_specific["zstack"]["tclk_seed"]
-            tclk_flavor = "zstack"
+            tclk_flavor = p.TclkFlavorId.Z_STACK
         elif "ezsp" in stack_specific and "hashed_tclk" in stack_specific["ezsp"]:
             tclk_seed = stack_specific["ezsp"]["hashed_tclk"]
-            tclk_flavor = "ezsp"
-
-        assert self._api is not None
+            tclk_flavor = p.TclkFlavorId.EZSP
 
         # `UNKNOWN` is assigned after the class body, where mypy cannot see it
         if node_info.ieee == t.EUI64.UNKNOWN:  # type: ignore[attr-defined]
             # zigpy leaves the IEEE address unspecified when forming a new network,
             # deferring to the radio's hardware address
-            rsp = await self._api.request(GetHwAddress())
-            node_info = node_info.replace(ieee=rsp.ieee_address)
+            rsp = cast(p.HwAddress, await self._api.request(p.GetHwAddress()))
+            node_info = node_info.replace(ieee=rsp.ieee)
 
+        state = p.NetworkState(
+            channel=t.uint8_t(network_info.channel),
+            nwk_update_id=t.uint8_t(network_info.nwk_update_id),
+            pan_id=network_info.pan_id,
+            extended_pan_id=network_info.extended_pan_id,
+            nwk_address=node_info.nwk,
+            ieee_address=node_info.ieee,
+            network_key=network_info.network_key.key,
+            network_key_seq=t.uint8_t(network_info.network_key.seq),
+            network_key_tx_counter=t.uint32_t(network_info.network_key.tx_counter),
+            tc_link_key=network_info.tc_link_key.key,
+            has_tclk_seed=t.Bool(tclk_seed is not None),
+            tclk_seed=t.KeyData(
+                bytes.fromhex(tclk_seed) if tclk_seed is not None else os.urandom(16)
+            ),
+            tclk_flavor=tclk_flavor,
+            # None means "pick automatically": apply a safe default
+            tx_power=t.int8s(
+                network_info.tx_power if network_info.tx_power is not None else 8
+            ),
+            aps_frame_counter=t.uint32_t(network_info.tc_link_key.tx_counter),
+        )
         await self._api.request(
-            Configure(
-                channel=network_info.channel,
-                # None means "pick automatically": the server applies its safe default
-                tx_power=network_info.tx_power,
-                nwk_update_id=network_info.nwk_update_id,
-                pan_id=network_info.pan_id,
-                extended_pan_id=network_info.extended_pan_id,
-                nwk_address=node_info.nwk,
-                ieee_address=node_info.ieee,
-                network_key=network_info.network_key.key,
-                network_key_seq=network_info.network_key.seq,
-                network_key_tx_counter=network_info.network_key.tx_counter,
-                tc_link_key=network_info.tc_link_key.key,
-                source_routing=self.config[zigpy.config.CONF_SOURCE_ROUTING],
-                # Unique trust center link keys negotiated in earlier sessions
-                key_table=[
-                    KeyTableEntry(partner_ieee=key.partner_ieee, key=key.key)
-                    for key in network_info.key_table
-                ],
-                tclk_seed=tclk_seed,
-                tclk_flavor=tclk_flavor,
+            p.Configure(
+                role=p.NodeRole.COORDINATOR,
+                source_routing=t.Bool(self.config[zigpy.config.CONF_SOURCE_ROUTING]),
+                state=state,
             )
         )
+
+        # Unique trust center link keys negotiated in earlier sessions
+        entries = [
+            p.KeyEntry(
+                key=key.key,
+                tx_counter=t.uint32_t(key.tx_counter),
+                rx_counter=t.uint32_t(key.rx_counter),
+                seq=t.uint8_t(key.seq),
+                partner_ieee=key.partner_ieee,
+            )
+            for key in network_info.key_table
+        ]
+        for start in range(0, len(entries), KEY_BATCH_SIZE):
+            await self._api.request(
+                p.LoadKeyTable(
+                    entries=t.LVList[p.KeyEntry, t.uint16_t](
+                        entries[start : start + KEY_BATCH_SIZE]
+                    )
+                )
+            )
+
+        await self._restore_children(network_info)
+
+        await self._api.request(p.StartNetwork())
 
         # Ziggurat has no persistent storage of its own: zigpy's backup database is
         # the network's NVRAM, so the settings just written are recorded there for
@@ -667,12 +535,37 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             zigpy.backups.NetworkBackup(network_info=network_info, node_info=node_info)
         )
 
+    async def _restore_children(self, network_info: zigpy.state.NetworkInfo) -> None:
+        assert self._api is not None
+        # The backup carries no capability, so device type is Unknown (restored as a
+        # sleepy end device); children without a known NWK address can't be loaded.
+        entries = [
+            p.ChildEntry(
+                ieee=ieee,
+                nwk=network_info.nwk_addresses[ieee],
+                rx_on_when_idle=t.uint1_t(1),
+                device_type=p.ChildDeviceType.UNKNOWN,
+                reserved=t.uint5_t(0),
+            )
+            for ieee in network_info.children
+            if ieee in network_info.nwk_addresses
+        ]
+        for start in range(0, len(entries), KEY_BATCH_SIZE):
+            await self._api.request(
+                p.LoadChildren(
+                    entries=t.LVList[p.ChildEntry, t.uint16_t](
+                        entries[start : start + KEY_BATCH_SIZE]
+                    )
+                )
+            )
+
     async def reset_network_info(self) -> None:
-        pass
+        assert self._api is not None
+        await self._api.request(p.Shutdown())
 
     async def _watchdog_feed(self) -> None:
         assert self._api is not None
-        await self._api.request(Ping())
+        await self._api.request(p.GetFirmwareInfo())
 
     def packet_received(self, packet: t.ZigbeePacket) -> None:
         # ZDO requests addressed to the coordinator have to be answered here: there is
@@ -799,32 +692,37 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             DEVICE_JOIN_MAX_DELAY, join_if_still_unannounced
         )
 
-    def on_notification(self, notification: Notification) -> None:
+    def on_notification(self, notification: p.Notification) -> None:
         match notification:
-            case ReceivedApsCommand():
+            case p.ReceivedAps():
                 self._handle_received_aps_command(notification)
-            case FrameCounterUpdate():
+            case p.FrameCounter():
+                _LOGGER.debug(
+                    "NWK frame counter updated to %d", notification.frame_counter
+                )
                 self.state.network_info.network_key.tx_counter = (
                     notification.frame_counter
                 )
+                self.backups.add_backup(self.backups.from_network_state())
+            case p.ApsFrameCounter():
                 _LOGGER.debug(
-                    "Frame counter updated to %d",
-                    self.state.network_info.network_key.tx_counter,
+                    "APS frame counter updated to %d", notification.frame_counter
                 )
-                self.backups.add_backup(
-                    zigpy.backups.NetworkBackup(
-                        network_info=self.state.network_info,
-                        node_info=self.state.node_info,
-                    )
+                self.state.network_info.tc_link_key.tx_counter = (
+                    notification.frame_counter
                 )
-            case DeviceJoined():
+                self.backups.add_backup(self.backups.from_network_state())
+            case p.RouteRecord():
+                self.handle_relays(
+                    nwk=notification.destination, relays=list(notification.relays)
+                )
+            case p.DeviceJoined():
                 self._handle_device_joined(
                     notification.nwk, notification.ieee, notification.parent
                 )
-            case DeviceLeft():
-                if notification.ieee is not None:
-                    ieee = notification.ieee
-                else:
+            case p.DeviceLeft():
+                ieee = notification.ieee_or_none
+                if ieee is None:
                     try:
                         ieee = self.get_device(nwk=notification.nwk).ieee
                     except KeyError:
@@ -834,10 +732,10 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     "Device %s (%s) left the network: %s",
                     notification.nwk,
                     ieee,
-                    notification.reason.value,
+                    notification.reason.name.lower(),
                 )
                 self.handle_leave(nwk=notification.nwk, ieee=ieee)
-            case LinkKeyUpdate():
+            case p.LinkKey():
                 key = zigpy.state.Key(
                     key=notification.key,
                     partner_ieee=notification.ieee,
@@ -855,7 +753,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                         node_info=self.state.node_info,
                     )
                 )
-            case ApsDecryptionFailure():
+            case p.ApsDecryptFailure():
                 _LOGGER.warning(
                     "Could not decrypt an APS command from %s (%s): its trust center "
                     "link key is wrong or missing.",
@@ -863,11 +761,12 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     notification.source,
                 )
 
-    def _handle_received_aps_command(self, command: ReceivedApsCommand) -> None:
-        if command.group is not None:
+    def _handle_received_aps_command(self, command: p.ReceivedAps) -> None:
+        group = command.group_id
+        if group is not None:
             dst = t.AddrModeAddress(
                 addr_mode=t.AddrMode.Group,
-                address=t.Group(command.group),
+                address=t.Group(group),
             )
         elif command.destination >= 0xFFF8:
             dst = t.AddrModeAddress(
@@ -897,47 +796,113 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         self.packet_received(packet)
 
     async def send_packet(self, packet: t.ZigbeePacket) -> None:
-        aps_encryption = t.TransmitOptions.APS_Encryption in packet.tx_options
-
         dst = packet.dst
         assert dst is not None and dst.address is not None
 
+        try:
+            device = self.get_device_with_address(dst)
+        except (KeyError, ValueError):
+            device = None
+
         destination: t.NWK | None = None
-        destination_eui64: t.EUI64 | None = None
+        destination_eui64 = device.ieee if device is not None else None
 
         if dst.addr_mode == t.AddrMode.IEEE:
             # The server resolves the EUI64 to a network address
             destination_eui64 = cast(t.EUI64, dst.address)
-            delivery_mode = "unicast"
         else:
             destination = t.NWK(dst.address)
-            delivery_mode = {
-                t.AddrMode.NWK: "unicast",
-                t.AddrMode.Group: "multicast",
-                t.AddrMode.Broadcast: "broadcast",
-            }[dst.addr_mode]
 
-            if aps_encryption:
-                # The server selects the link key by EUI64
-                destination_eui64 = self.get_device(nwk=destination).ieee
-
-        # Resolves once the frame is on the air (EZSP `messageSent` parity); the
-        # APS-ack delivery result arrives later and is logged by the API layer
-        assert self._api is not None
-        await self._api.request_transmitted(
-            SendAps(
-                delivery_mode=delivery_mode,
-                destination_eui64=destination_eui64,
-                destination=destination,
-                profile_id=packet.profile_id,
-                cluster_id=packet.cluster_id or 0x0000,
-                src_ep=packet.src_ep or 0,
-                dst_ep=packet.dst_ep or 0,
-                aps_ack=t.TransmitOptions.ACK in packet.tx_options,
-                aps_encryption=aps_encryption,
-                radius=packet.radius or 30,
-                aps_seq=packet.tsn,
-                priority=packet.priority if packet.priority is not None else 0,
-                data=packet.data.serialize(),
+        if (
+            t.TransmitOptions.APS_Encryption in packet.tx_options
+            and destination_eui64 is None
+        ):
+            raise DeliveryError(
+                "Cannot send an encrypted packet without a destination EUI64"
             )
-        )
+
+        # Resolves once the send is confirmed: passive-ack quorum for a broadcast or
+        # groupcast, next-hop acceptance for a no-ack unicast, or the end-to-end APS
+        # ack. A rejected or failed send raises `DeliveryError`.
+        assert self._api is not None
+        priority = packet.priority if packet.priority is not None else 0
+        radius = packet.radius or 30
+        asdu = packet.data.serialize()
+
+        send: p.SendUnicast | p.SendBroadcast | p.SendGroupcast
+        async with self._limit_concurrency(priority=packet.priority):
+            if dst.addr_mode == t.AddrMode.Group:
+                assert destination is not None
+                send = p.SendGroupcast.build(
+                    group_id=int(destination),
+                    profile_id=packet.profile_id,
+                    cluster_id=packet.cluster_id or 0x0000,
+                    src_ep=packet.src_ep or 0,
+                    aps_seq=packet.tsn,
+                    radius=radius,
+                    priority=priority,
+                    asdu=asdu,
+                )
+            elif dst.addr_mode == t.AddrMode.Broadcast:
+                assert destination is not None
+                send = p.SendBroadcast.build(
+                    destination=destination,
+                    profile_id=packet.profile_id,
+                    cluster_id=packet.cluster_id or 0x0000,
+                    src_ep=packet.src_ep or 0,
+                    dst_ep=packet.dst_ep or 0,
+                    aps_seq=packet.tsn,
+                    radius=radius,
+                    priority=priority,
+                    asdu=asdu,
+                )
+            else:
+                route_control = p.RouteControl.STACK_DECIDES
+                next_hop = None
+                relays = None
+
+                # Within the network startup period, provide route hints to the
+                # stack to reduce routing congestion
+                if (
+                    device is not None
+                    and datetime.now(timezone.utc) - self._start_time
+                    < ROUTE_HINT_DURATION
+                ):
+                    maybe_relays = self.build_source_route_to(device)
+
+                    if maybe_relays is None:
+                        maybe_next_hop = None
+                    elif not maybe_relays:
+                        maybe_next_hop = device.nwk
+                    else:
+                        maybe_next_hop = maybe_relays[0]
+
+                    if self.config[zigpy.config.CONF_SOURCE_ROUTING] and maybe_relays:
+                        route_control = p.RouteControl.HINT_SOURCE_ROUTE
+                        relays = maybe_relays
+                    elif maybe_next_hop is not None:
+                        route_control = p.RouteControl.HINT_NEXT_HOP
+                        next_hop = maybe_next_hop
+
+                send = p.SendUnicast.build(
+                    destination=destination,
+                    destination_eui64=destination_eui64,
+                    aps_ack=t.TransmitOptions.ACK in packet.tx_options,
+                    aps_encryption=(
+                        t.TransmitOptions.APS_Encryption in packet.tx_options
+                    ),
+                    sleepy_destination=packet.extended_timeout,
+                    profile_id=packet.profile_id,
+                    cluster_id=packet.cluster_id or 0x0000,
+                    src_ep=packet.src_ep or 0,
+                    dst_ep=packet.dst_ep or 0,
+                    aps_seq=packet.tsn,
+                    radius=radius,
+                    priority=priority,
+                    route_control=route_control,
+                    next_hop=next_hop,
+                    relays=relays,
+                    asdu=asdu,
+                )
+
+            await self._api.request_confirmed(send)

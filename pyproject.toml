@@ -17,6 +17,7 @@ dependencies = [
     "zigpy",
     "aiohttp",
     "mashumaro",
+    "aiospinel>=1.2.0",
 ]
 
 [project.entry-points."zigpy.radio"]
