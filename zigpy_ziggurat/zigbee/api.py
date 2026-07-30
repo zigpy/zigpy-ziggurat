@@ -7,7 +7,6 @@ from collections.abc import AsyncGenerator, Callable
 from datetime import timedelta
 import logging
 
-from zigpy.exceptions import DeliveryError
 import zigpy.types as t
 
 from zigpy_ziggurat.zigbee import protocol as p
@@ -55,6 +54,7 @@ class ZigguratApi:
             int, asyncio.Future[p.SendConfirm | p.ApsAckConfirm | p.BroadcastConfirm]
         ] = {}
         self._awaiting_aps_ack: set[int] = set()
+        self._handoff_callbacks: dict[int, Callable[[], None]] = {}
         self._transport: Transport | None = None
 
     async def connect(self) -> None:
@@ -84,6 +84,7 @@ class ZigguratApi:
                 confirm.set_exception(ConnectionError("Connection lost"))
         self._pending_confirms.clear()
         self._awaiting_aps_ack.clear()
+        self._handoff_callbacks.clear()
         # Report the loss once. `_closing` also suppresses it during our own teardown.
         if not self._closing:
             self._closing = True
@@ -123,9 +124,16 @@ class ZigguratApi:
             self._pending.pop(request_id, None)
 
     async def request_confirmed(
-        self, send: p.SendUnicast | p.SendBroadcast | p.SendGroupcast
+        self,
+        send: p.SendUnicast | p.SendBroadcast | p.SendGroupcast,
+        *,
+        on_handed_off: Callable[[], None] | None = None,
     ) -> None:
-        """Send and await the terminal confirmation."""
+        """Send and await the terminal confirmation.
+
+        `on_handed_off` fires when the mesh accepts an ack-requested unicast ahead of
+        its APS ack verdict; the other send kinds only produce a terminal confirm.
+        """
 
         # The terminal confirmation is the end-to-end APS ack for an ack-requested
         # unicast, the passive-ack quorum for a broadcast/groupcast, otherwise the local
@@ -141,6 +149,9 @@ class ZigguratApi:
         if isinstance(send, p.SendUnicast) and send.aps_ack:
             self._awaiting_aps_ack.add(request_id)
 
+        if on_handed_off is not None:
+            self._handoff_callbacks[request_id] = on_handed_off
+
         _LOGGER.debug("Sending request with confirmation (id=%d): %r", request_id, send)
 
         assert self._transport is not None
@@ -154,11 +165,14 @@ class ZigguratApi:
             self._pending_confirms.pop(request_id, None)
             self._awaiting_aps_ack.discard(request_id)
 
+            if request_id in self._handoff_callbacks:
+                del self._handoff_callbacks[request_id]
+
             if not confirm.done() or confirm.cancelled():
                 await self._cancel_send(request_id)
 
         if result.status != p.SendStatus.SUCCESS:
-            raise DeliveryError(f"Send failed: {result.status.name}")
+            raise p.send_status_error(result.status)
 
     async def request_stream(
         self, request: p.Request
@@ -252,6 +266,8 @@ class ZigguratApi:
                 notification.status == p.SendStatus.SUCCESS
                 and request_id in self._awaiting_aps_ack
             ):
+                if request_id in self._handoff_callbacks:
+                    self._handoff_callbacks.pop(request_id)()
                 return
             self._awaiting_aps_ack.discard(request_id)
             confirm.set_result(notification)

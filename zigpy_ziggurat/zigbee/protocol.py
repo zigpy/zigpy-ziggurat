@@ -5,7 +5,16 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import ClassVar
 
-from zigpy.exceptions import DeliveryError
+from zigpy.exceptions import (
+    ApsNoAckError,
+    CcaFailureError,
+    DeliveryError,
+    MacNoAckError,
+    NoRouteError,
+    RadioBusyError,
+    SendCancelledError,
+    TransactionExpiredError,
+)
 import zigpy.types as t
 
 from zigpy_ziggurat.zigbee import wire
@@ -497,3 +506,27 @@ class RateLimitedError(ProtocolError):
             Status.RATE_LIMITED, f"retry in {retry_in.total_seconds():.1f}s"
         )
         self.retry_in = retry_in
+
+
+# A send's terminal wire verdict, mapped to its typed zigpy exception
+SEND_STATUS_ERRORS: dict[SendStatus, type[DeliveryError]] = {
+    SendStatus.ROUTE_DISCOVERY_TIMEOUT: NoRouteError,
+    SendStatus.ROUTE_DISCOVERY_NO_ENTRY: NoRouteError,
+    SendStatus.ROUTE_INACTIVE_AFTER_DISCOVERY: NoRouteError,
+    SendStatus.NWK_NO_ACK: MacNoAckError,
+    SendStatus.CCA_FAILURE: CcaFailureError,
+    SendStatus.TRANSMIT_FAILED: DeliveryError,
+    SendStatus.APS_ACK_TIMEOUT: ApsNoAckError,
+    SendStatus.BROADCAST_QUORUM_NOT_REACHED: DeliveryError,
+    # The sleepy destination did not poll its parent (us) before the frame expired
+    SendStatus.INDIRECT_EXPIRED: TransactionExpiredError,
+    # Mid-pipeline memory pressure: eases as soon as an in-flight frame completes
+    SendStatus.FRAME_BUDGET_EXHAUSTED: RadioBusyError,
+    SendStatus.CANCELLED: SendCancelledError,
+    SendStatus.RADIO_ERROR: DeliveryError,
+}
+
+
+def send_status_error(status: SendStatus) -> DeliveryError:
+    """Build the typed exception for a failed send's terminal status."""
+    return SEND_STATUS_ERRORS[status](f"Send failed: {status.name}", int(status))

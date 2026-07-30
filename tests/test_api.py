@@ -265,6 +265,24 @@ async def test_request_confirmed(
     assert transport.sent(p.SendUnicast)[-1].aps_seq == 55
 
 
+async def test_request_confirmed_handed_off(
+    api: RecordingApi, transport: SyntheticBinaryTransport
+) -> None:
+    """The handoff callback fires for an ack send, ahead of the APS ack verdict."""
+    handed_off: list[bool] = []
+
+    await api.request_confirmed(
+        _send_aps(aps_ack=True), on_handed_off=lambda: handed_off.append(True)
+    )
+    assert handed_off == [True]
+
+    # A no-ack send only produces a terminal confirm: the callback never fires
+    await api.request_confirmed(
+        _send_aps(aps_ack=False), on_handed_off=lambda: handed_off.append(True)
+    )
+    assert handed_off == [True]
+
+
 async def test_cancel_on_abandon(
     api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:

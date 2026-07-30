@@ -6,12 +6,14 @@ from datetime import timedelta
 import logging
 import os
 from typing import Any
+from unittest.mock import patch
 
 from aiohttp import web
 import pytest
 import zigpy.config
 import zigpy.device
 import zigpy.endpoint
+import zigpy.exceptions
 from zigpy.exceptions import DeliveryError, NetworkNotFormed
 import zigpy.state
 import zigpy.types as t
@@ -672,6 +674,56 @@ async def test_send_packet_unicast(
     assert send.radius == 30
     assert send.priority == 0
     assert bytes(send.asdu) == b"\x01\x02\x03"
+
+
+async def test_send_packet_unicast_staged_handoff(
+    app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    """An ack unicast reports the sent stage ahead of its APS ack verdict."""
+    app.add_device(DEVICE_IEEE, DEVICE_NWK)
+
+    with patch.object(app, "packet_sent", wraps=app.packet_sent) as packet_sent:
+        await app.send_packet(
+            aps_packet(
+                t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=DEVICE_NWK),
+                tx_options=t.TransmitOptions.ACK,
+            )
+        )
+
+        assert len(packet_sent.mock_calls) == 1
+
+        # A no-ack unicast produces a single terminal confirm: no early sent stage
+        await app.send_packet(
+            aps_packet(t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=DEVICE_NWK))
+        )
+
+        assert len(packet_sent.mock_calls) == 1
+
+
+async def test_send_packet_cancellation(
+    app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    """Cancelling an in-flight send cancels it on the firmware too."""
+
+    async def accept_only(request: p.SendUnicast, request_id: int) -> None:
+        # Accepted, never confirmed
+        return None
+
+    server.handlers[p.RequestCommand.SEND_UNICAST] = accept_only
+
+    handle = app._scheduler.submit(
+        aps_packet(t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=DEVICE_NWK))
+    )
+    await asyncio.sleep(0.01)
+
+    assert handle.cancel()
+
+    with pytest.raises(zigpy.exceptions.SendCancelledError):
+        await handle
+
+    # The abandoned send was cancelled on the firmware
+    await asyncio.sleep(0.01)
+    assert len(server.sent(p.CancelRequest)) == 1
 
 
 async def test_send_packet_unicast_by_ieee(

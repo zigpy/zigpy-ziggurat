@@ -14,6 +14,7 @@ import zigpy.backups
 import zigpy.config
 import zigpy.device
 import zigpy.endpoint
+import zigpy.exceptions
 from zigpy.exceptions import DeliveryError, NetworkNotFormed
 import zigpy.state
 import zigpy.types as t
@@ -798,7 +799,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         )
         self.packet_received(packet)
 
-    async def send_packet(self, packet: t.ZigbeePacket) -> None:
+    async def _send_packet(self, packet: t.ZigbeePacket) -> None:
         dst = packet.dst
         assert dst is not None and dst.address is not None
 
@@ -833,79 +834,104 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         asdu = packet.data.serialize()
 
         send: p.SendUnicast | p.SendBroadcast | p.SendGroupcast
-        async with self._limit_concurrency(priority=packet.priority):
-            if dst.addr_mode == t.AddrMode.Group:
-                assert destination is not None
-                send = p.SendGroupcast.build(
-                    group_id=int(destination),
-                    profile_id=packet.profile_id,
-                    cluster_id=packet.cluster_id or 0x0000,
-                    src_ep=packet.src_ep or 0,
-                    aps_seq=packet.tsn,
-                    radius=radius,
-                    priority=priority,
-                    asdu=asdu,
-                )
-            elif dst.addr_mode == t.AddrMode.Broadcast:
-                assert destination is not None
-                send = p.SendBroadcast.build(
-                    destination=destination,
-                    profile_id=packet.profile_id,
-                    cluster_id=packet.cluster_id or 0x0000,
-                    src_ep=packet.src_ep or 0,
-                    dst_ep=packet.dst_ep or 0,
-                    aps_seq=packet.tsn,
-                    radius=radius,
-                    priority=priority,
-                    asdu=asdu,
-                )
-            else:
-                route_control = p.RouteControl.STACK_DECIDES
-                next_hop = None
-                relays = None
+        if dst.addr_mode == t.AddrMode.Group:
+            assert destination is not None
+            send = p.SendGroupcast.build(
+                group_id=int(destination),
+                profile_id=packet.profile_id,
+                cluster_id=packet.cluster_id or 0x0000,
+                src_ep=packet.src_ep or 0,
+                aps_seq=packet.tsn,
+                radius=radius,
+                priority=priority,
+                asdu=asdu,
+            )
+        elif dst.addr_mode == t.AddrMode.Broadcast:
+            assert destination is not None
+            send = p.SendBroadcast.build(
+                destination=destination,
+                profile_id=packet.profile_id,
+                cluster_id=packet.cluster_id or 0x0000,
+                src_ep=packet.src_ep or 0,
+                dst_ep=packet.dst_ep or 0,
+                aps_seq=packet.tsn,
+                radius=radius,
+                priority=priority,
+                asdu=asdu,
+            )
+        else:
+            route_control = p.RouteControl.STACK_DECIDES
+            next_hop = None
+            relays = None
 
-                # Within the network startup period, provide route hints to the
-                # stack to reduce routing congestion
-                if device is not None and (
-                    self._start_time is None
-                    or datetime.now(timezone.utc) - self._start_time
-                    < ROUTE_HINT_DURATION
-                ):
-                    maybe_relays = self.build_source_route_to(device)
+            # Within the network startup period, provide route hints to the
+            # stack to reduce routing congestion
+            if device is not None and (
+                self._start_time is None
+                or datetime.now(timezone.utc) - self._start_time < ROUTE_HINT_DURATION
+            ):
+                maybe_relays = self.build_source_route_to(device)
 
-                    if maybe_relays is None:
-                        maybe_next_hop = None
-                    elif not maybe_relays:
-                        maybe_next_hop = device.nwk
-                    else:
-                        maybe_next_hop = maybe_relays[0]
+                if maybe_relays is None:
+                    maybe_next_hop = None
+                elif not maybe_relays:
+                    maybe_next_hop = device.nwk
+                else:
+                    maybe_next_hop = maybe_relays[0]
 
-                    if self.config[zigpy.config.CONF_SOURCE_ROUTING] and maybe_relays:
-                        route_control = p.RouteControl.HINT_SOURCE_ROUTE
-                        relays = maybe_relays
-                    elif maybe_next_hop is not None:
-                        route_control = p.RouteControl.HINT_NEXT_HOP
-                        next_hop = maybe_next_hop
+                if self.config[zigpy.config.CONF_SOURCE_ROUTING] and maybe_relays:
+                    route_control = p.RouteControl.HINT_SOURCE_ROUTE
+                    relays = maybe_relays
+                elif maybe_next_hop is not None:
+                    route_control = p.RouteControl.HINT_NEXT_HOP
+                    next_hop = maybe_next_hop
 
-                send = p.SendUnicast.build(
-                    destination=destination,
-                    destination_eui64=destination_eui64,
-                    aps_ack=t.TransmitOptions.ACK in packet.tx_options,
-                    aps_encryption=(
-                        t.TransmitOptions.APS_Encryption in packet.tx_options
-                    ),
-                    sleepy_destination=packet.extended_timeout,
-                    profile_id=packet.profile_id,
-                    cluster_id=packet.cluster_id or 0x0000,
-                    src_ep=packet.src_ep or 0,
-                    dst_ep=packet.dst_ep or 0,
-                    aps_seq=packet.tsn,
-                    radius=radius,
-                    priority=priority,
-                    route_control=route_control,
-                    next_hop=next_hop,
-                    relays=relays,
-                    asdu=asdu,
-                )
+            send = p.SendUnicast.build(
+                destination=destination,
+                destination_eui64=destination_eui64,
+                aps_ack=t.TransmitOptions.ACK in packet.tx_options,
+                aps_encryption=(t.TransmitOptions.APS_Encryption in packet.tx_options),
+                sleepy_destination=packet.extended_timeout,
+                profile_id=packet.profile_id,
+                cluster_id=packet.cluster_id or 0x0000,
+                src_ep=packet.src_ep or 0,
+                dst_ep=packet.dst_ep or 0,
+                aps_seq=packet.tsn,
+                radius=radius,
+                priority=priority,
+                route_control=route_control,
+                next_hop=next_hop,
+                relays=relays,
+                asdu=asdu,
+            )
 
-            await self._api.request_confirmed(send)
+        try:
+            await self._api.request_confirmed(
+                send, on_handed_off=lambda: self.packet_sent(packet)
+            )
+        except p.RateLimitedError as exc:
+            # The firmware says exactly when to come back; sends to other
+            # destinations are likely unaffected
+            raise zigpy.exceptions.TransientSendError(
+                str(exc),
+                int(exc.status),
+                scope=zigpy.exceptions.FailureScope.DESTINATION,
+                retry_in=exc.retry_in.total_seconds(),
+            ) from exc
+        except p.ProtocolError as exc:
+            if exc.status == p.Status.BUDGET_EXHAUSTED:
+                # Frame memory pressure eases as soon as an in-flight frame resolves
+                raise zigpy.exceptions.RadioBusyError(
+                    str(exc), int(exc.status)
+                ) from exc
+            elif exc.status in (
+                p.Status.PAYLOAD_TOO_LONG,
+                p.Status.SECURITY_UNAVAILABLE,
+            ):
+                raise zigpy.exceptions.PermanentSendError(
+                    str(exc), int(exc.status)
+                ) from exc
+            elif exc.status == p.Status.NO_ROUTE:
+                raise zigpy.exceptions.NoRouteError(str(exc), int(exc.status)) from exc
+
+            raise
