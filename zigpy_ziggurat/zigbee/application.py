@@ -106,6 +106,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         super().__init__(config)
         self._api: ZigguratApi | None = None
         self._start_time: datetime | None = None
+        self._aps_counter = 0
 
     async def connect(self) -> None:
         # The device path is either the WebSocket URL of a ziggurat server or the
@@ -798,6 +799,11 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         )
         self.packet_received(packet)
 
+    def _next_aps_counter(self) -> int:
+        """Allocate the APS counter for the next outgoing frame."""
+        self._aps_counter = (self._aps_counter + 1) % 256
+        return self._aps_counter
+
     async def send_packet(self, packet: t.ZigbeePacket) -> None:
         dst = packet.dst
         assert dst is not None and dst.address is not None
@@ -834,6 +840,10 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
         send: p.SendUnicast | p.SendBroadcast | p.SendGroupcast
         async with self._limit_concurrency(priority=packet.priority):
+            # Allocated here rather than above the semaphore so counters advance in the
+            # order the server receives the frames
+            aps_seq = self._next_aps_counter()
+
             if dst.addr_mode == t.AddrMode.Group:
                 assert destination is not None
                 send = p.SendGroupcast.build(
@@ -841,7 +851,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     profile_id=packet.profile_id,
                     cluster_id=packet.cluster_id or 0x0000,
                     src_ep=packet.src_ep or 0,
-                    aps_seq=packet.tsn,
+                    aps_seq=aps_seq,
                     radius=radius,
                     priority=priority,
                     asdu=asdu,
@@ -854,7 +864,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     cluster_id=packet.cluster_id or 0x0000,
                     src_ep=packet.src_ep or 0,
                     dst_ep=packet.dst_ep or 0,
-                    aps_seq=packet.tsn,
+                    aps_seq=aps_seq,
                     radius=radius,
                     priority=priority,
                     asdu=asdu,
@@ -899,7 +909,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     cluster_id=packet.cluster_id or 0x0000,
                     src_ep=packet.src_ep or 0,
                     dst_ep=packet.dst_ep or 0,
-                    aps_seq=packet.tsn,
+                    aps_seq=aps_seq,
                     radius=radius,
                     priority=priority,
                     route_control=route_control,

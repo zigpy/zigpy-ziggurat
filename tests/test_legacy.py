@@ -577,7 +577,6 @@ async def test_legacy_send_packet(
             src_ep=t.uint8_t(1),
             dst=dst,
             dst_ep=t.uint8_t(1),
-            tsn=t.uint8_t(33),
             profile_id=t.uint16_t(0x0104),
             cluster_id=t.uint16_t(0x0006),
             data=t.SerializableBytes(b"\x01\x02\x03"),
@@ -587,7 +586,7 @@ async def test_legacy_send_packet(
 
     request = legacy_server.sent(commands.SendAps)[-1]
     assert request.data == b"\x01\x02\x03"
-    assert request.aps_seq == 33
+    assert request.aps_seq == 1
     assert request.radius == 30
     for field, value in expected.items():
         assert getattr(request, field) == value
@@ -609,7 +608,6 @@ async def test_legacy_send_packet_delivery_failure(
                 src_ep=t.uint8_t(1),
                 dst=t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=DEVICE_NWK),
                 dst_ep=t.uint8_t(1),
-                tsn=t.uint8_t(34),
                 profile_id=t.uint16_t(0x0104),
                 cluster_id=t.uint16_t(0x0006),
                 data=t.SerializableBytes(b"\x04"),
@@ -638,7 +636,6 @@ async def test_legacy_send_confirm_failure(
                 src_ep=t.uint8_t(1),
                 dst=t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=DEVICE_NWK),
                 dst_ep=t.uint8_t(1),
-                tsn=t.uint8_t(35),
                 profile_id=t.uint16_t(0x0104),
                 cluster_id=t.uint16_t(0x0006),
                 data=t.SerializableBytes(b"\x05"),
@@ -663,7 +660,6 @@ async def test_legacy_aps_ack_confirm_failure(
                 src_ep=t.uint8_t(1),
                 dst=t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=DEVICE_NWK),
                 dst_ep=t.uint8_t(1),
-                tsn=t.uint8_t(36),
                 profile_id=t.uint16_t(0x0104),
                 cluster_id=t.uint16_t(0x0006),
                 data=t.SerializableBytes(b"\x06"),

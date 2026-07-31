@@ -72,7 +72,6 @@ def zdo_packet(cluster_id: int, data: bytes, src: t.NWK = DEVICE_NWK) -> t.Zigbe
         src_ep=t.uint8_t(0),
         dst=t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=t.NWK(0x0000)),
         dst_ep=t.uint8_t(0),
-        tsn=t.uint8_t(data[0]),
         profile_id=t.uint16_t(0x0000),
         cluster_id=t.uint16_t(cluster_id),
         data=t.SerializableBytes(data),
@@ -84,7 +83,6 @@ def zdo_packet(cluster_id: int, data: bytes, src: t.NWK = DEVICE_NWK) -> t.Zigbe
 def aps_packet(
     dst: t.AddrModeAddress,
     *,
-    tsn: int = 33,
     src_ep: int = 1,
     dst_ep: int = 1,
     tx_options: t.TransmitOptions = t.TransmitOptions.NONE,
@@ -95,7 +93,6 @@ def aps_packet(
         src_ep=t.uint8_t(src_ep),
         dst=dst,
         dst_ep=t.uint8_t(dst_ep),
-        tsn=t.uint8_t(tsn),
         profile_id=t.uint16_t(0x0104),
         cluster_id=t.uint16_t(0x0006),
         data=t.SerializableBytes(data),
@@ -668,7 +665,7 @@ async def test_send_packet_unicast(
     assert not send.aps_encryption
     assert not send.sleepy_destination
     assert send.profile_id == 0x0104
-    assert send.aps_seq == 33
+    assert send.aps_seq == 1
     assert send.radius == 30
     assert send.priority == 0
     assert bytes(send.asdu) == b"\x01\x02\x03"
@@ -750,7 +747,7 @@ async def test_send_packet_broadcast(
     send = server.sent(p.SendBroadcast)[-1]
     assert send.destination == t.NWK(0xFFFC)
     assert send.dst_ep == 255
-    assert send.aps_seq == 33
+    assert send.aps_seq == 1
     assert bytes(send.asdu) == b"\x01\x02\x03"
 
 
@@ -766,7 +763,7 @@ async def test_send_packet_groupcast(
 
     send = server.sent(p.SendGroupcast)[-1]
     assert send.group_id == 0x0002
-    assert send.aps_seq == 33
+    assert send.aps_seq == 1
     assert bytes(send.asdu) == b"\x01\x02\x03"
 
 
