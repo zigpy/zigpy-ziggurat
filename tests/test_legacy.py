@@ -586,7 +586,6 @@ async def test_legacy_send_packet(
 
     request = legacy_server.sent(commands.SendAps)[-1]
     assert request.data == b"\x01\x02\x03"
-    assert request.aps_seq == 1
     assert request.radius == 30
     for field, value in expected.items():
         assert getattr(request, field) == value

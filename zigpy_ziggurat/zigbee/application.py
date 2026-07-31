@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import logging
 import math
 import os
+import random
 import statistics
 from typing import Any, cast
 
@@ -106,7 +107,10 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         super().__init__(config)
         self._api: ZigguratApi | None = None
         self._start_time: datetime | None = None
-        self._aps_counter = 0
+
+        # Randomized so a reconnect does not replay counters a device still remembers
+        # for duplicate rejection, which it would ack but not deliver
+        self._aps_counter = random.randint(0x00, 0xFF)
 
     async def connect(self) -> None:
         # The device path is either the WebSocket URL of a ziggurat server or the
@@ -840,8 +844,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
         send: p.SendUnicast | p.SendBroadcast | p.SendGroupcast
         async with self._limit_concurrency(priority=packet.priority):
-            # Allocated here rather than above the semaphore so counters advance in the
-            # order the server receives the frames
+            # Allocated inside the semaphore so counters advance in send order
             aps_seq = self._next_aps_counter()
 
             if dst.addr_mode == t.AddrMode.Group:
