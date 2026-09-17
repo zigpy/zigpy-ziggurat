@@ -1,6 +1,5 @@
 """Tests for `connect_transport`, which probes a WebSocket for its protocol, and for
-the transports it returns. The legacy JSON transcoding shim is covered separately in
-`test_legacy.py`."""
+the transports it returns."""
 
 import asyncio
 
@@ -117,6 +116,24 @@ async def test_spinel_tunnel_write_rejected() -> None:
     finally:
         await transport.disconnect()
         await rcp.stop()
+
+
+async def test_websocket_frame_handler_error(server: SyntheticZiggurat) -> None:
+    attempts: list[bytes] = []
+
+    def boom(frame: bytes) -> None:
+        attempts.append(frame)
+        raise RuntimeError("handler blew up")
+
+    transport = await connect_transport(server.url, boom, lambda exc: None)
+    try:
+        # The receive loop must survive a handler raising on a delivered frame.
+        await transport.send_frame(p.encode_request(p.Shutdown(), 1))
+        await _wait_for(attempts)
+        await transport.send_frame(p.encode_request(p.Shutdown(), 2))
+        await _wait_for(attempts, count=2)
+    finally:
+        await transport.disconnect()
 
 
 async def test_websocket_send_after_disconnect(server: SyntheticZiggurat) -> None:
