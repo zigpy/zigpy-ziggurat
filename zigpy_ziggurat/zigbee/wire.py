@@ -389,7 +389,9 @@ class LastResetPayload(t.Struct):
 class ReceivedApsPayload(t.Struct):
     source: t.NWK
     destination: t.NWK
-    has_group: t.Bool
+    has_group: t.uint1_t
+    aps_encrypted: t.uint1_t
+    reserved: t.uint6_t
     group: t.uint16_t
     profile_id: t.uint16_t
     cluster_id: t.uint16_t
