@@ -794,6 +794,11 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             cluster_id=command.cluster_id,
             lqi=command.lqi,
             rssi=command.rssi,
+            tx_options=(
+                t.TransmitOptions.APS_Encryption
+                if command.aps_encrypted
+                else t.TransmitOptions.NONE
+            ),
             data=t.SerializableBytes(command.data),
         )
         self.packet_received(packet)
