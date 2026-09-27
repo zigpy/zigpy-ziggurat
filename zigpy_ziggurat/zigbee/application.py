@@ -614,6 +614,9 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         coordinator = self._device
         nwk = self.state.node_info.nwk
 
+        # Answer with the same APS security the request arrived with
+        aps_encryption = t.TransmitOptions.APS_Encryption in packet.tx_options
+
         if hdr.command_id == zdo_t.ZDOCmd.Node_Desc_req:
             # Joining devices read our node descriptor to learn the trust center's
             # stack compliance revision before attempting the link key exchange
@@ -635,6 +638,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     nwk,
                     node_desc,
                     tsn=hdr.tsn,
+                    aps_encryption=aps_encryption,
                 )
             )
         elif hdr.command_id == zdo_t.ZDOCmd.Active_EP_req:
@@ -645,6 +649,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     nwk,
                     endpoints,
                     tsn=hdr.tsn,
+                    aps_encryption=aps_encryption,
                 )
             )
         elif hdr.command_id == zdo_t.ZDOCmd.Simple_Desc_req:
@@ -667,6 +672,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     nwk,
                     descriptor,
                     tsn=hdr.tsn,
+                    aps_encryption=aps_encryption,
                 )
             )
 

@@ -1085,6 +1085,35 @@ async def test_on_notification_received_aps(
     assert reply.asdu[0] == 0x77
 
 
+@pytest.mark.parametrize("aps_encrypted", [0, 1])
+async def test_on_notification_received_aps_zdo_reply_encryption(
+    app: ControllerApplication, server: SyntheticZiggurat, aps_encrypted: int
+) -> None:
+    """A local ZDO reply uses the same APS security as the request."""
+    add_initialized_device(app)
+
+    await server.send_notification(
+        p.ReceivedAps(
+            source=DEVICE_NWK,
+            destination=t.NWK(0x0000),
+            has_group=t.uint1_t(0),
+            aps_encrypted=t.uint1_t(aps_encrypted),
+            reserved=t.uint6_t(0),
+            group=t.uint16_t(0),
+            profile_id=t.uint16_t(0x0000),
+            cluster_id=t.uint16_t(zdo_t.ZDOCmd.Node_Desc_req),
+            src_ep=t.uint8_t(0),
+            dst_ep=t.uint8_t(0),
+            lqi=t.uint8_t(255),
+            rssi=t.int8s(-40),
+            data=t.LongOctetString(b"\x77" + t.NWK(0x0000).serialize()),
+        )
+    )
+    reply = await server.wait_for(p.SendUnicast)
+    assert reply.cluster_id == zdo_t.ZDOCmd.Node_Desc_rsp
+    assert reply.aps_encryption == aps_encrypted
+
+
 @pytest.mark.parametrize(
     ("destination", "group", "expected_dst"),
     [
