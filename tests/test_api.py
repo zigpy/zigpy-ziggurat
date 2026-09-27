@@ -406,7 +406,9 @@ async def test_notifications(
         p.ReceivedAps(
             source=t.NWK(0xAB12),
             destination=t.NWK(0x0000),
-            has_group=t.Bool(False),
+            has_group=t.uint1_t(0),
+            aps_encrypted=t.uint1_t(0),
+            reserved=t.uint6_t(0),
             group=t.uint16_t(0),
             profile_id=t.uint16_t(0x0104),
             cluster_id=t.uint16_t(0x0006),
