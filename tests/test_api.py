@@ -28,7 +28,6 @@ def _send_aps(*, aps_ack: bool) -> p.SendUnicast:
         cluster_id=0x0006,
         src_ep=1,
         dst_ep=1,
-        aps_seq=55,
         radius=30,
         priority=0,
         asdu=b"\x01\x02",
@@ -262,7 +261,7 @@ async def test_request_confirmed(
 ) -> None:
     """An APS-ack send resolves once the end-to-end APS ack arrives."""
     await api.request_confirmed(_send_aps(aps_ack=True))
-    assert transport.sent(p.SendUnicast)[-1].aps_seq == 55
+    assert transport.sent(p.SendUnicast)[-1].aps_ack
 
 
 async def test_cancel_on_abandon(

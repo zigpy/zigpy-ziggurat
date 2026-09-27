@@ -668,7 +668,6 @@ async def test_send_packet_unicast(
     assert not send.aps_encryption
     assert not send.sleepy_destination
     assert send.profile_id == 0x0104
-    assert send.aps_seq == 33
     assert send.radius == 30
     assert send.priority == 0
     assert bytes(send.asdu) == b"\x01\x02\x03"
@@ -750,7 +749,6 @@ async def test_send_packet_broadcast(
     send = server.sent(p.SendBroadcast)[-1]
     assert send.destination == t.NWK(0xFFFC)
     assert send.dst_ep == 255
-    assert send.aps_seq == 33
     assert bytes(send.asdu) == b"\x01\x02\x03"
 
 
@@ -766,7 +764,6 @@ async def test_send_packet_groupcast(
 
     send = server.sent(p.SendGroupcast)[-1]
     assert send.group_id == 0x0002
-    assert send.aps_seq == 33
     assert bytes(send.asdu) == b"\x01\x02\x03"
 
 
