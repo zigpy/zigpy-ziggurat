@@ -16,7 +16,6 @@ requires-python = ">=3.12"
 dependencies = [
     "zigpy",
     "aiohttp",
-    "mashumaro",
     "aiospinel>=1.2.0",
 ]
 
