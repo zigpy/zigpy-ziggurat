@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 import logging
 import math
 import os
@@ -156,7 +156,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             url
         )
 
-        self._start_time = datetime.now(timezone.utc)
+        self._start_time = datetime.now(UTC)
 
     def _register_coordinator_device(self) -> None:
         coordinator = ZigguratCoordinator(
@@ -435,7 +435,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         ):
             packet = cast(p.CapturedPacket, packet)
             yield t.CapturedPacket(
-                timestamp=datetime.now(timezone.utc),
+                timestamp=datetime.now(UTC),
                 rssi=packet.rssi,
                 lqi=packet.lqi,
                 channel=packet.channel,
@@ -868,8 +868,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 # stack to reduce routing congestion
                 if device is not None and (
                     self._start_time is None
-                    or datetime.now(timezone.utc) - self._start_time
-                    < ROUTE_HINT_DURATION
+                    or datetime.now(UTC) - self._start_time < ROUTE_HINT_DURATION
                 ):
                     maybe_relays = self.build_source_route_to(device)
 
