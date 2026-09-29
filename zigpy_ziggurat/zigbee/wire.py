@@ -272,12 +272,16 @@ class SendUnicastPayload(t.Struct):
     priority: t.int8s
     route: RouteControl
     next_hop: t.NWK = t.StructField(  # type: ignore[assignment]
-        requires=lambda s: cast(SendUnicastPayload, s).route
-        in (RouteControl.HINT_NEXT_HOP, RouteControl.FORCE_NEXT_HOP)
+        requires=lambda s: (
+            cast(SendUnicastPayload, s).route
+            in (RouteControl.HINT_NEXT_HOP, RouteControl.FORCE_NEXT_HOP)
+        )
     )
     relays: SourceRouteRelays = t.StructField(  # type: ignore[assignment]
-        requires=lambda s: cast(SendUnicastPayload, s).route
-        in (RouteControl.HINT_SOURCE_ROUTE, RouteControl.FORCE_SOURCE_ROUTE)
+        requires=lambda s: (
+            cast(SendUnicastPayload, s).route
+            in (RouteControl.HINT_SOURCE_ROUTE, RouteControl.FORCE_SOURCE_ROUTE)
+        )
     )
     asdu: t.LongOctetString
 

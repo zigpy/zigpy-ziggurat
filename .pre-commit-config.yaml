@@ -1,14 +1,14 @@
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.6.2
+    rev: v0.16.9
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: ["--fix", "--exit-non-zero-on-fix", "--config", "pyproject.toml"]
       - id: ruff-format
         args: ["--config", "pyproject.toml"]
 
   - repo: https://github.com/codespell-project/codespell
-    rev: v2.3.0
+    rev: v2.4.3
     hooks:
       - id: codespell
         additional_dependencies: [tomli]
@@ -18,7 +18,7 @@ repos:
     hooks:
       - id: mypy
         name: mypy
-        entry: uv run --frozen mypy
+        entry: uv run --frozen --group testing mypy
         language: system
         types_or: [python, pyi]
         require_serial: true
