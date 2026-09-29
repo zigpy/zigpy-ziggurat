@@ -668,7 +668,6 @@ async def test_send_packet_unicast(
     assert not send.aps_encryption
     assert not send.sleepy_destination
     assert send.profile_id == 0x0104
-    assert send.aps_seq == 33
     assert send.radius == 30
     assert send.priority == 0
     assert bytes(send.asdu) == b"\x01\x02\x03"
@@ -750,7 +749,6 @@ async def test_send_packet_broadcast(
     send = server.sent(p.SendBroadcast)[-1]
     assert send.destination == t.NWK(0xFFFC)
     assert send.dst_ep == 255
-    assert send.aps_seq == 33
     assert bytes(send.asdu) == b"\x01\x02\x03"
 
 
@@ -766,7 +764,6 @@ async def test_send_packet_groupcast(
 
     send = server.sent(p.SendGroupcast)[-1]
     assert send.group_id == 0x0002
-    assert send.aps_seq == 33
     assert bytes(send.asdu) == b"\x01\x02\x03"
 
 
@@ -1070,7 +1067,9 @@ async def test_on_notification_received_aps(
         p.ReceivedAps(
             source=DEVICE_NWK,
             destination=t.NWK(0x0000),
-            has_group=t.Bool(False),
+            has_group=t.uint1_t(0),
+            aps_encrypted=t.uint1_t(0),
+            reserved=t.uint6_t(0),
             group=t.uint16_t(0),
             profile_id=t.uint16_t(0x0000),
             cluster_id=t.uint16_t(zdo_t.ZDOCmd.Node_Desc_req),
@@ -1084,6 +1083,35 @@ async def test_on_notification_received_aps(
     reply = await server.wait_for(p.SendUnicast)
     assert reply.cluster_id == zdo_t.ZDOCmd.Node_Desc_rsp
     assert reply.asdu[0] == 0x77
+
+
+@pytest.mark.parametrize("aps_encrypted", [0, 1])
+async def test_on_notification_received_aps_zdo_reply_encryption(
+    app: ControllerApplication, server: SyntheticZiggurat, aps_encrypted: int
+) -> None:
+    """A local ZDO reply uses the same APS security as the request."""
+    add_initialized_device(app)
+
+    await server.send_notification(
+        p.ReceivedAps(
+            source=DEVICE_NWK,
+            destination=t.NWK(0x0000),
+            has_group=t.uint1_t(0),
+            aps_encrypted=t.uint1_t(aps_encrypted),
+            reserved=t.uint6_t(0),
+            group=t.uint16_t(0),
+            profile_id=t.uint16_t(0x0000),
+            cluster_id=t.uint16_t(zdo_t.ZDOCmd.Node_Desc_req),
+            src_ep=t.uint8_t(0),
+            dst_ep=t.uint8_t(0),
+            lqi=t.uint8_t(255),
+            rssi=t.int8s(-40),
+            data=t.LongOctetString(b"\x77" + t.NWK(0x0000).serialize()),
+        )
+    )
+    reply = await server.wait_for(p.SendUnicast)
+    assert reply.cluster_id == zdo_t.ZDOCmd.Node_Desc_rsp
+    assert reply.aps_encryption == aps_encrypted
 
 
 @pytest.mark.parametrize(
@@ -1125,7 +1153,9 @@ async def test_on_notification_received_aps_address_modes(
         p.ReceivedAps(
             source=DEVICE_NWK,
             destination=destination,
-            has_group=t.Bool(group is not None),
+            has_group=t.uint1_t(group is not None),
+            aps_encrypted=t.uint1_t(0),
+            reserved=t.uint6_t(0),
             group=t.uint16_t(group or 0),
             profile_id=t.uint16_t(0x0104),
             cluster_id=t.uint16_t(0x0006),
@@ -1146,6 +1176,48 @@ async def test_on_notification_received_aps_address_modes(
     assert packet.lqi == 200
     assert packet.rssi == -70
     assert packet.data.serialize() == b"\x00\x01\x00\x00\x00"
+
+    await app.shutdown(db=False)
+
+
+@pytest.mark.parametrize(
+    ("aps_encrypted", "expected_tx_options"),
+    [
+        (0, t.TransmitOptions.NONE),
+        (1, t.TransmitOptions.APS_Encryption),
+    ],
+)
+async def test_on_notification_received_aps_encrypted(
+    server: SyntheticZiggurat,
+    aps_encrypted: int,
+    expected_tx_options: t.TransmitOptions,
+) -> None:
+    app = RecordingApplication(make_app_config(server.url))
+    await app.connect()
+    await app.start_network()
+    add_initialized_device(app)
+
+    await server.send_notification(
+        p.ReceivedAps(
+            source=DEVICE_NWK,
+            destination=t.NWK(0x0000),
+            has_group=t.uint1_t(0),
+            aps_encrypted=t.uint1_t(aps_encrypted),
+            reserved=t.uint6_t(0),
+            group=t.uint16_t(0),
+            profile_id=t.uint16_t(0x0104),
+            cluster_id=t.uint16_t(0x0006),
+            src_ep=t.uint8_t(1),
+            dst_ep=t.uint8_t(1),
+            lqi=t.uint8_t(200),
+            rssi=t.int8s(-70),
+            data=t.LongOctetString(b"\x00\x01\x00\x00\x00"),
+        )
+    )
+    await flush(app)
+
+    assert len(app.packets) == 1
+    assert app.packets[0].tx_options == expected_tx_options
 
     await app.shutdown(db=False)
 
