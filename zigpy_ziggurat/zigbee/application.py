@@ -594,6 +594,9 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         except KeyError:
             return
 
+        # A device found by its network address is never a GPD
+        assert isinstance(device, zigpy.device.ZigbeeDevice)
+
         try:
             hdr, args = device.zdo.deserialize(
                 packet.cluster_id, packet.data.serialize()
@@ -890,7 +893,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
                 # Within the network startup period, provide route hints to the
                 # stack to reduce routing congestion
-                if device is not None and (
+                if isinstance(device, zigpy.device.ZigbeeDevice) and (
                     self._start_time is None
                     or datetime.now(timezone.utc) - self._start_time
                     < ROUTE_HINT_DURATION

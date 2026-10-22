@@ -59,6 +59,12 @@ class RecordingApplication(ControllerApplication):
         super().gp_packet_received(packet)
 
 
+def coordinator_device(app: ControllerApplication) -> zigpy.device.ZigbeeDevice:
+    device = app.get_device(nwk=t.NWK(0x0000))
+    assert isinstance(device, zigpy.device.ZigbeeDevice)
+    return device
+
+
 def add_initialized_device(
     app: ControllerApplication,
     ieee: t.EUI64 = DEVICE_IEEE,
@@ -66,7 +72,7 @@ def add_initialized_device(
 ) -> zigpy.device.Device:
     """An initialized device: zigpy does not interview it when packets arrive."""
     device = app.add_device(ieee, nwk)
-    device.node_desc = app.get_device(nwk=t.NWK(0x0000)).node_desc
+    device.node_desc = coordinator_device(app).node_desc
     device.status = zigpy.device.Status.ENDPOINTS_INIT
     device.add_endpoint(1).status = zigpy.endpoint.Status.ZDO_INIT
     return device
@@ -155,7 +161,7 @@ async def test_start_network(
 ) -> None:
     await connected_app.start_network()
 
-    coordinator = connected_app.get_device(nwk=t.NWK(0x0000))
+    coordinator = coordinator_device(connected_app)
     assert isinstance(coordinator, ZigguratCoordinator)
     assert coordinator.ieee == COORDINATOR_IEEE
     assert coordinator.node_desc is not None
@@ -205,7 +211,7 @@ async def test_start_network_applies_tunables(
 
 
 async def test_coordinator_device(app: ControllerApplication) -> None:
-    coordinator = app.get_device(nwk=t.NWK(0x0000))
+    coordinator = coordinator_device(app)
     coordinator.manufacturer = "ignored"
     coordinator.model = "ignored"
     assert coordinator.manufacturer == "Ziggurat"
@@ -932,7 +938,7 @@ async def test_add_endpoint(
         )
     )
 
-    endpoint = app.get_device(nwk=t.NWK(0x0000)).endpoints[12]
+    endpoint = coordinator_device(app).endpoints[12]
     assert isinstance(endpoint, zigpy.endpoint.Endpoint)
     assert endpoint.profile_id == 0x0104
     assert 0x0006 in endpoint.in_clusters
@@ -944,7 +950,7 @@ async def test_add_endpoint(
 
 async def test_force_remove(app: ControllerApplication) -> None:
     # A no-op: the server keeps no device registry of its own
-    await app.force_remove(app.get_device(nwk=t.NWK(0x0000)))
+    await app.force_remove(coordinator_device(app))
 
 
 async def test_reset_network_info(
@@ -1036,7 +1042,7 @@ async def test_packet_received_aqara_node_desc_override(
     app: ControllerApplication, server: SyntheticZiggurat
 ) -> None:
     our_nwk = t.NWK(0x0000).serialize()
-    coordinator = app.get_device(nwk=t.NWK(0x0000))
+    coordinator = coordinator_device(app)
     assert coordinator.node_desc is not None
     assert coordinator.node_desc.manufacturer_code == application_module.DEFAULT_MFG_ID
 
@@ -1353,7 +1359,7 @@ async def test_on_notification_device_joined(
     # A known, initialized device rejoining with a new address skips the delay
     ieee3 = t.EUI64.convert("cc:cc:cc:cc:cc:cc:cc:cc")
     device3 = app.add_device(ieee3, t.NWK(0x9999))
-    device3.node_desc = app.get_device(nwk=t.NWK(0x0000)).node_desc
+    device3.node_desc = coordinator_device(app).node_desc
     device3.status = zigpy.device.Status.ENDPOINTS_INIT
     await server.send_notification(joined(t.NWK(0x9AAA), ieee3))
     await flush(app)
