@@ -18,6 +18,7 @@ from zigpy.exceptions import DeliveryError, NetworkNotFormed
 import zigpy.state
 import zigpy.types as t
 import zigpy.zdo.types as zdo_t
+from zigpy.zgp.util import parse_gpdf
 
 from zigpy_ziggurat.config import CONF_TUNABLES, CONF_ZIGGURAT_CONFIG, CONFIG_SCHEMA
 from zigpy_ziggurat.zigbee import protocol as p
@@ -699,6 +700,8 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         match notification:
             case p.ReceivedAps():
                 self._handle_received_aps_command(notification)
+            case p.ReceivedGpdf():
+                self._handle_received_gpdf(notification)
             case p.FrameCounter():
                 _LOGGER.debug(
                     "NWK frame counter updated to %d", notification.frame_counter
@@ -797,6 +800,27 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             data=t.SerializableBytes(command.data),
         )
         self.packet_received(packet)
+
+    def _handle_received_gpdf(self, command: p.ReceivedGpdf) -> None:
+        try:
+            packet = parse_gpdf(
+                command.data,
+                ieee=command.source_ieee_or_none,
+                lqi=command.lqi,
+                rssi=command.rssi,
+            )
+        except ValueError:
+            _LOGGER.debug("Ignoring GPDF %r", command, exc_info=True)
+            return
+
+        # Without a security frame counter, duplicates are filtered by the MAC sequence
+        # number instead (spec A.3.6.1.2)
+        if packet.frame_counter is None:
+            packet = packet.replace(
+                frame_counter=t.uint32_t(command.mac_sequence_number)
+            )
+
+        self.gp_packet_received(packet)
 
     async def send_packet(self, packet: t.ZigbeePacket) -> None:
         dst = packet.dst

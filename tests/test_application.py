@@ -16,6 +16,7 @@ from zigpy.exceptions import DeliveryError, NetworkNotFormed
 import zigpy.state
 import zigpy.types as t
 import zigpy.zdo.types as zdo_t
+import zigpy.zgp as zgp
 
 from tests.common import (
     COORDINATOR_IEEE,
@@ -47,10 +48,15 @@ class RecordingApplication(ControllerApplication):
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__(config)
         self.packets: list[t.ZigbeePacket] = []
+        self.gp_packets: list[t.ZigbeeGpPacket] = []
 
     def packet_received(self, packet: t.ZigbeePacket) -> None:
         self.packets.append(packet)
         super().packet_received(packet)
+
+    def gp_packet_received(self, packet: t.ZigbeeGpPacket) -> None:
+        self.gp_packets.append(packet)
+        super().gp_packet_received(packet)
 
 
 def add_initialized_device(
@@ -1146,6 +1152,107 @@ async def test_on_notification_received_aps_address_modes(
     assert packet.lqi == 200
     assert packet.rssi == -70
     assert packet.data.serialize() == b"\x00\x01\x00\x00\x00"
+
+    await app.shutdown(db=False)
+
+
+@pytest.mark.parametrize(
+    ("gpdf", "source_ieee", "expected"),
+    [
+        # The spec's transmitted packet for SecurityLevel 0b10 (A.1.5.4.2.1) keeps its
+        # own frame counter and MIC, for zigpy to verify
+        (
+            "8C 10 21436587 02000000 20 CF787E72",
+            None,
+            [
+                t.ZigbeeGpPacket(
+                    application_id=zgp.ApplicationID.SrcID,
+                    src_id=zgp.SrcID(0x87654321),
+                    command_id=zgp.GPDCommandID.Off,
+                    payload=t.SerializableBytes(b""),
+                    frame_counter=t.uint32_t(2),
+                    security_level=zgp.SecurityLevel.FullFrameCounterAndMIC,
+                    security_key_type=None,
+                    security_status=zgp.SecurityStatus.Unprocessed,
+                    mic=t.uint32_t(0x727E78CF),
+                    auto_commissioning=False,
+                    rx_after_tx=False,
+                    individual_key=False,
+                    lqi=t.uint8_t(200),
+                    rssi=t.int8s(-70),
+                )
+            ],
+        ),
+        # An unprotected GPDF uses the MAC sequence number as its frame counter
+        (
+            "0C 44332211 22",
+            None,
+            [
+                t.ZigbeeGpPacket(
+                    application_id=zgp.ApplicationID.SrcID,
+                    src_id=zgp.SrcID(0x11223344),
+                    command_id=zgp.GPDCommandID.Toggle,
+                    payload=t.SerializableBytes(b""),
+                    frame_counter=t.uint32_t(0x37),
+                    security_level=zgp.SecurityLevel.NoSecurity,
+                    security_key_type=zgp.SecurityKeyType.NoKey,
+                    security_status=zgp.SecurityStatus.NoSecurity,
+                    auto_commissioning=False,
+                    rx_after_tx=False,
+                    lqi=t.uint8_t(200),
+                    rssi=t.int8s(-70),
+                )
+            ],
+        ),
+        # With ApplicationID 0b010, the GPD is identified by its MAC source address
+        (
+            "8C 02 01 22",
+            DEVICE_IEEE,
+            [
+                t.ZigbeeGpPacket(
+                    application_id=zgp.ApplicationID.IEEE,
+                    ieee=DEVICE_IEEE,
+                    endpoint=t.uint8_t(1),
+                    command_id=zgp.GPDCommandID.Toggle,
+                    payload=t.SerializableBytes(b""),
+                    frame_counter=t.uint32_t(0x37),
+                    security_level=zgp.SecurityLevel.NoSecurity,
+                    security_key_type=zgp.SecurityKeyType.NoKey,
+                    security_status=zgp.SecurityStatus.NoSecurity,
+                    auto_commissioning=False,
+                    rx_after_tx=False,
+                    lqi=t.uint8_t(200),
+                    rssi=t.int8s(-70),
+                )
+            ],
+        ),
+        # A GPDF sent to a GPD by a proxy is not for us
+        ("8C 80 44332211 F0", None, []),
+    ],
+)
+async def test_on_notification_received_gpdf(
+    server: SyntheticZiggurat,
+    gpdf: str,
+    source_ieee: t.EUI64 | None,
+    expected: list[t.ZigbeeGpPacket],
+) -> None:
+    app = RecordingApplication(make_app_config(server.url))
+    await app.connect()
+    await app.start_network()
+
+    await server.send_notification(
+        p.ReceivedGpdf(
+            mac_sequence_number=t.uint8_t(0x37),
+            has_source_ieee=t.Bool(source_ieee is not None),
+            source_ieee=source_ieee or t.EUI64.convert("00:00:00:00:00:00:00:00"),
+            lqi=t.uint8_t(200),
+            rssi=t.int8s(-70),
+            data=t.LongOctetString(bytes.fromhex(gpdf)),
+        )
+    )
+    await flush(app)
+
+    assert app.gp_packets == expected
 
     await app.shutdown(db=False)
 
