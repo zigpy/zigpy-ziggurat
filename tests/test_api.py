@@ -28,7 +28,6 @@ def _send_aps(*, aps_ack: bool) -> p.SendUnicast:
         cluster_id=0x0006,
         src_ep=1,
         dst_ep=1,
-        aps_seq=55,
         radius=30,
         priority=0,
         asdu=b"\x01\x02",
@@ -262,7 +261,7 @@ async def test_request_confirmed(
 ) -> None:
     """An APS-ack send resolves once the end-to-end APS ack arrives."""
     await api.request_confirmed(_send_aps(aps_ack=True))
-    assert transport.sent(p.SendUnicast)[-1].aps_seq == 55
+    assert transport.sent(p.SendUnicast)[-1].aps_ack
 
 
 async def test_cancel_on_abandon(
@@ -407,7 +406,9 @@ async def test_notifications(
         p.ReceivedAps(
             source=t.NWK(0xAB12),
             destination=t.NWK(0x0000),
-            has_group=t.Bool(False),
+            has_group=t.uint1_t(0),
+            aps_encrypted=t.uint1_t(0),
+            reserved=t.uint6_t(0),
             group=t.uint16_t(0),
             profile_id=t.uint16_t(0x0104),
             cluster_id=t.uint16_t(0x0006),

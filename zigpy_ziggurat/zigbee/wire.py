@@ -268,7 +268,7 @@ class SendUnicastPayload(t.Struct):
     cluster_id: t.uint16_t
     src_ep: t.uint8_t
     dst_ep: t.uint8_t
-    aps_seq: t.uint8_t
+    _aps_seq: t.uint8_t
     radius: t.uint8_t
     priority: t.int8s
     route: RouteControl
@@ -294,7 +294,7 @@ class SendBroadcastPayload(t.Struct):
     cluster_id: t.uint16_t
     src_ep: t.uint8_t
     dst_ep: t.uint8_t
-    aps_seq: t.uint8_t
+    _aps_seq: t.uint8_t
     radius: t.uint8_t
     priority: t.int8s
     asdu: t.LongOctetString
@@ -306,7 +306,7 @@ class SendGroupcastPayload(t.Struct):
     profile_id: t.uint16_t
     cluster_id: t.uint16_t
     src_ep: t.uint8_t
-    aps_seq: t.uint8_t
+    _aps_seq: t.uint8_t
     radius: t.uint8_t
     priority: t.int8s
     asdu: t.LongOctetString
@@ -394,7 +394,9 @@ class LastResetPayload(t.Struct):
 class ReceivedApsPayload(t.Struct):
     source: t.NWK
     destination: t.NWK
-    has_group: t.Bool
+    has_group: t.uint1_t
+    aps_encrypted: t.uint1_t
+    reserved: t.uint6_t
     group: t.uint16_t
     profile_id: t.uint16_t
     cluster_id: t.uint16_t
