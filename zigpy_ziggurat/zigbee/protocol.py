@@ -382,6 +382,12 @@ class BroadcastConfirm(Notification, wire.BroadcastConfirmPayload):
     pass
 
 
+class ReceivedGpdf(Notification, wire.ReceivedGpdfPayload):
+    @property
+    def source_ieee_or_none(self) -> t.EUI64 | None:
+        return self.source_ieee if self.has_source_ieee else None
+
+
 class DeviceJoined(Notification, wire.DeviceJoinedPayload):
     pass
 
@@ -437,6 +443,7 @@ NOTIFICATIONS: dict[NotificationCommand, type[Notification]] = {
     NotificationCommand.SEND_CONFIRM: SendConfirm,
     NotificationCommand.APS_ACK_CONFIRM: ApsAckConfirm,
     NotificationCommand.BROADCAST_CONFIRM: BroadcastConfirm,
+    NotificationCommand.RECEIVED_GPDF: ReceivedGpdf,
     NotificationCommand.DEVICE_JOINED: DeviceJoined,
     NotificationCommand.DEVICE_LEFT: DeviceLeft,
     NotificationCommand.FRAME_COUNTER: FrameCounter,

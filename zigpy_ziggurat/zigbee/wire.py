@@ -55,6 +55,7 @@ class NotificationCommand(t.enum8):
     SEND_CONFIRM = 0x11
     APS_ACK_CONFIRM = 0x12
     BROADCAST_CONFIRM = 0x13
+    RECEIVED_GPDF = 0x14
     DEVICE_JOINED = 0x20
     DEVICE_LEFT = 0x21
     FRAME_COUNTER = 0x30
@@ -399,6 +400,15 @@ class ReceivedApsPayload(t.Struct):
     cluster_id: t.uint16_t
     src_ep: t.uint8_t
     dst_ep: t.uint8_t
+    lqi: t.uint8_t
+    rssi: t.int8s
+    data: t.LongOctetString
+
+
+class ReceivedGpdfPayload(t.Struct):
+    mac_sequence_number: t.uint8_t
+    has_source_ieee: t.Bool
+    source_ieee: t.EUI64
     lqi: t.uint8_t
     rssi: t.int8s
     data: t.LongOctetString

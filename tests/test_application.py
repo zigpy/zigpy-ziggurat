@@ -16,6 +16,7 @@ from zigpy.exceptions import DeliveryError, NetworkNotFormed
 import zigpy.state
 import zigpy.types as t
 import zigpy.zdo.types as zdo_t
+import zigpy.zgp as zgp
 
 from tests.common import (
     COORDINATOR_IEEE,
@@ -47,10 +48,21 @@ class RecordingApplication(ControllerApplication):
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__(config)
         self.packets: list[t.ZigbeePacket] = []
+        self.gp_packets: list[t.ZigbeeGpPacket] = []
 
     def packet_received(self, packet: t.ZigbeePacket) -> None:
         self.packets.append(packet)
         super().packet_received(packet)
+
+    def gp_packet_received(self, packet: t.ZigbeeGpPacket) -> None:
+        self.gp_packets.append(packet)
+        super().gp_packet_received(packet)
+
+
+def coordinator_device(app: ControllerApplication) -> zigpy.device.ZigbeeDevice:
+    device = app.get_device(nwk=t.NWK(0x0000))
+    assert isinstance(device, zigpy.device.ZigbeeDevice)
+    return device
 
 
 def add_initialized_device(
@@ -60,7 +72,7 @@ def add_initialized_device(
 ) -> zigpy.device.Device:
     """An initialized device: zigpy does not interview it when packets arrive."""
     device = app.add_device(ieee, nwk)
-    device.node_desc = app.get_device(nwk=t.NWK(0x0000)).node_desc
+    device.node_desc = coordinator_device(app).node_desc
     device.status = zigpy.device.Status.ENDPOINTS_INIT
     device.add_endpoint(1).status = zigpy.endpoint.Status.ZDO_INIT
     return device
@@ -149,7 +161,7 @@ async def test_start_network(
 ) -> None:
     await connected_app.start_network()
 
-    coordinator = connected_app.get_device(nwk=t.NWK(0x0000))
+    coordinator = coordinator_device(connected_app)
     assert isinstance(coordinator, ZigguratCoordinator)
     assert coordinator.ieee == COORDINATOR_IEEE
     assert coordinator.node_desc is not None
@@ -199,7 +211,7 @@ async def test_start_network_applies_tunables(
 
 
 async def test_coordinator_device(app: ControllerApplication) -> None:
-    coordinator = app.get_device(nwk=t.NWK(0x0000))
+    coordinator = coordinator_device(app)
     coordinator.manufacturer = "ignored"
     coordinator.model = "ignored"
     assert coordinator.manufacturer == "Ziggurat"
@@ -926,7 +938,7 @@ async def test_add_endpoint(
         )
     )
 
-    endpoint = app.get_device(nwk=t.NWK(0x0000)).endpoints[12]
+    endpoint = coordinator_device(app).endpoints[12]
     assert isinstance(endpoint, zigpy.endpoint.Endpoint)
     assert endpoint.profile_id == 0x0104
     assert 0x0006 in endpoint.in_clusters
@@ -938,7 +950,7 @@ async def test_add_endpoint(
 
 async def test_force_remove(app: ControllerApplication) -> None:
     # A no-op: the server keeps no device registry of its own
-    await app.force_remove(app.get_device(nwk=t.NWK(0x0000)))
+    await app.force_remove(coordinator_device(app))
 
 
 async def test_reset_network_info(
@@ -1030,7 +1042,7 @@ async def test_packet_received_aqara_node_desc_override(
     app: ControllerApplication, server: SyntheticZiggurat
 ) -> None:
     our_nwk = t.NWK(0x0000).serialize()
-    coordinator = app.get_device(nwk=t.NWK(0x0000))
+    coordinator = coordinator_device(app)
     assert coordinator.node_desc is not None
     assert coordinator.node_desc.manufacturer_code == application_module.DEFAULT_MFG_ID
 
@@ -1150,6 +1162,107 @@ async def test_on_notification_received_aps_address_modes(
     await app.shutdown(db=False)
 
 
+@pytest.mark.parametrize(
+    ("gpdf", "source_ieee", "expected"),
+    [
+        # The spec's transmitted packet for SecurityLevel 0b10 (A.1.5.4.2.1) keeps its
+        # own frame counter and MIC, for zigpy to verify
+        (
+            "8C 10 21436587 02000000 20 CF787E72",
+            None,
+            [
+                t.ZigbeeGpPacket(
+                    application_id=zgp.ApplicationID.SrcID,
+                    src_id=zgp.SrcID(0x87654321),
+                    command_id=zgp.GPDCommandID.Off,
+                    payload=t.SerializableBytes(b""),
+                    frame_counter=t.uint32_t(2),
+                    security_level=zgp.SecurityLevel.FullFrameCounterAndMIC,
+                    security_key_type=None,
+                    security_status=zgp.SecurityStatus.Unprocessed,
+                    mic=t.uint32_t(0x727E78CF),
+                    auto_commissioning=False,
+                    rx_after_tx=False,
+                    individual_key=False,
+                    lqi=t.uint8_t(200),
+                    rssi=t.int8s(-70),
+                )
+            ],
+        ),
+        # An unprotected GPDF uses the MAC sequence number as its frame counter
+        (
+            "0C 44332211 22",
+            None,
+            [
+                t.ZigbeeGpPacket(
+                    application_id=zgp.ApplicationID.SrcID,
+                    src_id=zgp.SrcID(0x11223344),
+                    command_id=zgp.GPDCommandID.Toggle,
+                    payload=t.SerializableBytes(b""),
+                    frame_counter=t.uint32_t(0x37),
+                    security_level=zgp.SecurityLevel.NoSecurity,
+                    security_key_type=zgp.SecurityKeyType.NoKey,
+                    security_status=zgp.SecurityStatus.NoSecurity,
+                    auto_commissioning=False,
+                    rx_after_tx=False,
+                    lqi=t.uint8_t(200),
+                    rssi=t.int8s(-70),
+                )
+            ],
+        ),
+        # With ApplicationID 0b010, the GPD is identified by its MAC source address
+        (
+            "8C 02 01 22",
+            DEVICE_IEEE,
+            [
+                t.ZigbeeGpPacket(
+                    application_id=zgp.ApplicationID.IEEE,
+                    ieee=DEVICE_IEEE,
+                    endpoint=t.uint8_t(1),
+                    command_id=zgp.GPDCommandID.Toggle,
+                    payload=t.SerializableBytes(b""),
+                    frame_counter=t.uint32_t(0x37),
+                    security_level=zgp.SecurityLevel.NoSecurity,
+                    security_key_type=zgp.SecurityKeyType.NoKey,
+                    security_status=zgp.SecurityStatus.NoSecurity,
+                    auto_commissioning=False,
+                    rx_after_tx=False,
+                    lqi=t.uint8_t(200),
+                    rssi=t.int8s(-70),
+                )
+            ],
+        ),
+        # A GPDF sent to a GPD by a proxy is not for us
+        ("8C 80 44332211 F0", None, []),
+    ],
+)
+async def test_on_notification_received_gpdf(
+    server: SyntheticZiggurat,
+    gpdf: str,
+    source_ieee: t.EUI64 | None,
+    expected: list[t.ZigbeeGpPacket],
+) -> None:
+    app = RecordingApplication(make_app_config(server.url))
+    await app.connect()
+    await app.start_network()
+
+    await server.send_notification(
+        p.ReceivedGpdf(
+            mac_sequence_number=t.uint8_t(0x37),
+            has_source_ieee=t.Bool(source_ieee is not None),
+            source_ieee=source_ieee or t.EUI64.convert("00:00:00:00:00:00:00:00"),
+            lqi=t.uint8_t(200),
+            rssi=t.int8s(-70),
+            data=t.LongOctetString(bytes.fromhex(gpdf)),
+        )
+    )
+    await flush(app)
+
+    assert app.gp_packets == expected
+
+    await app.shutdown(db=False)
+
+
 async def test_on_notification_frame_counter(
     app: ControllerApplication, server: SyntheticZiggurat
 ) -> None:
@@ -1246,7 +1359,7 @@ async def test_on_notification_device_joined(
     # A known, initialized device rejoining with a new address skips the delay
     ieee3 = t.EUI64.convert("cc:cc:cc:cc:cc:cc:cc:cc")
     device3 = app.add_device(ieee3, t.NWK(0x9999))
-    device3.node_desc = app.get_device(nwk=t.NWK(0x0000)).node_desc
+    device3.node_desc = coordinator_device(app).node_desc
     device3.status = zigpy.device.Status.ENDPOINTS_INIT
     await server.send_notification(joined(t.NWK(0x9AAA), ieee3))
     await flush(app)
