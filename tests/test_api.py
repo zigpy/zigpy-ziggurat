@@ -488,11 +488,36 @@ async def test_connection_lost_fails_pending_requests(
     assert api.disconnects == [None]
 
 
+async def test_startup_hello_ignored(
+    api: RecordingApi, transport: SyntheticBinaryTransport
+) -> None:
+    async def start_then_reply(request: p.Request, request_id: int) -> None:
+        transport.notify(
+            p.NotificationCommand.HELLO,
+            0,
+            p.Hello(
+                protocol_version=t.uint8_t(p.PROTOCOL_VERSION),
+                configured=t.Bool(False),
+            ),
+        )
+        transport.ok(request.command, request_id)
+
+    # Embedded firmware starts its stack on the first host frame and announces it
+    # with a `hello` before the reply: that opens the session, it is not a reboot
+    transport.handlers[p.RequestCommand.RESET] = start_then_reply
+    assert await api.request(p.Reset(hard=t.Bool(False))) is None
+
+    assert api.disconnects == []
+    assert api.notifications == []
+
+
 async def test_hello_reported_as_disconnect(
     api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:
     async def withhold(request: p.Request, request_id: int) -> None:
         return None
+
+    assert await api.request(p.Shutdown()) is None
 
     transport.handlers[p.RequestCommand.SHUTDOWN] = withhold
     request = asyncio.ensure_future(api.request(p.Shutdown()))
