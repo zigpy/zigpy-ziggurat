@@ -407,13 +407,13 @@ class SyntheticSpinelRcp:
     def __init__(
         self,
         *,
-        get_prop_id: aiospinel.PackedUInt21 = PROP_VENDOR_ZIGGURAT,
-        set_prop_id: aiospinel.PackedUInt21 = PROP_VENDOR_ZIGGURAT,
+        get_status: aiospinel.Status | None = None,
+        set_status: aiospinel.Status | None = None,
     ) -> None:
         self.url = ""
         self.tunnel_writes: list[bytes] = []
-        self._get_prop_id = get_prop_id
-        self._set_prop_id = set_prop_id
+        self._get_status = get_status
+        self._set_status = set_status
         self._server: asyncio.Server | None = None
         self._writers: list[asyncio.StreamWriter] = []
 
@@ -456,12 +456,24 @@ class SyntheticSpinelRcp:
         frame = aiospinel.SpinelFrame.from_bytes(hdlc.data)
         tid = frame.header.transaction_id
         if frame.command_id == aiospinel.CommandID.PROP_VALUE_GET:
-            self._respond(writer, tid, self._get_prop_id.serialize())
+            self._respond_prop(writer, tid, self._get_status)
         elif frame.command_id == aiospinel.CommandID.PROP_VALUE_SET:
             _, rest = aiospinel.PackedUInt21.deserialize(frame.data)
             length = int.from_bytes(rest[:2], "little")
             self.tunnel_writes.append(rest[2 : 2 + length])
-            self._respond(writer, tid, self._set_prop_id.serialize())
+            self._respond_prop(writer, tid, self._set_status)
+
+    def _respond_prop(
+        self,
+        writer: asyncio.StreamWriter,
+        tid: int | None,
+        status: aiospinel.Status | None,
+    ) -> None:
+        if status is None:
+            data = aiospinel.PackedUInt21(PROP_VENDOR_ZIGGURAT).serialize()
+        else:
+            data = aiospinel.PropertyID.LAST_STATUS.serialize() + status.serialize()
+        self._respond(writer, tid, data)
 
     def _respond(
         self, writer: asyncio.StreamWriter, tid: int | None, data: bytes
@@ -477,7 +489,7 @@ class SyntheticSpinelRcp:
 
     async def push_stream_frame(self, payload: bytes) -> None:
         data = (
-            PROP_VENDOR_ZIGGURAT.serialize()
+            aiospinel.PackedUInt21(PROP_VENDOR_ZIGGURAT).serialize()
             + len(payload).to_bytes(2, "little")
             + payload
         )

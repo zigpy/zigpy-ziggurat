@@ -97,7 +97,7 @@ async def test_spinel_stream_frame_handler_error(
 
 
 async def test_spinel_connect_rejects_foreign_firmware() -> None:
-    rcp = SyntheticSpinelRcp(get_prop_id=aiospinel.PackedUInt21(0x0001))
+    rcp = SyntheticSpinelRcp(get_status=aiospinel.Status.PROP_NOT_FOUND)
     await rcp.start()
     try:
         with pytest.raises(ConnectionError, match="does not embed"):
@@ -107,11 +107,11 @@ async def test_spinel_connect_rejects_foreign_firmware() -> None:
 
 
 async def test_spinel_tunnel_write_rejected() -> None:
-    rcp = SyntheticSpinelRcp(set_prop_id=aiospinel.PackedUInt21(0x0001))
+    rcp = SyntheticSpinelRcp(set_status=aiospinel.Status.INVALID_ARGUMENT)
     await rcp.start()
     transport = await connect_transport(rcp.url, lambda frame: None, lambda exc: None)
     try:
-        with pytest.raises(ConnectionError, match="Tunnel write rejected"):
+        with pytest.raises(aiospinel.PropertyStatusError):
             await transport.send_frame(b"\x01")
     finally:
         await transport.disconnect()
