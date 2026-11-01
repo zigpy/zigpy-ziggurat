@@ -11,7 +11,16 @@ from typing import Any, TypeVar
 
 from aiohttp import web
 from aiohttp.test_utils import TestServer
-import aiospinel
+from aiospinel import (
+    CommandID,
+    HDLCLiteFrame,
+    HDLCSpecial,
+    PackedUInt21,
+    PropertyID,
+    SpinelFrame,
+    SpinelHeader,
+    Status,
+)
 import pytest
 import zigpy.config
 import zigpy.types as t
@@ -407,8 +416,8 @@ class SyntheticSpinelRcp:
     def __init__(
         self,
         *,
-        get_status: aiospinel.Status | None = None,
-        set_status: aiospinel.Status | None = None,
+        get_status: Status | None = None,
+        set_status: Status | None = None,
     ) -> None:
         self.url = ""
         self.tunnel_writes: list[bytes] = []
@@ -440,25 +449,21 @@ class SyntheticSpinelRcp:
                 break
             buffer += data
             while True:
-                chunk, flag, rest = buffer.partition(
-                    bytes([aiospinel.HDLCSpecial.FLAG])
-                )
+                chunk, flag, rest = buffer.partition(bytes([HDLCSpecial.FLAG]))
                 if not flag:
                     buffer = bytearray(chunk)
                     break
                 buffer = bytearray(rest)
                 if chunk:
-                    self._handle(aiospinel.HDLCLiteFrame.from_bytes(chunk), writer)
+                    self._handle(HDLCLiteFrame.from_bytes(chunk), writer)
 
-    def _handle(
-        self, hdlc: aiospinel.HDLCLiteFrame, writer: asyncio.StreamWriter
-    ) -> None:
-        frame = aiospinel.SpinelFrame.from_bytes(hdlc.data)
+    def _handle(self, hdlc: HDLCLiteFrame, writer: asyncio.StreamWriter) -> None:
+        frame = SpinelFrame.from_bytes(hdlc.data)
         tid = frame.header.transaction_id
-        if frame.command_id == aiospinel.CommandID.PROP_VALUE_GET:
+        if frame.command_id == CommandID.PROP_VALUE_GET:
             self._respond_prop(writer, tid, self._get_status)
-        elif frame.command_id == aiospinel.CommandID.PROP_VALUE_SET:
-            _, rest = aiospinel.PackedUInt21.deserialize(frame.data)
+        elif frame.command_id == CommandID.PROP_VALUE_SET:
+            _, rest = PackedUInt21.deserialize(frame.data)
             length = int.from_bytes(rest[:2], "little")
             self.tunnel_writes.append(rest[2 : 2 + length])
             self._respond_prop(writer, tid, self._set_status)
@@ -467,40 +472,36 @@ class SyntheticSpinelRcp:
         self,
         writer: asyncio.StreamWriter,
         tid: int | None,
-        status: aiospinel.Status | None,
+        status: Status | None,
     ) -> None:
         if status is None:
-            data = aiospinel.PackedUInt21(PROP_VENDOR_ZIGGURAT).serialize()
+            data = PackedUInt21(PROP_VENDOR_ZIGGURAT).serialize()
         else:
-            data = aiospinel.PropertyID.LAST_STATUS.serialize() + status.serialize()
+            data = PropertyID.LAST_STATUS.serialize() + status.serialize()
         self._respond(writer, tid, data)
 
     def _respond(
         self, writer: asyncio.StreamWriter, tid: int | None, data: bytes
     ) -> None:
-        frame = aiospinel.SpinelFrame(
-            header=aiospinel.SpinelHeader(
-                flag=0b10, network_link_id=0, transaction_id=tid
-            ),
-            command_id=aiospinel.CommandID.PROP_VALUE_IS,
+        frame = SpinelFrame(
+            header=SpinelHeader(flag=0b10, network_link_id=0, transaction_id=tid),
+            command_id=CommandID.PROP_VALUE_IS,
             data=data,
         )
-        writer.write(aiospinel.HDLCLiteFrame(data=frame.serialize()).serialize())
+        writer.write(HDLCLiteFrame(data=frame.serialize()).serialize())
 
     async def push_stream_frame(self, payload: bytes) -> None:
         data = (
-            aiospinel.PackedUInt21(PROP_VENDOR_ZIGGURAT).serialize()
+            PackedUInt21(PROP_VENDOR_ZIGGURAT).serialize()
             + len(payload).to_bytes(2, "little")
             + payload
         )
-        frame = aiospinel.SpinelFrame(
-            header=aiospinel.SpinelHeader(
-                flag=0b10, network_link_id=0, transaction_id=0
-            ),
-            command_id=aiospinel.CommandID.PROP_VALUE_IS,
+        frame = SpinelFrame(
+            header=SpinelHeader(flag=0b10, network_link_id=0, transaction_id=0),
+            command_id=CommandID.PROP_VALUE_IS,
             data=data,
         )
-        encoded = aiospinel.HDLCLiteFrame(data=frame.serialize()).serialize()
+        encoded = HDLCLiteFrame(data=frame.serialize()).serialize()
         for writer in self._writers:
             writer.write(encoded)
             await writer.drain()

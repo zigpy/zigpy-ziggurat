@@ -8,7 +8,7 @@ import logging
 from typing import Any, Protocol, cast
 
 import aiohttp
-import aiospinel
+from aiospinel import PropertyStatusError, SpinelProtocol
 import zigpy.serial
 
 _LOGGER = logging.getLogger(__name__)
@@ -56,7 +56,7 @@ async def connect_transport(
 # -- serial (Spinel tunnel) ------------------------------------------------------
 
 
-class _SpinelProtocol(aiospinel.SpinelProtocol):
+class _SpinelProtocol(SpinelProtocol):
     """Tunnels binary frames over the vendor Spinel stream property."""
 
     def __init__(self, on_frame: OnFrame, on_lost: OnLost) -> None:
@@ -82,10 +82,8 @@ class _SpinelProtocol(aiospinel.SpinelProtocol):
     async def start_ziggurat(self) -> None:
         try:
             await self.get_property(PROP_VENDOR_ZIGGURAT)
-        except aiospinel.PropertyStatusError as exc:
-            raise ConnectionError(
-                "Firmware does not embed the Ziggurat stack"
-            ) from exc
+        except PropertyStatusError as exc:
+            raise ConnectionError("Firmware does not embed the Ziggurat stack") from exc
         _LOGGER.debug("Embedded Ziggurat firmware detected")
 
     async def tunnel_send(self, frame: bytes) -> None:
