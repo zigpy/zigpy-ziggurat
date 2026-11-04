@@ -62,6 +62,11 @@ FRAME_COUNTER_RESTORE_MARGIN = 1000
 # How long route hints are supplied to the stack, to reduce startup churn.
 ROUTE_HINT_DURATION = timedelta(minutes=10)
 
+# How long an undelivered unicast's APS counter is kept for its retry. zigpy retries
+# within a fraction of a second, and a device forgets the counter after its duplicate
+# rejection window anyway.
+UNDELIVERED_APS_SEQ_LIFETIME = timedelta(seconds=15)
+
 
 def logistic(x: float, *, L: float = 1, x_0: float = 0, k: float = 1) -> float:
     """Logistic function."""
@@ -107,6 +112,9 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         super().__init__(config)
         self._api: ZigguratApi | None = None
         self._start_time: datetime | None = None
+        # The APS counter of each zigpy request whose last attempt was accepted but not
+        # delivered, and when it was stored. The oldest entries come first
+        self._undelivered_aps_seqs: dict[int, tuple[t.uint8_t, datetime]] = {}
 
     async def connect(self) -> None:
         # The device path is either the WebSocket URL of a ziggurat server or the
@@ -922,6 +930,27 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                         route_control = p.RouteControl.HINT_NEXT_HOP
                         next_hop = maybe_next_hop
 
+                # Clean up the APS sequence mapping to keep it from growing unbounded
+                now = datetime.now(UTC)
+                while self._undelivered_aps_seqs:
+                    oldest = next(iter(self._undelivered_aps_seqs))
+                    _, stored_at = self._undelivered_aps_seqs[oldest]
+
+                    if now - stored_at < UNDELIVERED_APS_SEQ_LIFETIME:
+                        break
+
+                    del self._undelivered_aps_seqs[oldest]
+
+                # A retry reuses the APS counter of the undelivered attempt before it,
+                # so a device that got the frame but lost its ack drops the retry as a
+                # duplicate
+                aps_seq = None
+                if (
+                    packet.attempt > 0
+                    and packet.request_id in self._undelivered_aps_seqs
+                ):
+                    aps_seq, _ = self._undelivered_aps_seqs.pop(packet.request_id)
+
                 send = p.SendUnicast.build(
                     destination=destination,
                     destination_eui64=destination_eui64,
@@ -940,6 +969,18 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     next_hop=next_hop,
                     relays=relays,
                     asdu=asdu,
+                    aps_seq=aps_seq,
                 )
 
-            await self._api.request_confirmed(send)
+            accepted, status = await self._api.request_confirmed(send)
+
+        if status == p.SendStatus.SUCCESS:
+            return
+
+        if packet.request_id is not None and isinstance(accepted, p.SendUnicastResult):
+            self._undelivered_aps_seqs[packet.request_id] = (
+                accepted.aps_seq,
+                datetime.now(UTC),
+            )
+
+        raise DeliveryError(f"Send failed: {status.name}")

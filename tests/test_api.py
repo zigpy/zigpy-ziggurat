@@ -12,6 +12,9 @@ import zigpy.types as t
 from zigpy_ziggurat.zigbee import api as api_module, protocol as p
 from zigpy_ziggurat.zigbee.api import ZigguratApi
 
+# The APS counter the fake firmware sends every unicast with
+_APS_SEQ = 0x42
+
 _Bytes = t.LVList[t.uint8_t, t.uint16_t]
 RequestT = TypeVar("RequestT", bound=p.Request)
 Handler = Callable[[p.Request, int], Awaitable[None]]
@@ -95,6 +98,13 @@ class SyntheticBinaryTransport:
         body = bytes([p.Status.OK]) + (payload.serialize() if payload else b"")
         self._on_frame(p.encode_reply(p.FrameType.RESPONSE, command, request_id, body))
 
+    def accept_unicast(self, request_id: int) -> None:
+        self.ok(
+            p.RequestCommand.SEND_UNICAST,
+            request_id,
+            p.SendUnicastResult(aps_seq=t.uint8_t(_APS_SEQ)),
+        )
+
     def error(
         self, command: p.RequestCommand, request_id: int, status: p.Status
     ) -> None:
@@ -158,7 +168,7 @@ class SyntheticBinaryTransport:
         self.ok(request.command, request_id, p.HwAddress(ieee=self.hw_ieee))
 
     async def _send_aps(self, request: p.Request, request_id: int) -> None:
-        self.ok(request.command, request_id)
+        self.accept_unicast(request_id)
         self.send_confirm(request_id)
         if request.aps_ack:  # type: ignore[attr-defined]
             self.aps_ack_confirm(request_id)
@@ -260,7 +270,9 @@ async def test_request_confirmed(
     api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:
     """An APS-ack send resolves once the end-to-end APS ack arrives."""
-    await api.request_confirmed(_send_aps(aps_ack=True))
+    accepted, status = await api.request_confirmed(_send_aps(aps_ack=True))
+    assert accepted == p.SendUnicastResult(aps_seq=t.uint8_t(_APS_SEQ))
+    assert status == p.SendStatus.SUCCESS
     assert transport.sent(p.SendUnicast)[-1].aps_ack
 
 
@@ -272,7 +284,7 @@ async def test_cancel_on_abandon(
 
     async def accept_only(request: p.Request, request_id: int) -> None:
         send_ids.append(request_id)
-        transport.ok(request.command, request_id)  # accepted, never confirmed
+        transport.accept_unicast(request_id)  # accepted, never confirmed
 
     transport.handlers[p.RequestCommand.SEND_UNICAST] = accept_only
 
@@ -303,7 +315,7 @@ async def test_cancel_on_timeout(
 
     async def accept_only(request: p.Request, request_id: int) -> None:
         send_ids.append(request_id)
-        transport.ok(request.command, request_id)  # accepted, never confirmed
+        transport.accept_unicast(request_id)  # accepted, never confirmed
 
     transport.handlers[p.RequestCommand.SEND_UNICAST] = accept_only
 
@@ -326,7 +338,7 @@ async def test_cancel_skipped_while_closing(
 
     async def accept_only(request: p.Request, request_id: int) -> None:
         send_ids.append(request_id)
-        transport.ok(request.command, request_id)  # accepted, never confirmed
+        transport.accept_unicast(request_id)  # accepted, never confirmed
 
     transport.handlers[p.RequestCommand.SEND_UNICAST] = accept_only
 
@@ -376,14 +388,16 @@ async def test_request_confirmed_failure(
     """The frame is handed off but the end-to-end APS ack never arrives."""
 
     async def ack_timeout(request: p.Request, request_id: int) -> None:
-        transport.ok(request.command, request_id)
+        transport.accept_unicast(request_id)
         transport.send_confirm(request_id, status=p.SendStatus.SUCCESS)
         transport.aps_ack_confirm(request_id, status=p.SendStatus.APS_ACK_TIMEOUT)
 
     transport.handlers[p.RequestCommand.SEND_UNICAST] = ack_timeout
 
-    with pytest.raises(DeliveryError, match="APS_ACK_TIMEOUT"):
-        await api.request_confirmed(_send_aps(aps_ack=True))
+    # The failure comes back with the accept response, which a retry needs
+    accepted, status = await api.request_confirmed(_send_aps(aps_ack=True))
+    assert accepted == p.SendUnicastResult(aps_seq=t.uint8_t(_APS_SEQ))
+    assert status == p.SendStatus.APS_ACK_TIMEOUT
 
 
 async def test_request_stream(
@@ -562,13 +576,13 @@ async def test_confirmed_send_delivery_failure(
     api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:
     async def failed_confirm(request: p.Request, request_id: int) -> None:
-        transport.ok(request.command, request_id)
+        transport.accept_unicast(request_id)
         transport.send_confirm(request_id, status=p.SendStatus.ROUTE_DISCOVERY_TIMEOUT)
 
     transport.handlers[p.RequestCommand.SEND_UNICAST] = failed_confirm
 
-    with pytest.raises(DeliveryError, match="ROUTE_DISCOVERY_TIMEOUT"):
-        await api.request_confirmed(_send_aps(aps_ack=False))
+    _, status = await api.request_confirmed(_send_aps(aps_ack=False))
+    assert status == p.SendStatus.ROUTE_DISCOVERY_TIMEOUT
 
 
 async def test_connection_lost_fails_pending_confirm(
@@ -576,7 +590,7 @@ async def test_connection_lost_fails_pending_confirm(
 ) -> None:
     async def accept_only(request: p.Request, request_id: int) -> None:
         # Accept the send but never confirm, leaving a pending confirmation.
-        transport.ok(request.command, request_id)
+        transport.accept_unicast(request_id)
 
     transport.handlers[p.RequestCommand.SEND_UNICAST] = accept_only
 

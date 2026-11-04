@@ -98,6 +98,7 @@ class SyntheticZiggurat:
         self.route_table: list[p.RouteEntry] = []
         self.beacons: list[p.Beacon] = []
         self.captured_packets: list[p.CapturedPacket] = []
+        self._aps_seq = 0
         self.handlers: dict[p.RequestCommand, Handler] = {
             p.RequestCommand.RESET: self.on_empty_ok,
             p.RequestCommand.SHUTDOWN: self.on_empty_ok,
@@ -287,7 +288,16 @@ class SyntheticZiggurat:
             p.RequestCommand.SCAN_ROUTE_TABLE, request_id, self.route_table
         )
 
-    async def on_send_unicast(self, request: p.SendUnicast, request_id: int) -> None:
+    def assign_aps_seq(self, request: p.SendUnicast) -> t.uint8_t:
+        """The APS counter a unicast is sent with: the forced one, or the next one."""
+        if request.force_aps_seq:
+            return request.aps_seq
+        self._aps_seq = (self._aps_seq + 1) % 256
+        return t.uint8_t(self._aps_seq)
+
+    async def on_send_unicast(
+        self, request: p.SendUnicast, request_id: int
+    ) -> p.SendUnicastResult:
         # The local handoff is terminal for a no-ack unicast; an ack-requested one
         # is only confirmed by the end-to-end APS ack that follows.
         await self.send_notification(
@@ -297,7 +307,7 @@ class SyntheticZiggurat:
             await self.send_notification(
                 p.ApsAckConfirm(status=p.SendStatus.SUCCESS), request_id
             )
-        return None
+        return p.SendUnicastResult(aps_seq=self.assign_aps_seq(request))
 
     async def on_send_broadcast(
         self, request: p.SendBroadcast, request_id: int
