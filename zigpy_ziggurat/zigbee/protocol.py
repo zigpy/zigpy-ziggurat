@@ -96,6 +96,10 @@ class CancelResult(Response, wire.CancelResultPayload):
     pass
 
 
+class SendUnicastResult(Response, wire.SendUnicastResultPayload):
+    pass
+
+
 class EnergyResult(Response, wire.EnergyResultPayload):
     pass
 
@@ -190,6 +194,7 @@ class ScanRouteTable(Request):
 
 class SendUnicast(Request, wire.SendUnicastPayload):
     command = RequestCommand.SEND_UNICAST
+    response = SendUnicastResult
 
     @classmethod
     def build(
@@ -210,13 +215,15 @@ class SendUnicast(Request, wire.SendUnicastPayload):
         route_control: RouteControl = RouteControl.STACK_DECIDES,
         next_hop: t.NWK | None = None,
         relays: list[t.NWK] | None = None,
+        aps_seq: int | None = None,
     ) -> SendUnicast:
         return cls(
             has_eui64=t.uint1_t(destination_eui64 is not None),
             aps_ack=t.uint1_t(aps_ack),
             aps_encryption=t.uint1_t(aps_encryption),
             sleepy_destination=t.uint1_t(sleepy_destination),
-            reserved=t.uint4_t(0),
+            force_aps_seq=t.uint1_t(aps_seq is not None),
+            reserved=t.uint3_t(0),
             # 0xFFFE stands in for "no short address"; the firmware resolves the EUI64.
             destination=destination if destination is not None else t.NWK(0xFFFE),
             destination_eui64=destination_eui64 or t.EUI64([0] * 8),
@@ -224,7 +231,8 @@ class SendUnicast(Request, wire.SendUnicastPayload):
             cluster_id=t.uint16_t(cluster_id),
             src_ep=t.uint8_t(src_ep),
             dst_ep=t.uint8_t(dst_ep),
-            _aps_seq=t.uint8_t(0),
+            # `aps_seq` sends with an earlier send's APS counter instead of a fresh one
+            aps_seq=t.uint8_t(aps_seq if aps_seq is not None else 0),
             radius=t.uint8_t(radius),
             priority=t.int8s(priority),
             route=route_control,

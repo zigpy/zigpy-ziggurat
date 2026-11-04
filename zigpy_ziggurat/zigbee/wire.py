@@ -261,14 +261,15 @@ class SendUnicastPayload(t.Struct):
     aps_ack: t.uint1_t
     aps_encryption: t.uint1_t
     sleepy_destination: t.uint1_t
-    reserved: t.uint4_t
+    force_aps_seq: t.uint1_t
+    reserved: t.uint3_t
     destination: t.NWK
     destination_eui64: t.EUI64
     profile_id: t.uint16_t
     cluster_id: t.uint16_t
     src_ep: t.uint8_t
     dst_ep: t.uint8_t
-    _aps_seq: t.uint8_t
+    aps_seq: t.uint8_t
     radius: t.uint8_t
     priority: t.int8s
     route: RouteControl
@@ -285,6 +286,10 @@ class SendUnicastPayload(t.Struct):
         )
     )
     asdu: t.LongOctetString
+
+
+class SendUnicastResultPayload(t.Struct):
+    aps_seq: t.uint8_t
 
 
 class SendBroadcastPayload(t.Struct):
@@ -430,6 +435,7 @@ class SendStatus(t.enum8):
     FRAME_BUDGET_EXHAUSTED = 10
     CANCELLED = 11
     RADIO_ERROR = 12
+    HANDOFF_TIMEOUT = 13
 
 
 class SendConfirmPayload(t.Struct):
