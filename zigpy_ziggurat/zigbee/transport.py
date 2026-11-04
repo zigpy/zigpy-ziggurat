@@ -8,14 +8,14 @@ import logging
 from typing import Any, Protocol, cast
 
 import aiohttp
-import aiospinel
+from aiospinel import PropertyStatusError, SpinelProtocol
 import zigpy.serial
 
 _LOGGER = logging.getLogger(__name__)
 
 WEBSOCKET_HEARTBEAT = 15
 
-PROP_VENDOR_ZIGGURAT = aiospinel.PackedUInt21(0x3D5A)
+PROP_VENDOR_ZIGGURAT = 0x3D5A
 
 # The callback the API installs to receive a device -> host binary frame.
 OnFrame = Callable[[bytes], None]
@@ -56,7 +56,7 @@ async def connect_transport(
 # -- serial (Spinel tunnel) ------------------------------------------------------
 
 
-class _SpinelProtocol(aiospinel.SpinelProtocol):
+class _SpinelProtocol(SpinelProtocol):
     """Tunnels binary frames over the vendor Spinel stream property."""
 
     def __init__(self, on_frame: OnFrame, on_lost: OnLost) -> None:
@@ -80,32 +80,18 @@ class _SpinelProtocol(aiospinel.SpinelProtocol):
             _LOGGER.exception("Failed to handle frame: %r", data)
 
     async def start_ziggurat(self) -> None:
-        rsp = await self.send_command(
-            aiospinel.CommandID.PROP_VALUE_GET,
-            PROP_VENDOR_ZIGGURAT.serialize(),
-        )
-        prop_id, _ = aiospinel.PackedUInt21.deserialize(rsp.data)
-        if prop_id != PROP_VENDOR_ZIGGURAT:
-            raise ConnectionError(
-                f"Firmware does not embed the Ziggurat stack: {rsp!r}"
-            )
+        try:
+            await self.get_property(PROP_VENDOR_ZIGGURAT)
+        except PropertyStatusError as exc:
+            raise ConnectionError("Firmware does not embed the Ziggurat stack") from exc
         _LOGGER.debug("Embedded Ziggurat firmware detected")
 
     async def tunnel_send(self, frame: bytes) -> None:
         # No retries: a timed-out tunnel write must not resend the request (the first
         # copy may already have been processed).
-        rsp = await self.send_command(
-            aiospinel.CommandID.PROP_VALUE_SET,
-            (
-                PROP_VENDOR_ZIGGURAT.serialize()
-                + len(frame).to_bytes(2, "little")
-                + frame
-            ),
-            retries=0,
+        await self.set_property(
+            PROP_VENDOR_ZIGGURAT, len(frame).to_bytes(2, "little") + frame, retries=0
         )
-        prop_id, _ = aiospinel.PackedUInt21.deserialize(rsp.data)
-        if prop_id != PROP_VENDOR_ZIGGURAT:
-            raise ConnectionError(f"Tunnel write rejected: {rsp!r}")
 
 
 class SpinelTransport:
@@ -141,8 +127,7 @@ class SpinelTransport:
 
     async def disconnect(self) -> None:
         if self._protocol is not None:
-            self._protocol.close()
-            await self._protocol.wait_until_closed()
+            await self._protocol.disconnect()
             self._protocol = None
 
     async def send_frame(self, frame: bytes) -> None:
