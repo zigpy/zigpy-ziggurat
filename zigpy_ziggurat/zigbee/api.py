@@ -56,6 +56,7 @@ class ZigguratApi:
         ] = {}
         self._awaiting_aps_ack: set[int] = set()
         self._transport: Transport | None = None
+        self._received_frame = False
 
     async def connect(self) -> None:
         self._transport = await connect_transport(
@@ -201,6 +202,8 @@ class ZigguratApi:
             _LOGGER.debug("Received notification (id=%d): %r", request_id, notification)
             self._handle_notification(request_id, notification)
 
+        self._received_frame = True
+
     def _handle_response(self, request_id: int, body: bytes) -> None:
         pending = self._pending.get(request_id)
         if pending is None or pending.response.done():
@@ -261,7 +264,11 @@ class ZigguratApi:
             if confirm is not None and not confirm.done():
                 confirm.set_result(notification)
         elif isinstance(notification, p.Hello):
-            # The firmware only sends `hello` when it reboots
+            # Embedded firmware starts its stack on the first frame the host sends, and
+            # the stack announces itself before it answers. So a `hello` that opens the
+            # session is that start. Any later `hello` means the firmware rebooted.
+            if not self._received_frame:
+                return
             self._connection_lost(ConnectionError("Ziggurat firmware reset"))
         elif isinstance(notification, p.LastReset):
             logging.getLogger("ziggurat.fw").warning(
