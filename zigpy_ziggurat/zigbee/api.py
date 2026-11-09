@@ -131,7 +131,7 @@ class ZigguratApi:
             self._pending.pop(request_id, None)
 
     async def request_confirmed(
-        self, send: p.SendUnicast | p.SendBroadcast | p.SendGroupcast
+        self, send: p.SendUnicast | p.SendBroadcast | p.SendGroupcast | p.SendGpdf
     ) -> None:
         """Send and await the terminal confirmation."""
 
