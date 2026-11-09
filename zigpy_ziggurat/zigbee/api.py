@@ -158,7 +158,11 @@ class ZigguratApi:
             if not confirm.done() or confirm.cancelled():
                 await self._cancel_send(request_id)
 
-        if result.status != p.SendStatus.SUCCESS:
+        # The passive-ack quorum gives false negatives on small networks: the broadcast
+        # is usually delivered even when the quorum is not reached
+        if result.status == p.SendStatus.BROADCAST_QUORUM_NOT_REACHED:
+            _LOGGER.debug("Ignoring broadcast quorum failure (id=%d)", request_id)
+        elif result.status != p.SendStatus.SUCCESS:
             raise DeliveryError(f"Send failed: {result.status.name}")
 
     async def request_stream(

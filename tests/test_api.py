@@ -386,6 +386,36 @@ async def test_request_confirmed_failure(
         await api.request_confirmed(_send_aps(aps_ack=True))
 
 
+async def test_request_confirmed_broadcast_quorum_ignored(
+    api: RecordingApi, transport: SyntheticBinaryTransport
+) -> None:
+    """A broadcast that misses its passive-ack quorum is treated as delivered."""
+
+    async def quorum_not_reached(request: p.Request, request_id: int) -> None:
+        transport.ok(request.command, request_id)
+        transport.notify(
+            p.NotificationCommand.BROADCAST_CONFIRM,
+            request_id,
+            p.BroadcastConfirm(status=p.SendStatus.BROADCAST_QUORUM_NOT_REACHED),
+        )
+
+    transport.handlers[p.RequestCommand.SEND_BROADCAST] = quorum_not_reached
+
+    send = p.SendBroadcast.build(
+        destination=t.NWK(0xFFFC),
+        profile_id=0x0000,
+        cluster_id=0x0036,
+        src_ep=0,
+        dst_ep=0,
+        radius=30,
+        priority=0,
+        asdu=b"\x01\x00\x01",
+    )
+    await api.request_confirmed(send)
+
+    assert transport.sent(p.SendBroadcast) == [send]
+
+
 async def test_request_stream(
     api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:
