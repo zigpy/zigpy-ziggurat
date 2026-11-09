@@ -42,6 +42,7 @@ class RequestCommand(t.enum8):
     SET_NWK_UPDATE_ID = 0x36
     SET_PROVISIONAL_KEY = 0x37
     SET_TUNABLE = 0x38
+    SEND_GPDF = 0x39
     ENERGY_SCAN = 0x40
     NETWORK_SCAN = 0x41
     PACKET_CAPTURE = 0x42
@@ -310,6 +311,34 @@ class SendGroupcastPayload(t.Struct):
     radius: t.uint8_t
     priority: t.int8s
     asdu: t.LongOctetString
+
+
+class GpdfTargetKind(t.enum2):
+    SRC_ID = 0
+    IEEE = 1
+    MAINTENANCE = 2
+
+
+class SendGpdfPayload(t.Struct):
+    target: GpdfTargetKind
+    has_key: t.uint1_t
+    reserved: t.uint5_t
+    src_id: t.uint32_t = t.StructField(  # type: ignore[assignment]
+        requires=lambda s: cast(SendGpdfPayload, s).target in (GpdfTargetKind.SRC_ID,)
+    )
+    gpd_ieee: t.EUI64 = t.StructField(  # type: ignore[assignment]
+        requires=lambda s: cast(SendGpdfPayload, s).target in (GpdfTargetKind.IEEE,)
+    )
+    endpoint: t.uint8_t = t.StructField(  # type: ignore[assignment]
+        requires=lambda s: cast(SendGpdfPayload, s).target in (GpdfTargetKind.IEEE,)
+    )
+    channel: t.uint8_t
+    lifetime_ms: t.uint32_t
+    key: t.KeyData = t.StructField(  # type: ignore[assignment]
+        requires=lambda s: bool(cast(SendGpdfPayload, s).has_key)
+    )
+    command_id: t.uint8_t
+    payload: t.LVBytes
 
 
 class CancelRequestPayload(t.Struct):

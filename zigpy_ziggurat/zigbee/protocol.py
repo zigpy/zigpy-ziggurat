@@ -7,6 +7,7 @@ from typing import ClassVar
 
 from zigpy.exceptions import DeliveryError
 import zigpy.types as t
+from zigpy.zgp.types import SrcID
 
 from zigpy_ziggurat.zigbee import wire
 
@@ -293,6 +294,50 @@ class SendGroupcast(Request, wire.SendGroupcastPayload):
             radius=t.uint8_t(radius),
             priority=t.int8s(priority),
             asdu=t.LongOctetString(asdu),
+        )
+
+
+class SendGpdf(Request, wire.SendGpdfPayload):
+    command = RequestCommand.SEND_GPDF
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        target: SrcID | tuple[t.EUI64, int] | None,
+        command_id: int,
+        payload: bytes,
+        channel: int,
+        key: t.KeyData | None,
+        lifetime: timedelta,
+    ) -> SendGpdf:
+        src_id: t.uint32_t | None = None
+        gpd_ieee: t.EUI64 | None = None
+        endpoint: t.uint8_t | None = None
+
+        match target:
+            case None:
+                kind = wire.GpdfTargetKind.MAINTENANCE
+            case (ieee, ep):
+                kind = wire.GpdfTargetKind.IEEE
+                gpd_ieee = ieee
+                endpoint = t.uint8_t(ep)
+            case _:
+                kind = wire.GpdfTargetKind.SRC_ID
+                src_id = t.uint32_t(target)
+
+        return cls(
+            target=kind,
+            has_key=t.uint1_t(key is not None),
+            reserved=t.uint5_t(0),
+            src_id=src_id,
+            gpd_ieee=gpd_ieee,
+            endpoint=endpoint,
+            channel=t.uint8_t(channel),
+            lifetime_ms=t.uint32_t(lifetime // timedelta(milliseconds=1)),
+            key=key,
+            command_id=t.uint8_t(command_id),
+            payload=t.LVBytes(payload),
         )
 
 

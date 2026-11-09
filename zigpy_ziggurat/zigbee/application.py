@@ -18,6 +18,7 @@ from zigpy.exceptions import DeliveryError, NetworkNotFormed
 import zigpy.state
 import zigpy.types as t
 import zigpy.zdo.types as zdo_t
+from zigpy.zgp.types import GPDCommandID, SrcID
 from zigpy.zgp.util import parse_gpdf
 
 from zigpy_ziggurat.config import CONF_TUNABLES, CONF_ZIGGURAT_CONFIG, CONFIG_SCHEMA
@@ -835,6 +836,33 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             )
 
         self.gp_packet_received(packet)
+
+    async def _send_gpdf(
+        self,
+        *,
+        target: SrcID | tuple[t.EUI64, int] | None,
+        command_id: GPDCommandID,
+        payload: bytes,
+        channel: int,
+        key: t.KeyData | None,
+        lifetime: timedelta,
+    ) -> None:
+        # Ziggurat holds the GPDF until its GPD sends a GPDF with RxAfterTx, then sends
+        # it in the GPD's receive window
+        assert self._api is not None
+        _, status = await self._api.request_confirmed(
+            p.SendGpdf.build(
+                target=target,
+                command_id=command_id,
+                payload=payload,
+                channel=channel,
+                key=key,
+                lifetime=lifetime,
+            )
+        )
+
+        if status != p.SendStatus.SUCCESS:
+            raise DeliveryError(f"GPDF not sent: {status.name}")
 
     async def send_packet(self, packet: t.ZigbeePacket) -> None:
         dst = packet.dst
