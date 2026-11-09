@@ -430,6 +430,9 @@ class SendStatus(t.enum8):
     FRAME_BUDGET_EXHAUSTED = 10
     CANCELLED = 11
     RADIO_ERROR = 12
+    GPDF_EXPIRED = 14
+    GPDF_REPLACED = 15
+    GPDF_NO_KEY = 16
 
 
 class SendConfirmPayload(t.Struct):
