@@ -844,7 +844,6 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         command_id: GPDCommandID,
         payload: bytes,
         channel: int,
-        key: t.KeyData | None,
         lifetime: timedelta,
     ) -> None:
         # Ziggurat holds the GPDF until its GPD sends a GPDF with RxAfterTx, then sends
@@ -856,7 +855,6 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 command_id=command_id,
                 payload=payload,
                 channel=channel,
-                key=key,
                 lifetime=lifetime,
             )
         )
