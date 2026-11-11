@@ -308,7 +308,6 @@ class SendGpdf(Request, wire.SendGpdfPayload):
         command_id: int,
         payload: bytes,
         channel: int,
-        key: t.KeyData | None,
         lifetime: timedelta,
     ) -> SendGpdf:
         src_id: t.uint32_t | None = None
@@ -328,14 +327,12 @@ class SendGpdf(Request, wire.SendGpdfPayload):
 
         return cls(
             target=kind,
-            has_key=t.uint1_t(key is not None),
-            reserved=t.uint5_t(0),
+            reserved=t.uint6_t(0),
             src_id=src_id,
             gpd_ieee=gpd_ieee,
             endpoint=endpoint,
             channel=t.uint8_t(channel),
             lifetime_ms=t.uint32_t(lifetime // timedelta(milliseconds=1)),
-            key=key,
             command_id=t.uint8_t(command_id),
             payload=t.LVBytes(payload),
         )

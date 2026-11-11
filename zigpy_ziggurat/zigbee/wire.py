@@ -321,8 +321,7 @@ class GpdfTargetKind(t.enum2):
 
 class SendGpdfPayload(t.Struct):
     target: GpdfTargetKind
-    has_key: t.uint1_t
-    reserved: t.uint5_t
+    reserved: t.uint6_t
     src_id: t.uint32_t = t.StructField(  # type: ignore[assignment]
         requires=lambda s: cast(SendGpdfPayload, s).target in (GpdfTargetKind.SRC_ID,)
     )
@@ -334,9 +333,6 @@ class SendGpdfPayload(t.Struct):
     )
     channel: t.uint8_t
     lifetime_ms: t.uint32_t
-    key: t.KeyData = t.StructField(  # type: ignore[assignment]
-        requires=lambda s: bool(cast(SendGpdfPayload, s).has_key)
-    )
     command_id: t.uint8_t
     payload: t.LVBytes
 
@@ -461,7 +457,6 @@ class SendStatus(t.enum8):
     RADIO_ERROR = 12
     GPDF_EXPIRED = 14
     GPDF_REPLACED = 15
-    GPDF_NO_KEY = 16
 
 
 class SendConfirmPayload(t.Struct):

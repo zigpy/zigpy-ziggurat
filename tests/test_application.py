@@ -1157,7 +1157,6 @@ async def test_send_gpdf(
         command_id=zgp.types.GPDCommandID(0xFE),
         payload=b"\x00",
         channel=15,
-        key=t.KeyData(range(16)),
         lifetime=timedelta(seconds=20),
     )
 
@@ -1168,8 +1167,6 @@ async def test_send_gpdf(
     assert send.endpoint == endpoint
     assert send.channel == 15
     assert send.lifetime_ms == 20_000
-    assert send.has_key
-    assert send.key == t.KeyData(range(16))
     assert send.command_id == 0xFE
     assert bytes(send.payload) == b"\x00"
 
@@ -1190,7 +1187,6 @@ async def test_send_gpdf_not_sent(
             command_id=zgp.types.GPDCommandID(0xFE),
             payload=b"\x00",
             channel=15,
-            key=None,
             lifetime=timedelta(seconds=20),
         )
 
