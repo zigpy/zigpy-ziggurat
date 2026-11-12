@@ -471,6 +471,7 @@ async def test_write_network_info_restores_children(
     assert [entry.nwk for entry in entries] == list(nwk_addresses.values())
     # The backup carries no capability, so the device type is unknown
     assert {entry.device_type for entry in entries} == {p.ChildDeviceType.UNKNOWN}
+    assert {entry.rx_on_when_idle for entry in entries} == {0}
 
 
 async def test_permit_ncp(
