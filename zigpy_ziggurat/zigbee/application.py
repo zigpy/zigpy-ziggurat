@@ -547,7 +547,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             p.ChildEntry(
                 ieee=ieee,
                 nwk=network_info.nwk_addresses[ieee],
-                rx_on_when_idle=t.uint1_t(1),
+                rx_on_when_idle=t.uint1_t(0),
                 device_type=p.ChildDeviceType.UNKNOWN,
                 reserved=t.uint5_t(0),
             )
