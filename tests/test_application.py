@@ -933,6 +933,74 @@ async def test_send_packet_confirm_failure(
         )
 
 
+@pytest.mark.parametrize(
+    ("target", "kind", "src_id", "gpd_ieee", "endpoint"),
+    [
+        (
+            zgp.types.SrcID(0x12345678),
+            p.wire.GpdfTargetKind.SRC_ID,
+            0x12345678,
+            None,
+            None,
+        ),
+        (
+            (DEVICE_IEEE, 0x01),
+            p.wire.GpdfTargetKind.IEEE,
+            None,
+            DEVICE_IEEE,
+            0x01,
+        ),
+        (None, p.wire.GpdfTargetKind.MAINTENANCE, None, None, None),
+    ],
+)
+async def test_send_gpdf(
+    app: ControllerApplication,
+    server: SyntheticZiggurat,
+    target: zgp.types.SrcID | tuple[t.EUI64, int] | None,
+    kind: p.wire.GpdfTargetKind,
+    src_id: int | None,
+    gpd_ieee: t.EUI64 | None,
+    endpoint: int | None,
+) -> None:
+    await app.send_gpdf(
+        target=target,
+        command_id=zgp.types.GPDCommandID(0xFE),
+        payload=b"\x00",
+        channel=15,
+        lifetime=timedelta(seconds=20),
+    )
+
+    send = server.sent(p.SendGpdf)[-1]
+    assert send.target == kind
+    assert send.src_id == src_id
+    assert send.gpd_ieee == gpd_ieee
+    assert send.endpoint == endpoint
+    assert send.channel == 15
+    assert send.lifetime_ms == 20_000
+    assert send.command_id == 0xFE
+    assert bytes(send.payload) == b"\x00"
+
+
+async def test_send_gpdf_not_sent(
+    app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    async def expired(request: p.SendGpdf, request_id: int) -> None:
+        await server.send_notification(
+            p.SendConfirm(status=p.SendStatus.GPDF_EXPIRED), request_id
+        )
+
+    server.handlers[p.RequestCommand.SEND_GPDF] = expired
+
+    with pytest.raises(DeliveryError, match="GPDF_EXPIRED"):
+        await app.send_gpdf(
+            target=zgp.types.SrcID(0x12345678),
+            command_id=zgp.types.GPDCommandID(0xFE),
+            payload=b"\x00",
+            channel=15,
+            lifetime=timedelta(seconds=20),
+        )
+
+
 async def test_add_endpoint(
     app: ControllerApplication, server: SyntheticZiggurat
 ) -> None:

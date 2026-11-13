@@ -118,6 +118,7 @@ class SyntheticZiggurat:
             p.RequestCommand.SEND_UNICAST: self.on_send_unicast,
             p.RequestCommand.SEND_BROADCAST: self.on_send_broadcast,
             p.RequestCommand.SEND_GROUPCAST: self.on_send_groupcast,
+            p.RequestCommand.SEND_GPDF: self.on_send_gpdf,
             p.RequestCommand.CANCEL_REQUEST: self.on_cancel_request,
             p.RequestCommand.PERMIT_JOINS: self.on_empty_ok,
             p.RequestCommand.SET_CHANNEL: self.on_empty_ok,
@@ -313,6 +314,13 @@ class SyntheticZiggurat:
     ) -> None:
         await self.send_notification(
             p.BroadcastConfirm(status=p.SendStatus.SUCCESS), request_id
+        )
+        return None
+
+    async def on_send_gpdf(self, request: p.SendGpdf, request_id: int) -> None:
+        # Sent once its GPD listened
+        await self.send_notification(
+            p.SendConfirm(status=p.SendStatus.SUCCESS), request_id
         )
         return None
 
