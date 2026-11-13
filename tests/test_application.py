@@ -1128,12 +1128,13 @@ async def test_on_notification_received_aps_zdo_reply_encryption(
 
 
 @pytest.mark.parametrize(
-    ("destination", "group", "expected_dst"),
+    ("destination", "group", "expected_dst", "expected_dst_ep"),
     [
         (
             t.NWK(0x0000),
             2,
             t.AddrModeAddress(addr_mode=t.AddrMode.Group, address=t.Group(2)),
+            None,
         ),
         (
             t.NWK(0xFFFD),
@@ -1141,11 +1142,13 @@ async def test_on_notification_received_aps_zdo_reply_encryption(
             t.AddrModeAddress(
                 addr_mode=t.AddrMode.Broadcast, address=t.BroadcastAddress(0xFFFD)
             ),
+            1,
         ),
         (
             t.NWK(0x0000),
             None,
             t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=t.NWK(0x0000)),
+            1,
         ),
     ],
 )
@@ -1154,9 +1157,10 @@ async def test_on_notification_received_aps_address_modes(
     destination: t.NWK,
     group: int | None,
     expected_dst: t.AddrModeAddress,
+    expected_dst_ep: int | None,
 ) -> None:
     """A group id, a broadcast address and a plain network address each decode into
-    their own zigpy address mode."""
+    their own zigpy address mode. A group frame has no destination endpoint."""
     app = RecordingApplication(make_app_config(server.url))
     await app.connect()
     await app.start_network()
@@ -1185,6 +1189,7 @@ async def test_on_notification_received_aps_address_modes(
     assert len(app.packets) == 1
     packet = app.packets[0]
     assert packet.dst == expected_dst
+    assert packet.dst_ep == expected_dst_ep
     assert packet.src == t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=DEVICE_NWK)
     assert packet.lqi == 200
     assert packet.rssi == -70
