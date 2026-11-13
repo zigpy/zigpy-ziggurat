@@ -474,6 +474,58 @@ async def test_write_network_info_restores_children(
     assert {entry.rx_on_when_idle for entry in entries} == {0}
 
 
+async def test_write_network_info_restores_children_capability(
+    connected_app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    """A child's capability comes from its node descriptor, so an end device that
+    keeps its receiver on is not restored as sleepy."""
+    app = connected_app
+    await app.load_network_info()
+
+    def child(
+        n: int, mac_capability_flags: int | None, logical_type: zdo_t.LogicalType | None
+    ) -> t.EUI64:
+        ieee = t.EUI64([n] * 8)
+        device = app.add_device(ieee, t.NWK(0x1000 + n))
+        if mac_capability_flags is not None:
+            device.node_desc = zdo_t.NodeDescriptor(
+                logical_type=logical_type,
+                mac_capability_flags=zdo_t.NodeDescriptor.MACCapabilityFlags(
+                    mac_capability_flags
+                ),
+            )
+        return ieee
+
+    children = [
+        # A Sengled bulb: an end device with its receiver on
+        child(1, 0x8C, zdo_t.LogicalType.EndDevice),
+        # A battery sensor
+        child(2, 0x80, zdo_t.LogicalType.EndDevice),
+        child(3, 0x8E, zdo_t.LogicalType.Router),
+        # Not interviewed
+        child(4, None, None),
+        # A node descriptor with no logical type
+        child(5, 0x80, None),
+    ]
+
+    await app.write_network_info(
+        network_info=app.state.network_info.replace(
+            children=children,
+            nwk_addresses={ieee: app.get_device(ieee=ieee).nwk for ieee in children},
+        ),
+        node_info=app.state.node_info,
+    )
+
+    (load,) = server.sent(p.LoadChildren)
+    assert [(entry.device_type, entry.rx_on_when_idle) for entry in load.entries] == [
+        (p.ChildDeviceType.END_DEVICE, 1),
+        (p.ChildDeviceType.END_DEVICE, 0),
+        (p.ChildDeviceType.ROUTER, 1),
+        (p.ChildDeviceType.UNKNOWN, 0),
+        (p.ChildDeviceType.UNKNOWN, 0),
+    ]
+
+
 async def test_permit_ncp(
     app: ControllerApplication, server: SyntheticZiggurat
 ) -> None:
