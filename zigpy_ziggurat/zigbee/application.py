@@ -778,11 +778,16 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
     def _handle_received_aps_command(self, command: p.ReceivedAps) -> None:
         group = command.group_id
+        dst_ep: t.uint8_t | None = command.dst_ep
+
         if group is not None:
             dst = t.AddrModeAddress(
                 addr_mode=t.AddrMode.Group,
                 address=t.Group(group),
             )
+            # A group frame carries no destination endpoint, so `dst_ep` is filler.
+            # Passing it on would make zigpy treat a filler of 0 as ZDO.
+            dst_ep = None
         elif command.destination >= 0xFFF8:
             dst = t.AddrModeAddress(
                 addr_mode=t.AddrMode.Broadcast,
@@ -801,7 +806,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             ),
             dst=dst,
             src_ep=command.src_ep,
-            dst_ep=command.dst_ep,
+            dst_ep=dst_ep,
             profile_id=command.profile_id,
             cluster_id=command.cluster_id,
             lqi=command.lqi,
