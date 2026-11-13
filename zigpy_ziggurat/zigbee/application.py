@@ -865,7 +865,6 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         # Resolves once the send is confirmed: passive-ack quorum for a broadcast or
         # groupcast, next-hop acceptance for a no-ack unicast, or the end-to-end APS
         # ack. A rejected or failed send raises `DeliveryError`.
-        assert self._api is not None
         priority = packet.priority if packet.priority is not None else 0
         radius = packet.radius or 30
         asdu = packet.data.serialize()
@@ -941,5 +940,9 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     relays=relays,
                     asdu=asdu,
                 )
+
+            # The connection can close while the send waits for a concurrency slot
+            if self._api is None:
+                raise DeliveryError("Not connected to Ziggurat")
 
             await self._api.request_confirmed(send)

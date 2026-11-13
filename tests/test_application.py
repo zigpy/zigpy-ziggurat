@@ -746,6 +746,19 @@ async def test_send_packet_encrypted_without_eui64(
     assert server.sent(p.SendUnicast) == []
 
 
+async def test_send_packet_disconnected(
+    app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    await app.disconnect()
+
+    with pytest.raises(DeliveryError, match="Not connected"):
+        await app.send_packet(
+            aps_packet(t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=DEVICE_NWK))
+        )
+
+    assert server.sent(p.SendUnicast) == []
+
+
 async def test_send_packet_broadcast(
     app: ControllerApplication, server: SyntheticZiggurat
 ) -> None:
