@@ -907,10 +907,11 @@ async def test_send_packet_delivery_failure(
 async def test_send_packet_confirm_failure(
     app: ControllerApplication, server: SyntheticZiggurat
 ) -> None:
-    async def no_route(request: p.SendUnicast, request_id: int) -> None:
+    async def no_route(request: p.SendUnicast, request_id: int) -> p.SendUnicastResult:
         await server.send_notification(
             p.SendConfirm(status=p.SendStatus.ROUTE_DISCOVERY_TIMEOUT), request_id
         )
+        return p.SendUnicastResult(aps_seq=server.assign_aps_seq(request))
 
     server.handlers[p.RequestCommand.SEND_UNICAST] = no_route
 
@@ -918,6 +919,100 @@ async def test_send_packet_confirm_failure(
         await app.send_packet(
             aps_packet(t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=DEVICE_NWK))
         )
+
+
+@pytest.mark.parametrize(
+    ("retry_request_id", "retry_attempt", "force_aps_seq", "aps_seq"),
+    [
+        # A retry of the undelivered request resends with its APS counter (the first
+        # one the server assigns)
+        (7, 1, 1, 1),
+        # Another request's attempt gets a fresh counter
+        (8, 1, 0, 0),
+        # A first attempt is a new request, even with the id of an old one
+        (7, 0, 0, 0),
+    ],
+)
+async def test_send_packet_retry_reuses_aps_seq(
+    app: ControllerApplication,
+    server: SyntheticZiggurat,
+    retry_request_id: int,
+    retry_attempt: int,
+    force_aps_seq: int,
+    aps_seq: int,
+) -> None:
+    """A retry of an undelivered unicast resends it with the same APS counter, so a
+    device that got it but lost its ack drops the retry as a duplicate."""
+    statuses = [p.SendStatus.APS_ACK_TIMEOUT, p.SendStatus.SUCCESS]
+
+    async def confirm(request: p.SendUnicast, request_id: int) -> p.SendUnicastResult:
+        await server.send_notification(
+            p.SendConfirm(status=statuses.pop(0)), request_id
+        )
+        return p.SendUnicastResult(aps_seq=server.assign_aps_seq(request))
+
+    server.handlers[p.RequestCommand.SEND_UNICAST] = confirm
+    packet = aps_packet(
+        t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=DEVICE_NWK)
+    ).replace(request_id=7)
+
+    with pytest.raises(DeliveryError, match="APS_ACK_TIMEOUT"):
+        await app.send_packet(packet)
+
+    await app.send_packet(
+        packet.replace(request_id=retry_request_id, attempt=retry_attempt)
+    )
+
+    retry = server.sent(p.SendUnicast)[-1]
+    assert retry.force_aps_seq == force_aps_seq
+    assert retry.aps_seq == aps_seq
+
+
+async def test_send_packet_retry_after_expiry_gets_fresh_aps_seq(
+    app: ControllerApplication,
+    server: SyntheticZiggurat,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An undelivered attempt's APS counter is forgotten once it is too old."""
+    monkeypatch.setattr(
+        application_module, "UNDELIVERED_APS_SEQ_LIFETIME", timedelta(0)
+    )
+    statuses = [p.SendStatus.APS_ACK_TIMEOUT, p.SendStatus.SUCCESS]
+
+    async def confirm(request: p.SendUnicast, request_id: int) -> p.SendUnicastResult:
+        await server.send_notification(
+            p.SendConfirm(status=statuses.pop(0)), request_id
+        )
+        return p.SendUnicastResult(aps_seq=server.assign_aps_seq(request))
+
+    server.handlers[p.RequestCommand.SEND_UNICAST] = confirm
+    packet = aps_packet(
+        t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=DEVICE_NWK)
+    ).replace(request_id=7)
+
+    with pytest.raises(DeliveryError, match="APS_ACK_TIMEOUT"):
+        await app.send_packet(packet)
+
+    await app.send_packet(packet.replace(attempt=1))
+
+    retry = server.sent(p.SendUnicast)[-1]
+    assert not retry.force_aps_seq
+
+
+async def test_send_packet_retry_after_delivery_gets_fresh_aps_seq(
+    app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    """A retry after a delivered attempt (zigpy saw no reply) gets a fresh APS
+    counter: with the same one the device would drop it as a duplicate."""
+    packet = aps_packet(
+        t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=DEVICE_NWK)
+    ).replace(request_id=7)
+
+    await app.send_packet(packet)
+    await app.send_packet(packet.replace(attempt=1))
+
+    retry = server.sent(p.SendUnicast)[-1]
+    assert not retry.force_aps_seq
 
 
 async def test_add_endpoint(

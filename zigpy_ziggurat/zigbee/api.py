@@ -7,7 +7,6 @@ from collections.abc import AsyncGenerator, Callable
 from datetime import timedelta
 import logging
 
-from zigpy.exceptions import DeliveryError
 import zigpy.types as t
 
 from zigpy_ziggurat.zigbee import protocol as p
@@ -125,13 +124,13 @@ class ZigguratApi:
 
     async def request_confirmed(
         self, send: p.SendUnicast | p.SendBroadcast | p.SendGroupcast
-    ) -> None:
-        """Send and await the terminal confirmation."""
+    ) -> tuple[p.Response | None, p.SendStatus]:
+        """Send; return the accept response and the terminal confirmation status."""
 
         # The terminal confirmation is the end-to-end APS ack for an ack-requested
         # unicast, the passive-ack quorum for a broadcast/groupcast, otherwise the local
-        # handoff. A rejected frame raises `DeliveryError` before any confirm; a failed
-        # confirmation raises it too.
+        # handoff. A rejected frame raises `DeliveryError` before any confirm. A failed
+        # confirmation is returned, not raised: a retry needs the accept response.
         request_id = self._next_id()
         pending = _Pending(send, streaming=False)
         self._pending[request_id] = pending
@@ -148,7 +147,7 @@ class ZigguratApi:
         try:
             async with asyncio.timeout(CONFIRM_TIMEOUT):
                 await self._transport.send_frame(p.encode_request(send, request_id))
-                await pending.response  # accepted / rejected
+                accepted = await pending.response
                 result = await confirm
         finally:
             self._pending.pop(request_id, None)
@@ -158,8 +157,7 @@ class ZigguratApi:
             if not confirm.done() or confirm.cancelled():
                 await self._cancel_send(request_id)
 
-        if result.status != p.SendStatus.SUCCESS:
-            raise DeliveryError(f"Send failed: {result.status.name}")
+        return accepted, result.status
 
     async def request_stream(
         self, request: p.Request
