@@ -541,16 +541,9 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
     async def _restore_children(self, network_info: zigpy.state.NetworkInfo) -> None:
         assert self._api is not None
-        # The backup carries no capability, so device type is Unknown (restored as a
-        # sleepy end device); children without a known NWK address can't be loaded.
+        # Children without a known NWK address can't be loaded
         entries = [
-            p.ChildEntry(
-                ieee=ieee,
-                nwk=network_info.nwk_addresses[ieee],
-                rx_on_when_idle=t.uint1_t(0),
-                device_type=p.ChildDeviceType.UNKNOWN,
-                reserved=t.uint5_t(0),
-            )
+            self._child_entry(ieee, network_info.nwk_addresses[ieee])
             for ieee in network_info.children
             if ieee in network_info.nwk_addresses
         ]
@@ -562,6 +555,41 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     )
                 )
             )
+
+    def _child_entry(self, ieee: t.EUI64, nwk: t.NWK) -> p.ChildEntry:
+        # The backup carries no capability, so it comes from the child's node
+        # descriptor. Some end devices keep their receiver on and never poll (Sengled
+        # bulbs), so they must not be restored as sleepy. Without a node descriptor
+        # the child is restored as a sleepy end device, as most end devices are.
+        try:
+            device = self.get_device(ieee=ieee)
+        except KeyError:
+            node_desc = None
+        else:
+            # A child joined the network, so it is never a GPD
+            assert isinstance(device, zigpy.device.ZigbeeDevice)
+            node_desc = device.node_desc
+
+        if node_desc is None:
+            device_type = p.ChildDeviceType.UNKNOWN
+            rx_on_when_idle = False
+        else:
+            if node_desc.is_router:
+                device_type = p.ChildDeviceType.ROUTER
+            elif node_desc.is_end_device:
+                device_type = p.ChildDeviceType.END_DEVICE
+            else:
+                device_type = p.ChildDeviceType.UNKNOWN
+
+            rx_on_when_idle = bool(node_desc.is_receiver_on_when_idle)
+
+        return p.ChildEntry(
+            ieee=ieee,
+            nwk=nwk,
+            rx_on_when_idle=t.uint1_t(rx_on_when_idle),
+            device_type=device_type,
+            reserved=t.uint5_t(0),
+        )
 
     async def reset_network_info(self) -> None:
         assert self._api is not None
