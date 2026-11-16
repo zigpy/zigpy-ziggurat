@@ -4,6 +4,7 @@ from datetime import timedelta
 
 import pytest
 import zigpy.types as t
+from zigpy.zgp.types import SrcID
 
 from zigpy_ziggurat.zigbee import protocol as p
 
@@ -119,3 +120,27 @@ def test_load_request_round_trip(request_obj: p.Request) -> None:
     parsed, rest = type(request_obj).deserialize(request_obj.serialize())
     assert rest == b""
     assert parsed == request_obj
+
+
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    [
+        # Target kind in bits 0-1 of the first byte
+        (SrcID(0x12345678), bytes.fromhex("00 78563412 0F 204E0000 FE 01 00")),
+        ((_IEEE, 0x01), bytes.fromhex("01 7766554433221100 01 0F 204E0000 FE 01 00")),
+        (None, bytes.fromhex("02 0F 204E0000 FE 01 00")),
+    ],
+)
+def test_send_gpdf_build(
+    target: SrcID | tuple[t.EUI64, int] | None, expected: bytes
+) -> None:
+    send = p.SendGpdf.build(
+        target=target,
+        command_id=0xFE,
+        payload=b"\x00",
+        channel=15,
+        lifetime=timedelta(seconds=20),
+    )
+
+    assert send.serialize() == expected
+    assert p.SendGpdf.deserialize(expected) == (send, b"")
