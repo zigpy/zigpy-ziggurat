@@ -608,6 +608,26 @@ async def test_restart_keeps_stack_child_capability(
         {"ziggurat": {"children": []}},
         {"ziggurat": {"children": {"01:01:01:01:01:01:01:01": "x"}}},
         {"ziggurat": {"children": {"01:01:01:01:01:01:01:01": {"rx_on_when_idle": 1}}}},
+        {
+            "ziggurat": {
+                "children": {
+                    "01:01:01:01:01:01:01:01": {
+                        "device_type": "INVALID",
+                        "rx_on_when_idle": True,
+                    }
+                }
+            }
+        },
+        {
+            "ziggurat": {
+                "children": {
+                    "01:01:01:01:01:01:01:01": {
+                        "device_type": "END_DEVICE",
+                        "rx_on_when_idle": "yes",
+                    }
+                }
+            }
+        },
     ],
 )
 async def test_write_network_info_ignores_malformed_child_capabilities(

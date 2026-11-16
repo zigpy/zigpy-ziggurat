@@ -600,11 +600,20 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             node_desc = device.node_desc
 
         if node_desc is None:
+            # Both fields are used together or not at all: half a record is as
+            # untrustworthy as none
             capability = stack_capability if isinstance(stack_capability, dict) else {}
-            device_type = p.ChildDeviceType.__members__.get(
-                str(capability.get("device_type")), p.ChildDeviceType.UNKNOWN
+            stack_device_type = p.ChildDeviceType.__members__.get(
+                str(capability.get("device_type"))
             )
-            rx_on_when_idle = capability.get("rx_on_when_idle") is True
+            stack_rx_on = capability.get("rx_on_when_idle")
+
+            if stack_device_type is not None and isinstance(stack_rx_on, bool):
+                device_type = stack_device_type
+                rx_on_when_idle = stack_rx_on
+            else:
+                device_type = p.ChildDeviceType.UNKNOWN
+                rx_on_when_idle = False
         else:
             if node_desc.is_router:
                 device_type = p.ChildDeviceType.ROUTER
