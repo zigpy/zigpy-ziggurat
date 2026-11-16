@@ -3,13 +3,17 @@ against the synthetic binary websocket server."""
 
 import asyncio
 from datetime import timedelta
+import json
 import logging
 import os
+import pathlib
 from typing import Any
 from unittest import mock
 
 from aiohttp import web
 import pytest
+import zigpy.appdb
+import zigpy.backups
 import zigpy.config
 import zigpy.device
 import zigpy.endpoint
@@ -534,6 +538,56 @@ async def test_start_network_interrupted(
         "network_backup_removed",
     ]
     assert len(app.backups.backups) == 1
+
+
+async def test_add_backup_database(
+    connected_app: ControllerApplication, tmp_path: pathlib.Path
+) -> None:
+    """The database holds exactly the backups in memory as backups supersede each
+    other, also when one shares the `backup_time` of the backup it supersedes, which
+    zigpy deletes by, or is added again."""
+    app = connected_app
+    await app.load_network_info()
+    db = await zigpy.appdb.PersistingListener.new(str(tmp_path / "zigbee.db"), app)
+    app.backups.add_listener(db)
+
+    async def assert_database_matches() -> None:
+        await db._callback_handlers.join()
+        async with db.execute(
+            f"SELECT backup_json FROM network_backups{zigpy.appdb.DB_V}"
+        ) as cursor:
+            rows = [json.loads(row[0]) for row in await cursor.fetchall()]
+        assert rows == [
+            json.loads(json.dumps(b.as_dict())) for b in app.backups.backups
+        ]
+
+    def backup(tx_counter: int) -> zigpy.backups.NetworkBackup:
+        network_info = app.state.network_info
+        return zigpy.backups.NetworkBackup(
+            network_info=network_info.replace(
+                network_key=network_info.network_key.replace(tx_counter=tx_counter)
+            ),
+            node_info=app.state.node_info,
+        )
+
+    try:
+        app._add_backup(backup(1))
+        await assert_database_matches()
+
+        second = backup(2)
+        app._add_backup(second)
+        await assert_database_matches()
+
+        third = backup(3)
+        third.backup_time = second.backup_time
+        app._add_backup(third)
+        await assert_database_matches()
+
+        app._add_backup(third)
+        await assert_database_matches()
+        assert app.backups.backups == [third]
+    finally:
+        await db.shutdown()
 
 
 async def test_write_network_info(

@@ -341,9 +341,20 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         if not any(b is backup for b in self.backups.backups):
             return
 
+        # zigpy removes a backup from the database by its `backup_time`, so one
+        # sharing the new backup's (the new backup itself, if it was already
+        # there) is removed first, as zigpy does, or the new backup would go with it
+        superseded = [
+            old
+            for old in previous
+            if old is backup or not any(b is old for b in self.backups.backups)
+        ]
+        for old in superseded:
+            if old.backup_time == backup.backup_time:
+                self.backups.listener_event("network_backup_removed", old)
         self.backups.listener_event("network_backup_created", backup)
-        for old in previous:
-            if not any(b is old for b in self.backups.backups):
+        for old in superseded:
+            if old.backup_time != backup.backup_time:
                 self.backups.listener_event("network_backup_removed", old)
 
     def _get_network_settings(self) -> None:
