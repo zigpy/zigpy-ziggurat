@@ -1147,6 +1147,13 @@ async def test_packet_received(
     assert reply.cluster_id == zdo_t.ZDOCmd.Simple_Desc_rsp
     assert reply.asdu[1] == zdo_t.Status.SUCCESS
 
+    # Power_Desc_req: mains powered, receiver on when idle, 100 %
+    app.packet_received(zdo_packet(zdo_t.ZDOCmd.Power_Desc_req, b"\x1a" + our_nwk))
+    reply = await server.wait_for(p.SendUnicast, count=4)
+    assert reply.cluster_id == zdo_t.ZDOCmd.Power_Desc_rsp
+    assert reply.destination == DEVICE_NWK
+    assert bytes(reply.asdu) == b"\x1a\x00" + our_nwk + b"\x10\xc1"
+
     # Requests that are not answered locally. zigpy may originate its own requests
     # (e.g. IEEE_addr_req for an unknown sender), so only count ZDO responses.
     def zdo_replies() -> list[p.SendUnicast]:
@@ -1160,6 +1167,8 @@ async def test_packet_received(
         zdo_packet(zdo_t.ZDOCmd.Simple_Desc_req, b"\x14" + our_nwk + b"\x63"),
         # Another node's descriptor
         zdo_packet(zdo_t.ZDOCmd.Node_Desc_req, b"\x15" + t.NWK(0x1234).serialize()),
+        # Another node's power descriptor
+        zdo_packet(zdo_t.ZDOCmd.Power_Desc_req, b"\x1b" + t.NWK(0x1234).serialize()),
         # Not a request we answer
         zdo_packet(zdo_t.ZDOCmd.Mgmt_Lqi_req, b"\x16\x00"),
         # A truncated payload
