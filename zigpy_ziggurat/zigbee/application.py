@@ -634,6 +634,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
         if hdr.command_id not in (
             zdo_t.ZDOCmd.Node_Desc_req,
+            zdo_t.ZDOCmd.Power_Desc_req,
             zdo_t.ZDOCmd.Active_EP_req,
             zdo_t.ZDOCmd.Simple_Desc_req,
         ):
@@ -703,6 +704,23 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     zdo_t.Status.SUCCESS,
                     nwk,
                     descriptor,
+                    tsn=hdr.tsn,
+                    aps_encryption=aps_encryption,
+                )
+            )
+        elif hdr.command_id == zdo_t.ZDOCmd.Power_Desc_req:
+            # Mains powered, receiver as our node descriptor says (on when idle)
+            power_desc = zdo_t.PowerDescriptor(
+                current_power_mode=zdo_t.CurrentPowerMode.RxOnSyncedWithNodeDesc,
+                available_power_sources=zdo_t.PowerSources.MainsPower,
+                current_power_source=zdo_t.PowerSources.MainsPower,
+                current_power_source_level=zdo_t.PowerSourceLevel.Percent100,
+            )
+            device.zdo.create_catching_task(
+                device.zdo.Power_Desc_rsp(
+                    zdo_t.Status.SUCCESS,
+                    nwk,
+                    power_desc,
                     tsn=hdr.tsn,
                     aps_encryption=aps_encryption,
                 )
