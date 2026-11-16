@@ -73,6 +73,9 @@ class ZigguratApi:
             await self._transport.disconnect()
 
     def _on_transport_lost(self, exc: BaseException | None) -> None:
+        if self._transport is None:
+            # A failed connect releasing its port: `connect()` raises instead.
+            return
         self._connection_lost(exc)
 
     def _connection_lost(self, exc: BaseException | None) -> None:

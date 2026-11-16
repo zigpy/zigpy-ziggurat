@@ -122,8 +122,13 @@ class SpinelTransport:
             flow_control=cast(Any, self._flow_control),
         )
         self._protocol = cast(_SpinelProtocol, protocol)
-        await self._protocol.wait_until_connected()
-        await self._protocol.start_ziggurat()
+        try:
+            await self._protocol.wait_until_connected()
+            await self._protocol.start_ziggurat()
+        except BaseException:
+            # Release the port: the caller never gets this transport to close it.
+            await self.disconnect()
+            raise
 
     async def disconnect(self) -> None:
         if self._protocol is not None:
@@ -152,19 +157,28 @@ async def _open_websocket(
         ws_url = url
 
     session = aiohttp.ClientSession(connector=connector)
-    websocket = await session.ws_connect(ws_url, heartbeat=WEBSOCKET_HEARTBEAT)
+    try:
+        websocket = await session.ws_connect(ws_url, heartbeat=WEBSOCKET_HEARTBEAT)
+    except BaseException:
+        await session.close()
+        raise
     return session, websocket
 
 
 async def _probe_websocket(url: str, on_frame: OnFrame, on_lost: OnLost) -> Transport:
     """Open the WebSocket and check that the opening hello is a binary frame."""
     session, websocket = await _open_websocket(url)
-    async with asyncio.timeout(HANDSHAKE_TIMEOUT):
-        hello = await websocket.receive()
+    try:
+        async with asyncio.timeout(HANDSHAKE_TIMEOUT):
+            hello = await websocket.receive()
 
-    if hello.type != aiohttp.WSMsgType.BINARY:
+        if hello.type != aiohttp.WSMsgType.BINARY:
+            raise ConnectionError(f"Unexpected handshake from ziggurat: {hello!r}")
+    except BaseException:
+        # Closing the session drops the socket without waiting on a close handshake
+        # that a server which never said hello may not answer.
         await session.close()
-        raise ConnectionError(f"Unexpected handshake from ziggurat: {hello!r}")
+        raise
 
     transport = WebSocketTransport(on_frame, on_lost)
     transport._adopt(session, websocket)

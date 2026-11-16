@@ -122,12 +122,19 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             baudrate=device[zigpy.config.CONF_DEVICE_BAUDRATE],
             flow_control=device[zigpy.config.CONF_DEVICE_FLOW_CONTROL],
         )
-        await api.connect()
-        self._api = api
+        # zigpy expects a failed connect to leave nothing open: `probe()` discards the
+        # app, and the `disconnect()` it calls afterwards is a no-op without `_api`.
+        try:
+            await api.connect()
+            self._api = api
 
-        # Clear any transient radio state left by a previous client (e.g. a packet
-        # capture still streaming on the firmware) so this session starts from idle.
-        await api.request(p.Reset(hard=t.Bool(False)))
+            # Clear any transient radio state left by a previous client (e.g. a packet
+            # capture still streaming on the firmware) so this session starts from idle.
+            await api.request(p.Reset(hard=t.Bool(False)))
+        except BaseException:
+            self._api = None
+            await api.disconnect()
+            raise
 
     async def disconnect(self) -> None:
         self._start_time = None

@@ -8,6 +8,7 @@ import os
 from typing import Any
 
 from aiohttp import web
+from aiospinel import Status
 import pytest
 import zigpy.config
 import zigpy.device
@@ -25,6 +26,7 @@ from tests.common import (
     LINK_KEY,
     NETWORK_KEY,
     StatusError,
+    SyntheticSpinelRcp,
     SyntheticZiggurat,
     app,
     connected_app,
@@ -154,6 +156,68 @@ async def test_disconnect(
     async with asyncio.timeout(1):
         while not server.ws.closed:
             await asyncio.sleep(0.01)
+
+
+async def test_connect_foreign_firmware_closes_port() -> None:
+    # A plain OpenThread RCP answers Spinel, but has no Ziggurat stack.
+    rcp = SyntheticSpinelRcp(get_status=Status.PROP_NOT_FOUND)
+    await rcp.start()
+    try:
+        app = ControllerApplication(make_app_config(rcp.url))
+        lost: list[BaseException | None] = []
+
+        class Listener:
+            def connection_lost(self, exc: BaseException | None) -> None:
+                lost.append(exc)
+
+        app.add_listener(Listener())
+
+        with pytest.raises(ConnectionError, match="does not embed"):
+            await app.connect()
+
+        # The port is released, and a connect that never completed is not reported
+        # as a lost connection.
+        assert rcp.connections == 1
+        await rcp.wait_closed_by_client()
+        assert app._api is None
+        assert lost == []
+
+        await app.disconnect()  # zigpy still calls this after a failed connect
+    finally:
+        await rcp.stop()
+
+
+async def test_probe_foreign_firmware_closes_port() -> None:
+    rcp = SyntheticSpinelRcp(get_status=Status.PROP_NOT_FOUND)
+    await rcp.start()
+    try:
+        config = {zigpy.config.CONF_DEVICE_PATH: rcp.url}
+        assert await ControllerApplication.probe(config) is False
+
+        assert rcp.connections >= 1
+        await rcp.wait_closed_by_client()
+    finally:
+        await rcp.stop()
+
+
+async def test_connect_reset_failure_closes_connection(
+    server: SyntheticZiggurat,
+) -> None:
+    async def reject(request: p.Reset, request_id: int) -> None:
+        raise StatusError(p.Status.INVALID_REQUEST)
+
+    server.handlers[p.RequestCommand.RESET] = reject
+    app = ControllerApplication(make_app_config(server.url))
+
+    with pytest.raises(p.ProtocolError):
+        await app.connect()
+
+    assert app._api is None
+    async with asyncio.timeout(1):
+        while not server.ws.closed:
+            await asyncio.sleep(0.01)
+
+    await app.disconnect()
 
 
 async def test_start_network(

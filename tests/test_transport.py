@@ -2,7 +2,13 @@
 the transports it returns."""
 
 import asyncio
+from collections.abc import AsyncIterator
+import socket
+from typing import Any
 
+import aiohttp
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 from aiospinel import PropertyStatusError, Status
 import pytest
 
@@ -16,12 +22,60 @@ from tests.common import (
     server,
     spinel_rcp,
 )
-from zigpy_ziggurat.zigbee import protocol as p
+from zigpy_ziggurat.zigbee import protocol as p, transport as transport_module
 from zigpy_ziggurat.zigbee.transport import (
     SpinelTransport,
     WebSocketTransport,
     connect_transport,
 )
+
+
+@pytest.fixture
+def client_sessions(monkeypatch: pytest.MonkeyPatch) -> list[aiohttp.ClientSession]:
+    """Record every `ClientSession` the WebSocket transport opens."""
+    sessions: list[aiohttp.ClientSession] = []
+    client_session = aiohttp.ClientSession
+
+    def recording_session(*args: Any, **kwargs: Any) -> aiohttp.ClientSession:
+        session = client_session(*args, **kwargs)
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr(aiohttp, "ClientSession", recording_session)
+    return sessions
+
+
+class SilentZiggurat:
+    """A WebSocket server that accepts the upgrade but never sends a hello."""
+
+    def __init__(self) -> None:
+        self.web_app = web.Application()
+        self.web_app.router.add_get("/", self._handle_connection)
+        self.url = ""
+        self.disconnected = asyncio.Event()
+
+    async def _handle_connection(self, request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        try:
+            async for _ in ws:
+                pass
+        finally:
+            # The server may cancel the handler once the client drops the socket.
+            self.disconnected.set()
+        return ws
+
+
+@pytest.fixture
+async def silent_server() -> AsyncIterator[SilentZiggurat]:
+    ziggurat = SilentZiggurat()
+    test_server = TestServer(ziggurat.web_app)
+    await test_server.start_server()
+    ziggurat.url = f"ws://localhost:{test_server.port}/"
+
+    yield ziggurat
+
+    await test_server.close()
 
 
 async def _wait_for(frames: list[bytes], count: int = 1) -> None:
@@ -51,11 +105,51 @@ async def test_probe_selects_binary(server: SyntheticZiggurat) -> None:
 
 async def test_probe_rejects_unexpected_handshake(
     closing_server: ClosingZiggurat,
+    client_sessions: list[aiohttp.ClientSession],
 ) -> None:
     with pytest.raises(ConnectionError):
         await connect_transport(
             closing_server.url, lambda frame: None, lambda exc: None
         )
+
+    assert len(client_sessions) == 1
+    assert client_sessions[0].closed
+
+
+async def test_probe_handshake_timeout_closes_session(
+    silent_server: SilentZiggurat,
+    client_sessions: list[aiohttp.ClientSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(transport_module, "HANDSHAKE_TIMEOUT", 0.1)
+
+    with pytest.raises(TimeoutError):
+        await connect_transport(silent_server.url, lambda frame: None, lambda exc: None)
+
+    assert len(client_sessions) == 1
+    assert client_sessions[0].closed
+
+    # The socket itself is gone too, not just the session object.
+    async with asyncio.timeout(1):
+        await silent_server.disconnected.wait()
+
+
+async def test_probe_connect_refused_closes_session(
+    client_sessions: list[aiohttp.ClientSession],
+) -> None:
+    # A bound socket that never listens refuses connections, and holding it keeps
+    # anything else from taking the port meanwhile.
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+
+        with pytest.raises(aiohttp.ClientConnectionError):
+            await connect_transport(
+                f"ws://127.0.0.1:{port}/", lambda frame: None, lambda exc: None
+            )
+
+    assert len(client_sessions) == 1
+    assert client_sessions[0].closed
 
 
 async def test_spinel_transport_roundtrip(spinel_rcp: SyntheticSpinelRcp) -> None:
@@ -102,6 +196,10 @@ async def test_spinel_connect_rejects_foreign_firmware() -> None:
     try:
         with pytest.raises(ConnectionError, match="does not embed"):
             await connect_transport(rcp.url, lambda frame: None, lambda exc: None)
+
+        # The rejected port is closed again, so the next attempt can open it.
+        assert rcp.connections == 1
+        await rcp.wait_closed_by_client()
     finally:
         await rcp.stop()
 

@@ -425,11 +425,20 @@ class SyntheticSpinelRcp:
         self._set_status = set_status
         self._server: asyncio.Server | None = None
         self._writers: list[asyncio.StreamWriter] = []
+        # Connections accepted, and how many of them the client has closed since.
+        self.connections = 0
+        self.closed = 0
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._serve, "127.0.0.1", 0)
         port = self._server.sockets[0].getsockname()[1]
         self.url = f"socket://127.0.0.1:{port}"
+
+    async def wait_closed_by_client(self) -> None:
+        """Wait until the client has closed every connection it opened."""
+        async with asyncio.timeout(2):
+            while self.closed < self.connections:
+                await asyncio.sleep(0.01)
 
     async def stop(self) -> None:
         assert self._server is not None
@@ -442,10 +451,12 @@ class SyntheticSpinelRcp:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         self._writers.append(writer)
+        self.connections += 1
         buffer = bytearray()
         while True:
             data = await reader.read(1024)
             if not data:
+                self.closed += 1
                 break
             buffer += data
             while True:
