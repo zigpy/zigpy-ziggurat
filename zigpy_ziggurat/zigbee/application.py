@@ -108,6 +108,11 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         self._api: ZigguratApi | None = None
         self._start_time: datetime | None = None
 
+        # Devices that joined but that zigpy does not know yet, by network address.
+        # Each entry is dropped when its `DEVICE_JOIN_MAX_DELAY` timer fires, just
+        # before zigpy is told about the join.
+        self._unannounced_joins: dict[t.NWK, t.EUI64] = {}
+
     async def connect(self) -> None:
         # The device path is either the WebSocket URL of a ziggurat server or the
         # serial port of a ziggurat firmware (e.g. an ESP32-C6 over USB-Serial-JTAG).
@@ -616,11 +621,44 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
     def _maybe_handle_local_zdo_request(self, packet: t.ZigbeePacket) -> None:
         assert packet.src is not None
+        src_nwk = t.NWK(packet.src.address)
+
+        if packet.cluster_id not in (
+            zdo_t.ZDOCmd.Node_Desc_req,
+            zdo_t.ZDOCmd.Active_EP_req,
+            zdo_t.ZDOCmd.Simple_Desc_req,
+        ):
+            return
+
+        # Answer with the same APS security the request arrived with
+        aps_encryption = t.TransmitOptions.APS_Encryption in packet.tx_options
 
         try:
-            device = self.get_device(nwk=t.NWK(packet.src.address))
+            device = self.get_device(nwk=src_nwk)
         except KeyError:
-            return
+            # An encrypted reply needs the destination EUI64, which a send looks up
+            # from the devices zigpy knows
+            if aps_encryption:
+                _LOGGER.debug(
+                    "Not answering an APS-encrypted %s from unknown device %s",
+                    zdo_t.ZDOCmd(packet.cluster_id).name,
+                    src_nwk,
+                )
+                return
+
+            # zigpy only learns of a new device from its announcement, or once its
+            # join delay has passed, but a joining device asks for our node
+            # descriptor first and gives up on joining without an answer. Answer
+            # through a stand-in device, with the EUI64 from its join if we saw it.
+            ieee = self._unannounced_joins.get(src_nwk)
+            if ieee is None:
+                ieee = t.EUI64.UNKNOWN  # type: ignore[attr-defined]
+
+            device = zigpy.device.Device(self, ieee, src_nwk)
+
+            # The stand-in is never added to zigpy: unregister the listener its
+            # constructor registered with the application
+            device.on_remove()
 
         # A device found by its network address is never a GPD
         assert isinstance(device, zigpy.device.ZigbeeDevice)
@@ -632,22 +670,12 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         except (ValueError, KeyError):
             return
 
-        if hdr.command_id not in (
-            zdo_t.ZDOCmd.Node_Desc_req,
-            zdo_t.ZDOCmd.Active_EP_req,
-            zdo_t.ZDOCmd.Simple_Desc_req,
-        ):
-            return
-
         # The address of interest must be us
         if args[0] != self.state.node_info.nwk:
             return
 
         coordinator = self._device
         nwk = self.state.node_info.nwk
-
-        # Answer with the same APS security the request arrived with
-        aps_encryption = t.TransmitOptions.APS_Encryption in packet.tx_options
 
         if hdr.command_id == zdo_t.ZDOCmd.Node_Desc_req:
             # Joining devices read our node descriptor to learn the trust center's
@@ -723,7 +751,12 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         # Give a new device a chance to announce itself before the join starts the
         # interview: the announcement creates the device through `packet_received`
         # and a later `handle_join` would cancel and restart the interview
+        self._unannounced_joins[nwk] = ieee
+
         def join_if_still_unannounced() -> None:
+            if self._unannounced_joins.get(nwk) == ieee:
+                del self._unannounced_joins[nwk]
+
             try:
                 self.get_device(ieee=ieee)
             except KeyError:

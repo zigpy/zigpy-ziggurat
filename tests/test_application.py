@@ -93,6 +93,36 @@ def zdo_packet(cluster_id: int, data: bytes, src: t.NWK = DEVICE_NWK) -> t.Zigbe
     )
 
 
+def zdo_request(
+    source: t.NWK,
+    *,
+    tsn: int,
+    cluster_id: int = zdo_t.ZDOCmd.Node_Desc_req,
+    extra: bytes = b"",
+    aps_encrypted: int = 0,
+) -> p.ReceivedAps:
+    return p.ReceivedAps(
+        source=source,
+        destination=t.NWK(0x0000),
+        has_group=t.uint1_t(0),
+        aps_encrypted=t.uint1_t(aps_encrypted),
+        reserved=t.uint6_t(0),
+        group=t.uint16_t(0),
+        profile_id=t.uint16_t(0x0000),
+        cluster_id=t.uint16_t(cluster_id),
+        src_ep=t.uint8_t(0),
+        dst_ep=t.uint8_t(0),
+        lqi=t.uint8_t(255),
+        rssi=t.int8s(-40),
+        data=t.LongOctetString(bytes([tsn]) + t.NWK(0x0000).serialize() + extra),
+    )
+
+
+def reported_mfg_code(reply: p.SendUnicast) -> int:
+    node_desc, _ = zdo_t.NodeDescriptor.deserialize(bytes(reply.asdu[4:]))
+    return node_desc.manufacturer_code
+
+
 def aps_packet(
     dst: t.AddrModeAddress,
     *,
@@ -1092,8 +1122,6 @@ async def test_packet_received(
         zdo_packet(zdo_t.ZDOCmd.Node_Desc_req, b"\x17"),
         # An unknown cluster
         zdo_packet(0xFF00, b"\x18"),
-        # An unknown sender
-        zdo_packet(zdo_t.ZDOCmd.Node_Desc_req, b"\x19" + our_nwk, src=t.NWK(0xDEAD)),
     ]:
         app.packet_received(packet)
 
@@ -1108,10 +1136,6 @@ async def test_packet_received_aqara_node_desc_override(
     coordinator = coordinator_device(app)
     assert coordinator.node_desc is not None
     assert coordinator.node_desc.manufacturer_code == application_module.DEFAULT_MFG_ID
-
-    def reported_mfg_code(reply: p.SendUnicast) -> int:
-        node_desc, _ = zdo_t.NodeDescriptor.deserialize(bytes(reply.asdu[4:]))
-        return node_desc.manufacturer_code
 
     # A Lumi/Aqara device is answered with the Xiaomi manufacturer code so it pairs
     aqara_nwk = t.NWK(0x1234)
@@ -1133,6 +1157,126 @@ async def test_packet_received_aqara_node_desc_override(
     )
     reply = await server.wait_for(p.SendUnicast, count=2)
     assert reported_mfg_code(reply) == application_module.DEFAULT_MFG_ID
+
+
+async def test_node_desc_req_before_device_annce(
+    app: ControllerApplication,
+    server: SyntheticZiggurat,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A joining device is answered before zigpy knows it."""
+    monkeypatch.setattr(application_module, "DEVICE_JOIN_MAX_DELAY", 0.2)
+
+    aqara_ieee = t.EUI64.convert("54:ef:44:00:00:00:00:01")
+    aqara_nwk = t.NWK(0x4321)
+    await server.send_notification(
+        p.DeviceJoined(
+            nwk=aqara_nwk,
+            ieee=aqara_ieee,
+            parent=t.NWK(0x0000),
+            rx_on_when_idle=t.uint1_t(0),
+            device_type=p.ChildDeviceType.END_DEVICE,
+            reserved=t.uint5_t(0),
+        )
+    )
+
+    # Its Node_Desc_req arrives before any Device_annce
+    await server.send_notification(zdo_request(aqara_nwk, tsn=0x30))
+    reply = await server.wait_for(p.SendUnicast)
+    with pytest.raises(KeyError):
+        app.get_device(ieee=aqara_ieee)
+
+    assert reply.cluster_id == zdo_t.ZDOCmd.Node_Desc_rsp
+    assert reply.destination == aqara_nwk
+    assert reply.asdu[0] == 0x30
+    assert reply.asdu[1] == zdo_t.Status.SUCCESS
+    # The manufacturer code override still applies, from the joined EUI64
+    assert reported_mfg_code(reply) == 0x115F
+
+    # Once zigpy is told about the join, the remembered address is dropped
+    await asyncio.sleep(0.3)
+    assert app.get_device(ieee=aqara_ieee).nwk == aqara_nwk
+    assert app._unannounced_joins == {}
+
+
+async def test_zdo_request_unknown_device(
+    app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    """A device whose join was not seen is answered with the defaults."""
+    unknown_nwk = t.NWK(0xDEAD)
+    listeners_before = dict(app._req_listeners)
+
+    # An encrypted request cannot be answered without the device's EUI64
+    await server.send_notification(zdo_request(unknown_nwk, tsn=0x40, aps_encrypted=1))
+    await server.send_notification(zdo_request(unknown_nwk, tsn=0x41))
+    reply = await server.wait_for(p.SendUnicast)
+
+    assert reply.cluster_id == zdo_t.ZDOCmd.Node_Desc_rsp
+    assert reply.destination == unknown_nwk
+    assert reply.asdu[0] == 0x41
+    assert not reply.aps_encryption
+    assert reported_mfg_code(reply) == application_module.DEFAULT_MFG_ID
+
+    await server.send_notification(
+        zdo_request(unknown_nwk, tsn=0x42, cluster_id=zdo_t.ZDOCmd.Active_EP_req)
+    )
+    reply = await server.wait_for(p.SendUnicast, count=2)
+    assert reply.cluster_id == zdo_t.ZDOCmd.Active_EP_rsp
+    assert reply.destination == unknown_nwk
+    assert reply.asdu[1] == zdo_t.Status.SUCCESS
+
+    await server.send_notification(
+        zdo_request(
+            unknown_nwk,
+            tsn=0x43,
+            cluster_id=zdo_t.ZDOCmd.Simple_Desc_req,
+            extra=b"\x01",
+        )
+    )
+    reply = await server.wait_for(p.SendUnicast, count=3)
+    assert reply.cluster_id == zdo_t.ZDOCmd.Simple_Desc_rsp
+    assert reply.destination == unknown_nwk
+    assert reply.asdu[1] == zdo_t.Status.SUCCESS
+
+    await asyncio.sleep(0.05)
+    assert [r.asdu[0] for r in server.sent(p.SendUnicast)] == [0x41, 0x42, 0x43]
+
+    # The stand-in devices leave no listeners behind
+    assert dict(app._req_listeners) == listeners_before
+
+
+async def test_unannounced_join_address_reused(
+    app: ControllerApplication,
+    server: SyntheticZiggurat,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later join that reuses the address keeps its entry past the earlier timer."""
+    monkeypatch.setattr(application_module, "DEVICE_JOIN_MAX_DELAY", 0.6)
+
+    def joined(ieee: t.EUI64) -> p.DeviceJoined:
+        return p.DeviceJoined(
+            nwk=t.NWK(0x4321),
+            ieee=ieee,
+            parent=t.NWK(0x0000),
+            rx_on_when_idle=t.uint1_t(1),
+            device_type=p.ChildDeviceType.ROUTER,
+            reserved=t.uint5_t(0),
+        )
+
+    first = t.EUI64.convert("aa:aa:aa:aa:aa:aa:aa:aa")
+    second = t.EUI64.convert("54:ef:44:00:00:00:00:02")
+
+    # The timers fire at 0.6 s and 0.9 s; check in between, 0.15 s from either
+    await server.send_notification(joined(first))
+    await asyncio.sleep(0.3)
+    await server.send_notification(joined(second))
+    await asyncio.sleep(0.45)
+
+    # The first join's timer has fired; the second join is still remembered
+    assert app._unannounced_joins == {t.NWK(0x4321): second}
+
+    await asyncio.sleep(0.35)
+    assert app._unannounced_joins == {}
 
 
 async def test_on_notification_received_aps(
