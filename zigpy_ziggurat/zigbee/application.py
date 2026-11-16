@@ -227,10 +227,13 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             not info.started
             and latest_backup is not None
             and latest_backup.network_info.network_key.key == state.network_key
+            and latest_backup.network_info.tc_link_key.key == state.tc_link_key
             and latest_backup.network_info.extended_pan_id == state.extended_pan_id
             and latest_backup.network_info.pan_id == state.pan_id
             and latest_backup.network_info.channel == state.channel
             and latest_backup.network_info.nwk_update_id == state.nwk_update_id
+            and latest_backup.node_info.ieee == state.ieee_address
+            and latest_backup.node_info.nwk == state.nwk_address
         ):
             _LOGGER.debug("The server's network was never started, using the backup")
             self._get_network_settings()

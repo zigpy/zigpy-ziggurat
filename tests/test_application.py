@@ -460,18 +460,28 @@ async def test_load_network_info_not_started_other_network(
     )
 
     server.started = False
-    for field, value in [
-        ("network_key", LINK_KEY),
-        ("extended_pan_id", t.ExtendedPanId.convert("11:22:33:44:55:66:77:88")),
-        ("pan_id", t.PanId(0x2B3C)),
-        ("channel", t.uint8_t(20)),
-        ("nwk_update_id", t.uint8_t(1)),
+    for field, value, read_back in [
+        ("network_key", LINK_KEY, lambda: app.state.network_info.network_key.key),
+        ("tc_link_key", LINK_KEY, lambda: app.state.network_info.tc_link_key.key),
+        (
+            "extended_pan_id",
+            t.ExtendedPanId.convert("11:22:33:44:55:66:77:88"),
+            lambda: app.state.network_info.extended_pan_id,
+        ),
+        ("pan_id", t.PanId(0x2B3C), lambda: app.state.network_info.pan_id),
+        ("channel", t.uint8_t(20), lambda: app.state.network_info.channel),
+        ("nwk_update_id", t.uint8_t(1), lambda: app.state.network_info.nwk_update_id),
+        (
+            "ieee_address",
+            t.EUI64.convert("bb:bb:bb:bb:bb:bb:bb:bb"),
+            lambda: app.state.node_info.ieee,
+        ),
+        ("nwk_address", t.NWK(0x1234), lambda: app.state.node_info.nwk),
     ]:
         server.network_state = make_network_state()
         setattr(server.network_state, field, value)
         await app.load_network_info()
-        read = getattr(app.state.network_info, field)
-        assert (read.key if field == "network_key" else read) == value
+        assert read_back() == value
 
         # A network read back from an unstarted server is not backed up before
         # it is written
