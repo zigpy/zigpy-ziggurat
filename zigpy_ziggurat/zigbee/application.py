@@ -244,9 +244,16 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 stack_specific = {"ezsp": {"hashed_tclk": seed_hex}}
 
         children: list[t.EUI64] = []
+        # The stack's own view of each child's capability, kept for children that
+        # zigpy has no node descriptor for (see `_child_entry`)
+        child_capabilities: dict[str, dict[str, Any]] = {}
         async for child_entry in self._api.request_stream(p.ScanChildren()):
             child_entry = cast(p.ChildEntry, child_entry)
             children.append(child_entry.ieee)
+            child_capabilities[str(child_entry.ieee)] = {
+                "rx_on_when_idle": bool(child_entry.rx_on_when_idle),
+                "device_type": child_entry.device_type.name,
+            }
 
         nwk_addresses: dict[t.EUI64, t.NWK] = {}
         async for addr_entry in self._api.request_stream(p.ScanAddressCache()):
@@ -263,8 +270,13 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     "path_cost": route_entry.path_cost,
                 }
             )
+        ziggurat: dict[str, Any] = {}
         if routes:
-            stack_specific["ziggurat"] = {"routes": routes}
+            ziggurat["routes"] = routes
+        if child_capabilities:
+            ziggurat["children"] = child_capabilities
+        if ziggurat:
+            stack_specific["ziggurat"] = ziggurat
 
         self.state.node_info = zigpy.state.NodeInfo(
             nwk=state.nwk_address,
@@ -555,9 +567,22 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
     async def _restore_children(self, network_info: zigpy.state.NetworkInfo) -> None:
         assert self._api is not None
+        # Backups written before the stack's capabilities were kept have none. They
+        # are only a hint, so anything unexpected is ignored rather than failing the
+        # restore.
+        ziggurat = network_info.stack_specific.get("ziggurat")
+        child_capabilities = (
+            ziggurat.get("children") if isinstance(ziggurat, dict) else None
+        )
+        if not isinstance(child_capabilities, dict):
+            child_capabilities = {}
         # Children without a known NWK address can't be loaded
         entries = [
-            self._child_entry(ieee, network_info.nwk_addresses[ieee])
+            self._child_entry(
+                ieee,
+                network_info.nwk_addresses[ieee],
+                child_capabilities.get(str(ieee)),
+            )
             for ieee in network_info.children
             if ieee in network_info.nwk_addresses
         ]
@@ -570,11 +595,15 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 )
             )
 
-    def _child_entry(self, ieee: t.EUI64, nwk: t.NWK) -> p.ChildEntry:
-        # The backup carries no capability, so it comes from the child's node
-        # descriptor. Some end devices keep their receiver on and never poll (Sengled
-        # bulbs), so they must not be restored as sleepy. Without a node descriptor
-        # the child is restored as a sleepy end device, as most end devices are.
+    def _child_entry(
+        self, ieee: t.EUI64, nwk: t.NWK, stack_capability: Any
+    ) -> p.ChildEntry:
+        # A child's capability comes from its node descriptor. Some end devices keep
+        # their receiver on and never poll (Sengled bulbs), so they must not be
+        # restored as sleepy. Without a node descriptor (an interview that never
+        # finished), the capability the stack itself last reported for the child is
+        # used. Failing both, the child is restored as a sleepy end device, as most
+        # end devices are.
         try:
             device = self.get_device(ieee=ieee)
         except KeyError:
@@ -585,8 +614,20 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             node_desc = device.node_desc
 
         if node_desc is None:
-            device_type = p.ChildDeviceType.UNKNOWN
-            rx_on_when_idle = False
+            # Both fields are used together or not at all: half a record is as
+            # untrustworthy as none
+            capability = stack_capability if isinstance(stack_capability, dict) else {}
+            stack_device_type = p.ChildDeviceType.__members__.get(
+                str(capability.get("device_type"))
+            )
+            stack_rx_on = capability.get("rx_on_when_idle")
+
+            if stack_device_type is not None and isinstance(stack_rx_on, bool):
+                device_type = stack_device_type
+                rx_on_when_idle = stack_rx_on
+            else:
+                device_type = p.ChildDeviceType.UNKNOWN
+                rx_on_when_idle = False
         else:
             if node_desc.is_router:
                 device_type = p.ChildDeviceType.ROUTER
