@@ -79,6 +79,10 @@ class ZigguratApi:
         for pending in self._pending.values():
             if not pending.response.done():
                 pending.response.set_exception(ConnectionError("Connection lost"))
+                # Wake a stream: it drains what arrived, then raises the error rather
+                # than waiting for a terminal response that will never come.
+                if pending.events is not None:
+                    pending.events.put_nowait(None)
         self._pending.clear()
         for confirm in self._pending_confirms.values():
             if not confirm.done():
