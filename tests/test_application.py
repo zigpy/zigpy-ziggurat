@@ -1180,7 +1180,7 @@ async def test_node_desc_req_before_device_annce(
         )
     )
 
-    # Its Node_Desc_req arrives before any Device_annce
+    # Its Device_annce was lost, so its Node_Desc_req is the first frame we see
     await server.send_notification(zdo_request(aqara_nwk, tsn=0x30))
     reply = await server.wait_for(p.SendUnicast)
     with pytest.raises(KeyError):

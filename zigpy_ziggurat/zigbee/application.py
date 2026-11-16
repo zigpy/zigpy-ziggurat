@@ -647,9 +647,11 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 return
 
             # zigpy only learns of a new device from its announcement, or once its
-            # join delay has passed, but a joining device asks for our node
-            # descriptor first and gives up on joining without an answer. Answer
-            # through a stand-in device, with the EUI64 from its join if we saw it.
+            # join delay has passed. A joining device announces itself before it
+            # asks for our node descriptor (BDB 3.1 §9.3), but the announcement is
+            # a broadcast that can be lost, and the device gives up on joining
+            # without an answer. Answer through a stand-in device, with the EUI64
+            # from its join if we saw it.
             ieee = self._unannounced_joins.get(src_nwk)
             if ieee is None:
                 ieee = t.EUI64.UNKNOWN  # type: ignore[attr-defined]
