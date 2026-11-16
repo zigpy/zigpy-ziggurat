@@ -6,6 +6,7 @@ from datetime import timedelta
 import logging
 import os
 from typing import Any
+from unittest import mock
 
 from aiohttp import web
 import pytest
@@ -30,6 +31,7 @@ from tests.common import (
     connected_app,
     flush,
     make_app_config,
+    make_network_state,
     server,
 )
 from zigpy_ziggurat.config import CONF_TUNABLES, CONF_ZIGGURAT_CONFIG
@@ -366,6 +368,172 @@ async def test_load_network_info_no_routes(
     # An empty route table adds no `ziggurat` section at all
     await connected_app.load_network_info()
     assert connected_app.state.network_info.stack_specific == {}
+
+
+async def test_load_network_info_not_started(
+    connected_app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    """A client that stopped between `Configure` and `StartNetwork` leaves the server
+    configured but not started, its tables possibly only partly loaded: the backup is
+    used, so the half-loaded tables never replace it."""
+    app = connected_app
+    other_ieee = t.EUI64.convert("bb:bb:bb:bb:bb:bb:bb:bb")
+
+    # With no backup to fall back on, the server's network is read back
+    server.started = False
+    await app.load_network_info()
+    assert app.state.network_info.pan_id == server.network_state.pan_id
+    assert len(server.sent(p.ScanKeyTable)) == 1
+
+    server.started = True
+    await app.load_network_info()
+    keys = [
+        zigpy.state.Key(key=LINK_KEY, partner_ieee=DEVICE_IEEE),
+        zigpy.state.Key(key=LINK_KEY, partner_ieee=other_ieee),
+    ]
+    await app.write_network_info(
+        network_info=app.state.network_info.replace(key_table=keys),
+        node_info=app.state.node_info,
+    )
+
+    # The next write was interrupted after loading only the first key
+    server.started = False
+    server.key_table = [
+        p.KeyEntry(
+            key=LINK_KEY,
+            tx_counter=t.uint32_t(0),
+            rx_counter=t.uint32_t(0),
+            seq=t.uint8_t(0),
+            partner_ieee=DEVICE_IEEE,
+        )
+    ]
+    await app.start_network()
+
+    # Both keys are loaded again, and the backup still holds both
+    assert [e.partner_ieee for e in server.sent(p.LoadKeyTable)[-1].entries] == [
+        DEVICE_IEEE,
+        other_ieee,
+    ]
+    assert app.backups[-1].network_info.key_table == keys
+
+
+async def test_load_network_info_not_started_counters(
+    connected_app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    """The counters `Configure` gave an unstarted server are never rolled back, even
+    if the backup of the state read before it was not saved."""
+    app = connected_app
+    margin = application_module.FRAME_COUNTER_RESTORE_MARGIN
+    await app.load_network_info()
+    await app.write_network_info(
+        network_info=app.state.network_info, node_info=app.state.node_info
+    )
+
+    server.started = False
+    server.network_state.network_key_tx_counter = t.uint32_t(50000)
+    server.network_state.aps_frame_counter = t.uint32_t(90000)
+    await app.load_network_info()
+    assert app.state.network_info.network_key.tx_counter == 50000
+    assert app.state.network_info.tc_link_key.tx_counter == 90000
+
+    # The same network falling behind the backup still gets the margin
+    server.network_state.network_key_tx_counter = t.uint32_t(0)
+    server.network_state.aps_frame_counter = t.uint32_t(0)
+    await app.load_network_info()
+    assert app.state.network_info.network_key.tx_counter == 1000 + margin
+    assert app.state.network_info.tc_link_key.tx_counter == 2000 + margin
+
+
+async def test_load_network_info_not_started_other_network(
+    connected_app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    """An unstarted network the backups don't hold, left by an interrupted
+    `form_network` or `restore_backup`, is read back rather than replaced."""
+    app = connected_app
+    await app.load_network_info()
+    await app.write_network_info(
+        network_info=app.state.network_info, node_info=app.state.node_info
+    )
+
+    server.started = False
+    for field, value in [
+        ("network_key", LINK_KEY),
+        ("extended_pan_id", t.ExtendedPanId.convert("11:22:33:44:55:66:77:88")),
+        ("pan_id", t.PanId(0x2B3C)),
+        ("channel", t.uint8_t(20)),
+        ("nwk_update_id", t.uint8_t(1)),
+    ]:
+        server.network_state = make_network_state()
+        setattr(server.network_state, field, value)
+        await app.load_network_info()
+        read = getattr(app.state.network_info, field)
+        assert (read.key if field == "network_key" else read) == value
+
+        # A network read back from an unstarted server is not backed up before
+        # it is written
+        assert not app._read_running_network
+
+
+async def test_start_network_interrupted(
+    connected_app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    """The server keeps running while no client is connected, so its frame counters
+    and key table move past the backup. A startup interrupted mid-write must not roll
+    them back to the backup's."""
+    app = connected_app
+    await app.start_network()
+
+    new_ieee = t.EUI64.convert("bb:bb:bb:bb:bb:bb:bb:bb")
+    new_key = p.KeyEntry(
+        key=LINK_KEY,
+        tx_counter=t.uint32_t(0),
+        rx_counter=t.uint32_t(0),
+        seq=t.uint8_t(0),
+        partner_ieee=new_ieee,
+    )
+    server.key_table = [new_key]
+    server.network_state.network_key_tx_counter = t.uint32_t(50000)
+    server.network_state.aps_frame_counter = t.uint32_t(90000)
+
+    async def radio_error(request: p.Request, request_id: int) -> None:
+        raise StatusError(p.Status.RADIO_ERROR)
+
+    # The next startup reads the running network, then fails while loading it back.
+    # The backup of the state it read is saved before the one it supersedes is
+    # deleted, so the network always has a backup in the database.
+    listener = mock.Mock()
+    app.backups.add_listener(listener)
+    server.handlers[p.RequestCommand.LOAD_KEY_TABLE] = radio_error
+    with pytest.raises(DeliveryError):
+        await app.start_network()
+    assert [name for name, _, _ in listener.method_calls] == [
+        "network_backup_created",
+        "network_backup_removed",
+    ]
+    server.handlers[p.RequestCommand.LOAD_KEY_TABLE] = server.on_empty_ok
+    server.started = False
+    server.key_table = []
+    server.requests.clear()
+    listener.reset_mock()
+
+    await app.start_network()
+
+    # The counters only move forward, and the key negotiated meanwhile is kept
+    assert server.configured.network_key_tx_counter >= 50000
+    assert server.configured.aps_frame_counter >= 90000
+    assert [e.partner_ieee for e in server.sent(p.LoadKeyTable)[-1].entries] == [
+        new_ieee
+    ]
+    assert [k.partner_ieee for k in app.backups[-1].network_info.key_table] == [
+        new_ieee
+    ]
+
+    # A startup from the backup adds no backup before the network has started
+    assert [name for name, _, _ in listener.method_calls] == [
+        "network_backup_created",
+        "network_backup_removed",
+    ]
+    assert len(app.backups.backups) == 1
 
 
 async def test_write_network_info(
@@ -1414,6 +1582,20 @@ async def test_on_notification_frame_counter(
 
     assert app.state.network_info.network_key.tx_counter == 123456
     assert app.backups[-1].network_info.network_key.tx_counter == 123456
+
+
+async def test_on_notification_frame_counter_before_network(
+    connected_app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    """A counter notification before the network is loaded records no backup."""
+    listener = mock.Mock()
+    connected_app.backups.add_listener(listener)
+
+    await server.send_notification(p.FrameCounter(frame_counter=t.uint32_t(123456)))
+    await flush(connected_app)
+
+    assert listener.method_calls == []
+    assert connected_app.backups.backups == []
 
 
 async def test_on_notification_aps_frame_counter(
