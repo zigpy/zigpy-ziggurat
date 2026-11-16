@@ -266,6 +266,45 @@ async def test_load_network_info(
     assert app.state.network_info.tc_link_key.tx_counter == aps_counter + margin
 
 
+async def test_load_network_info_firmware_version(
+    connected_app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    """The stack's version string is the coordinator's firmware version, also when
+    the network comes from a backup written by an older firmware."""
+    app = connected_app
+    firmware_version = "ziggurat/0.1.0+b5b68c2; POSIX; Nov 16 2026 00:00:00"
+
+    async def firmware_info(
+        request: p.GetFirmwareInfo, request_id: int
+    ) -> p.FirmwareInfo:
+        return p.FirmwareInfo(
+            protocol_version=t.uint8_t(p.PROTOCOL_VERSION),
+            version=t.LongCharacterString(firmware_version),
+        )
+
+    server.handlers[p.RequestCommand.GET_FIRMWARE_INFO] = firmware_info
+
+    # The server has a running network
+    await app.load_network_info()
+    assert app.state.node_info.version == firmware_version
+    assert type(app.state.node_info.version) is str
+
+    # A restarted, stateless server: the backup's stale version is not restored
+    await app.write_network_info(
+        network_info=app.state.network_info,
+        node_info=app.state.node_info.replace(version="ziggurat/0.1.0"),
+    )
+    assert app.backups[-1].node_info.version == "ziggurat/0.1.0"
+
+    async def not_configured(request: p.Request, request_id: int) -> None:
+        raise StatusError(p.Status.NOT_CONFIGURED)
+
+    server.handlers[p.RequestCommand.GET_NETWORK_INFO] = not_configured
+    await app.load_network_info()
+    assert app.state.node_info.ieee == COORDINATOR_IEEE
+    assert app.state.node_info.version == firmware_version
+
+
 @pytest.mark.parametrize(
     ("flavor", "expected"),
     [

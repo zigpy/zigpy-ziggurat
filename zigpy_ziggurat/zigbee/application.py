@@ -195,6 +195,11 @@ class ControllerApplication(zigpy.application.ControllerApplication):
     async def load_network_info(self, *, load_devices: bool = False) -> None:
         assert self._api is not None
 
+        # Shown as the coordinator's firmware version (e.g. by Home Assistant). The
+        # stack, not the backup, is what is running, so it applies to both paths below.
+        firmware = cast(p.FirmwareInfo, await self._api.request(p.GetFirmwareInfo()))
+        version = str(firmware.version)
+
         try:
             info = cast(p.NetworkInfo, await self._api.request(p.GetNetworkInfo()))
         except p.ProtocolError as exc:
@@ -204,6 +209,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             # The server is stateless and has no network running (e.g. it just
             # restarted): the most recent zigpy database backup is authoritative
             self._get_network_settings()
+            self.state.node_info = self.state.node_info.replace(version=version)
             return
 
         state = info.state
@@ -259,6 +265,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             logical_type=zdo_t.LogicalType.Coordinator,
             manufacturer="Ziggurat",
             model="Coordinator",
+            version=version,
         )
         self.state.network_info = zigpy.state.NetworkInfo(
             extended_pan_id=state.extended_pan_id,
