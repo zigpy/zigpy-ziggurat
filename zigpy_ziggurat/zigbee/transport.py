@@ -122,8 +122,13 @@ class SpinelTransport:
             flow_control=cast(Any, self._flow_control),
         )
         self._protocol = cast(_SpinelProtocol, protocol)
-        await self._protocol.wait_until_connected()
-        await self._protocol.start_ziggurat()
+        try:
+            await self._protocol.wait_until_connected()
+            await self._protocol.start_ziggurat()
+        except BaseException:
+            # Release the port: the caller never gets this transport to close it.
+            await self.disconnect()
+            raise
 
     async def disconnect(self) -> None:
         if self._protocol is not None:

@@ -102,6 +102,10 @@ async def test_spinel_connect_rejects_foreign_firmware() -> None:
     try:
         with pytest.raises(ConnectionError, match="does not embed"):
             await connect_transport(rcp.url, lambda frame: None, lambda exc: None)
+
+        # The rejected port is closed again, so the next attempt can open it.
+        assert rcp.connections == 1
+        await rcp.wait_closed_by_client()
     finally:
         await rcp.stop()
 
