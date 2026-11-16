@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import AsyncGenerator, Callable
 from datetime import timedelta
 import logging
+import math
 
 from zigpy.exceptions import DeliveryError
 import zigpy.types as t
@@ -17,6 +18,15 @@ _LOGGER = logging.getLogger(__name__)
 
 # The end-to-end APS ack (or local handoff) must arrive within this window.
 CONFIRM_TIMEOUT = 30
+
+# Every command is answered within this window, and a streaming command sends an update
+# (or its terminal response) within it. Past it, the firmware (or the server's handler)
+# has stopped answering: zigpy's watchdog feed is such a request, so this is also what
+# detects a wedged firmware.
+REQUEST_TIMEOUT = 2
+
+# For a stream that is legitimately silent for long stretches (packet capture)
+NO_TIMEOUT = math.inf
 
 
 class _Pending:
@@ -115,8 +125,17 @@ class ZigguratApi:
 
     # -- request surface -----------------------------------------------------------
 
-    async def request(self, request: p.Request) -> p.Response | None:
-        """Send a request; return its response, or None if the OK reply is empty."""
+    async def request(
+        self, request: p.Request, *, timeout: float | None = None
+    ) -> p.Response | None:
+        """Send a request; return its response, or None if the OK reply is empty.
+
+        Raises `TimeoutError` if no response arrives within `timeout` seconds
+        (`REQUEST_TIMEOUT` by default).
+        """
+        if timeout is None:
+            timeout = REQUEST_TIMEOUT
+
         request_id = self._next_id()
         pending = _Pending(request, streaming=False)
         self._pending[request_id] = pending
@@ -125,9 +144,18 @@ class ZigguratApi:
 
         assert self._transport is not None
         try:
-            await self._transport.send_frame(p.encode_request(request, request_id))
-            return await pending.response
+            async with asyncio.timeout(timeout) as deadline:
+                await self._transport.send_frame(p.encode_request(request, request_id))
+                return await pending.response
+        except TimeoutError as exc:
+            if not deadline.expired():
+                raise
+            raise TimeoutError(
+                f"No response to {type(request).__name__} (id={request_id})"
+                f" within {timeout}s"
+            ) from exc
         finally:
+            # A response arriving after this is ignored
             self._pending.pop(request_id, None)
 
     async def request_confirmed(
@@ -169,11 +197,22 @@ class ZigguratApi:
             raise DeliveryError(f"Send failed: {result.status.name}")
 
     async def request_stream(
-        self, request: p.Request
+        self, request: p.Request, *, timeout: float | None = None
     ) -> AsyncGenerator[p.Response, None]:
-        """Yield each streamed `request.event` item until the terminal response."""
+        """Yield each streamed `request.event` item until the terminal response.
+
+        Raises `TimeoutError` if nothing arrives for `timeout` seconds
+        (`REQUEST_TIMEOUT` by default): the timeout restarts with every update.
+        `NO_TIMEOUT` waits indefinitely.
+        """
         # An error response or disconnect is raised once the stream is exhausted.
         assert request.event is not None
+        if timeout is None:
+            timeout = REQUEST_TIMEOUT
+
+        # `asyncio.timeout(None)` never expires
+        deadline = None if timeout == NO_TIMEOUT else timeout
+
         request_id = self._next_id()
         pending = _Pending(request, streaming=True)
         self._pending[request_id] = pending
@@ -182,10 +221,33 @@ class ZigguratApi:
         _LOGGER.debug("Sending stream request (id=%d): %r", request_id, request)
 
         assert self._transport is not None
-        await self._transport.send_frame(p.encode_request(request, request_id))
         try:
-            while (item := await pending.events.get()) is not None:
+            try:
+                async with asyncio.timeout(deadline):
+                    await self._transport.send_frame(
+                        p.encode_request(request, request_id)
+                    )
+            except TimeoutError as exc:
+                raise TimeoutError(
+                    f"Could not send {type(request).__name__} (id={request_id})"
+                    f" within {timeout}s"
+                ) from exc
+
+            while True:
+                try:
+                    async with asyncio.timeout(deadline):
+                        item = await pending.events.get()
+                except TimeoutError as exc:
+                    raise TimeoutError(
+                        f"No update from {type(request).__name__} (id={request_id})"
+                        f" within {timeout}s"
+                    ) from exc
+
+                if item is None:
+                    break
+
                 yield item
+
             await pending.response  # surface an error
         finally:
             self._pending.pop(request_id, None)

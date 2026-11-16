@@ -35,7 +35,11 @@ from tests.common import (
     server,
 )
 from zigpy_ziggurat.config import CONF_TUNABLES, CONF_ZIGGURAT_CONFIG
-from zigpy_ziggurat.zigbee import application as application_module, protocol as p
+from zigpy_ziggurat.zigbee import (
+    api as api_module,
+    application as application_module,
+    protocol as p,
+)
 from zigpy_ziggurat.zigbee.application import (
     ControllerApplication,
     ZigguratCoordinator,
@@ -1166,6 +1170,93 @@ async def test_watchdog_feed(
 ) -> None:
     await app._watchdog_feed()
     assert isinstance(server.requests[-1], p.GetFirmwareInfo)
+
+
+async def test_watchdog_detects_unanswered_feed(
+    app: ControllerApplication,
+    server: SyntheticZiggurat,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A firmware that stops answering fails the watchdog feed, which zigpy's
+    watchdog loop reports as a lost connection."""
+    monkeypatch.setattr(api_module, "REQUEST_TIMEOUT", 0.05)
+    release = asyncio.Event()
+
+    async def withhold(request: p.GetFirmwareInfo, request_id: int) -> p.FirmwareInfo:
+        await release.wait()
+        return await server.on_get_firmware_info(request, request_id)
+
+    server.handlers[p.RequestCommand.GET_FIRMWARE_INFO] = withhold
+
+    lost: list[Exception] = []
+    monkeypatch.setattr(app, "connection_lost", lost.append)
+    monkeypatch.setattr(app, "_watchdog_period", 0)
+
+    await asyncio.wait_for(app._watchdog_loop(), 1)
+
+    assert len(lost) == 1
+    assert isinstance(lost[0], TimeoutError)
+
+    release.set()
+
+
+async def test_energy_scan_timeout(
+    app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    """An energy scan waits 1.5x a channel's scan time between updates, at least 2s."""
+    api = app._api
+    assert api is not None
+    timeouts: list[float | None] = []
+    original = api.request_stream
+
+    def spy(request: p.Request, *, timeout: float | None = None):  # type: ignore[no-untyped-def]
+        timeouts.append(timeout)
+        return original(request, timeout=timeout)
+
+    api.request_stream = spy  # type: ignore[method-assign]
+
+    async def scan(request: p.EnergyScan, request_id: int) -> None:
+        for channel in request.channels:
+            await server.send_event(
+                p.RequestCommand.ENERGY_SCAN,
+                request_id,
+                p.EnergyResult(channel=t.uint8_t(channel), rssi=t.int8s(-80)),
+            )
+
+    server.handlers[p.RequestCommand.ENERGY_SCAN] = scan
+    channels = t.Channels.from_channel_list([11])  # type: ignore[misc]
+
+    # Short scans keep the global timeout
+    await app.energy_scan(channels, duration_exp=2, count=1)
+    # 0.016 ms/symbol * 960 symbols * (2**8 + 1) = 3948 ms per channel (rounded)
+    await app.energy_scan(channels, duration_exp=8, count=1)
+
+    assert timeouts == [api_module.REQUEST_TIMEOUT, pytest.approx(3.948 * 1.5)]
+
+
+async def test_network_scan_timeout(
+    app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    """A network scan waits for its whole sweep, at least 2s."""
+    api = app._api
+    assert api is not None
+    timeouts: list[float | None] = []
+    original = api.request_stream
+
+    def spy(request: p.Request, *, timeout: float | None = None):  # type: ignore[no-untyped-def]
+        timeouts.append(timeout)
+        return original(request, timeout=timeout)
+
+    api.request_stream = spy  # type: ignore[method-assign]
+    channels = t.Channels.from_channel_list([11, 15])  # type: ignore[misc]
+
+    async for _ in app._network_scan(channels, duration_exp=0):
+        pass
+    async for _ in app._network_scan(channels, duration_exp=8):
+        pass
+
+    # 3948 ms per channel at `duration_exp` 8, over two channels
+    assert timeouts == [api_module.REQUEST_TIMEOUT, pytest.approx(3.948 * 2 * 1.5)]
 
 
 async def test_move_network_to_channel(

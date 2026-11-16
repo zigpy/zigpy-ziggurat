@@ -22,7 +22,7 @@ from zigpy.zgp.util import parse_gpdf
 
 from zigpy_ziggurat.config import CONF_TUNABLES, CONF_ZIGGURAT_CONFIG, CONFIG_SCHEMA
 from zigpy_ziggurat.zigbee import protocol as p
-from zigpy_ziggurat.zigbee.api import ZigguratApi
+from zigpy_ziggurat.zigbee.api import NO_TIMEOUT, REQUEST_TIMEOUT, ZigguratApi
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -50,6 +50,11 @@ def _max_concurrent_requests(url: str) -> int:
 # aBaseSuperframeDuration * (2^n + 1) symbols, at 16 us per symbol
 SYMBOL_PERIOD_MS = 0.016
 BASE_SUPERFRAME_DURATION_SYMBOLS = 960
+
+# An energy scan reports each channel as it finishes, so no update may be silent for
+# longer than a channel's scan takes times this factor (a network scan: the whole
+# sweep), and never for less than `REQUEST_TIMEOUT`.
+SCAN_TIMEOUT_FACTOR = 1.5
 
 KEY_BATCH_SIZE = 12
 
@@ -400,7 +405,11 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 p.EnergyScan(
                     channels=list(channels),
                     duration_per_channel_ms=duration_per_channel_ms,
-                )
+                ),
+                timeout=max(
+                    REQUEST_TIMEOUT,
+                    SCAN_TIMEOUT_FACTOR * duration_per_channel_ms / 1000,
+                ),
             ):
                 result = cast(p.EnergyResult, result)
                 all_results.setdefault(result.channel, []).append(result.rssi)
@@ -422,7 +431,16 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             p.NetworkScan(
                 channels=list(channels),
                 duration_per_channel_ms=duration_per_channel_ms,
-            )
+            ),
+            # Beacons are only reported as they are heard (embedded firmware reports
+            # none until the whole sweep is done), so allow the sweep's full length
+            timeout=max(
+                REQUEST_TIMEOUT,
+                SCAN_TIMEOUT_FACTOR
+                * len(list(channels))
+                * duration_per_channel_ms
+                / 1000,
+            ),
         ):
             beacon = cast(p.Beacon, beacon)
             yield t.NetworkBeacon(
@@ -446,7 +464,9 @@ class ControllerApplication(zigpy.application.ControllerApplication):
     ) -> AsyncGenerator[t.CapturedPacket, None]:
         assert self._api is not None
         async for packet in self._api.request_stream(
-            p.PacketCapture(channel=t.uint8_t(channel))
+            p.PacketCapture(channel=t.uint8_t(channel)),
+            # Captured packets arrive only when there is traffic: silence is normal
+            timeout=NO_TIMEOUT,
         ):
             packet = cast(p.CapturedPacket, packet)
             yield t.CapturedPacket(
