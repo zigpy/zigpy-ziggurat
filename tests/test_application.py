@@ -441,6 +441,116 @@ async def test_write_network_info_default_tx_power(
     assert server.configured.tx_power == 8
 
 
+@pytest.mark.parametrize(
+    ("nwk_config", "country_maximum", "expected"),
+    [
+        # Neither a TX power nor a country: the network's own TX power is kept
+        ({}, None, 15),
+        # A configured TX power
+        ({zigpy.config.CONF_NWK_TX_POWER: 4}, None, 4),
+        # capped at the configured maximum
+        (
+            {
+                zigpy.config.CONF_NWK_TX_POWER: 10,
+                zigpy.config.CONF_NWK_TX_POWER_MAXIMUM: 6,
+            },
+            None,
+            6,
+        ),
+        # A country's recommended TX power, below the network's own
+        ({zigpy.config.CONF_NWK_COUNTRY_CODE: "NL"}, None, 8),
+        # capped at the country's regulatory maximum
+        ({zigpy.config.CONF_NWK_COUNTRY_CODE: "NL"}, 5, 5),
+        # rounded down, never above the maximum
+        ({zigpy.config.CONF_NWK_COUNTRY_CODE: "NL"}, -0.5, -1),
+        # A configured TX power capped at the country's regulatory maximum
+        (
+            {
+                zigpy.config.CONF_NWK_TX_POWER: 10,
+                zigpy.config.CONF_NWK_COUNTRY_CODE: "NL",
+            },
+            7,
+            7,
+        ),
+    ],
+)
+async def test_start_network_tx_power(
+    server: SyntheticZiggurat,
+    monkeypatch: pytest.MonkeyPatch,
+    nwk_config: dict[str, Any],
+    country_maximum: float | None,
+    expected: int,
+) -> None:
+    """The stack takes the TX power only with `Configure`, which every startup
+    sends: zigpy's TX power, capped as zigpy caps it, is applied there."""
+    if country_maximum is not None:
+
+        async def get_maximum_tx_power(self: Any, country: str) -> float:
+            return country_maximum
+
+        monkeypatch.setattr(
+            ControllerApplication, "_get_maximum_tx_power", get_maximum_tx_power
+        )
+
+    # A network migrated from a radio that ran at a higher TX power
+    server.network_state.tx_power = t.int8s(15)
+
+    app = ControllerApplication(
+        make_app_config(server.url, **{zigpy.config.CONF_NWK: nwk_config})
+    )
+    await app.connect()
+
+    try:
+        await app.start_network()
+
+        assert server.configured.tx_power == expected
+        assert app.backups[-1].network_info.tx_power == expected
+
+        # zigpy's `set_tx_power` after startup reports the TX power in effect, which
+        # a running network can't change
+        assert await app.set_tx_power(expected) == expected
+        assert await app.set_tx_power(expected - 1) == expected
+
+        # A restart from the backup applies the same TX power again
+        async def not_configured(request: p.Request, request_id: int) -> None:
+            raise StatusError(p.Status.NOT_CONFIGURED)
+
+        server.handlers[p.RequestCommand.GET_NETWORK_INFO] = not_configured
+        await app.start_network()
+        assert server.configured.tx_power == expected
+        assert app.backups[-1].network_info.tx_power == expected
+    finally:
+        await app.shutdown(db=False)
+
+
+async def test_write_network_info_applies_tx_power(
+    server: SyntheticZiggurat,
+) -> None:
+    """Forming a network and restoring a backup write it with zigpy's TX power too,
+    so the radio never runs at a restored backup's TX power."""
+    app = ControllerApplication(
+        make_app_config(
+            server.url,
+            **{zigpy.config.CONF_NWK: {zigpy.config.CONF_NWK_COUNTRY_CODE: "NL"}},
+        )
+    )
+    await app.connect()
+
+    try:
+        await app.load_network_info()
+
+        # The country's recommended TX power, below, above and without the network's
+        for tx_power in (20, 4, None):
+            await app.write_network_info(
+                network_info=app.state.network_info.replace(tx_power=tx_power),
+                node_info=app.state.node_info,
+            )
+            assert server.configured.tx_power == 8
+            assert app.backups[-1].network_info.tx_power == 8
+    finally:
+        await app.shutdown(db=False)
+
+
 async def test_write_network_info_restores_children(
     connected_app: ControllerApplication, server: SyntheticZiggurat
 ) -> None:

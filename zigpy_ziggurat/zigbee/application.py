@@ -455,6 +455,13 @@ class ControllerApplication(zigpy.application.ControllerApplication):
     ) -> None:
         assert self._api is not None
 
+        # The stack takes the TX power only with `Configure`, so zigpy's TX power
+        # setting is applied here rather than by `set_tx_power`. The backup below
+        # records the value applied.
+        network_info = network_info.replace(
+            tx_power=await self._get_configure_tx_power(network_info)
+        )
+
         # A TCLK seed carried over from a microcontroller stack: ziggurat derives the
         # unique link keys the previous stack issued to devices from it. Both stacks
         # already store the seed as a plain hex string.
@@ -492,10 +499,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 bytes.fromhex(tclk_seed) if tclk_seed is not None else os.urandom(16)
             ),
             tclk_flavor=tclk_flavor,
-            # None means "pick automatically": apply a safe default
-            tx_power=t.int8s(
-                network_info.tx_power if network_info.tx_power is not None else 8
-            ),
+            tx_power=t.int8s(network_info.tx_power),
             aps_frame_counter=t.uint32_t(network_info.tc_link_key.tx_counter),
         )
         await self._api.request(
@@ -538,6 +542,42 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         self.backups.add_backup(
             zigpy.backups.NetworkBackup(network_info=network_info, node_info=node_info)
         )
+
+    async def _get_configure_tx_power(
+        self, network_info: zigpy.state.NetworkInfo
+    ) -> int:
+        """The TX power `Configure` applies: the value zigpy's `initialize` passes to
+        `set_tx_power` (the configured TX power, else the country's recommendation,
+        capped at the regulatory maximum), so that a configured TX power and the
+        country's recommendation take effect. With neither, the network's own TX
+        power."""
+        tx_power = await self._get_effective_tx_power()
+
+        if tx_power is None:
+            # None means "pick automatically": apply a safe default
+            if network_info.tx_power is None:
+                return 8
+
+            return int(network_info.tx_power)
+
+        # Rounded down, never above the maximum
+        return math.floor(min(tx_power, await self._get_effective_maximum_tx_power()))
+
+    async def _set_tx_power(self, tx_power: float) -> float | None:
+        # zigpy calls this right after `start_network`, whose `Configure` has already
+        # applied this TX power. The stack can't change it on a running network, so
+        # report the value in effect rather than reconfiguring the network.
+        applied = self.state.network_info.tx_power
+        if applied is None:
+            return None
+
+        if applied != tx_power:
+            _LOGGER.debug(
+                "The TX power is only applied at startup, %d dBm stays in effect",
+                applied,
+            )
+
+        return float(applied)
 
     async def _restore_children(self, network_info: zigpy.state.NetworkInfo) -> None:
         assert self._api is not None
