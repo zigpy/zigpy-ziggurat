@@ -589,6 +589,43 @@ async def test_connection_lost_fails_pending_confirm(
         await request
 
 
+async def test_connection_lost_fails_pending_stream(
+    api: RecordingApi, transport: SyntheticBinaryTransport
+) -> None:
+    async def one_result_then_hang(request: p.Request, request_id: int) -> None:
+        # Stream one result but never send the terminal response.
+        transport.event(
+            p.RequestCommand.ENERGY_SCAN,
+            request_id,
+            p.EnergyResult(channel=t.uint8_t(15), rssi=t.int8s(-85)),
+        )
+
+    transport.handlers[p.RequestCommand.ENERGY_SCAN] = one_result_then_hang
+
+    results: list[p.Response] = []
+
+    async def consume() -> None:
+        async for item in api.request_stream(
+            p.EnergyScan(
+                channels=_Bytes([15, 20]), duration_per_channel_ms=t.uint16_t(100)
+            )
+        ):
+            results.append(item)
+
+    stream = asyncio.ensure_future(consume())
+    async with asyncio.timeout(1):
+        while not results:
+            await asyncio.sleep(0)
+    transport.lose(None)
+
+    # A dropped connection ends the stream with an error, not a hang or a clean end
+    # that would pass a truncated scan off as complete.
+    with pytest.raises(ConnectionError):
+        await asyncio.wait_for(stream, 1)
+
+    assert len(results) == 1
+
+
 async def test_unknown_notification_command_ignored(
     api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:
