@@ -994,6 +994,41 @@ async def test_send_packet_no_route_hints_after_startup(
     assert send.next_hop is None
 
 
+@pytest.mark.parametrize("source_routing", [False, True])
+async def test_send_packet_no_route_hint_on_forced_route_discovery(
+    server: SyntheticZiggurat, source_routing: bool
+) -> None:
+    """zigpy asks for route discovery when it retries a request. The hint from its
+    stored topology may be what failed, so the stack is left to find the route."""
+    app = ControllerApplication(
+        make_app_config(
+            server.url, **{zigpy.config.CONF_SOURCE_ROUTING: source_routing}
+        )
+    )
+    await app.connect()
+    await app.start_network()
+
+    device = app.add_device(DEVICE_IEEE, DEVICE_NWK)
+    device.relays = t.Relays([t.NWK(0x1111), t.NWK(0x2222)])
+
+    await app.send_packet(
+        aps_packet(
+            t.AddrModeAddress(addr_mode=t.AddrMode.NWK, address=DEVICE_NWK),
+            tx_options=(
+                t.TransmitOptions.ACK | t.TransmitOptions.FORCE_ROUTE_DISCOVERY
+            ),
+        )
+    )
+
+    send = server.sent(p.SendUnicast)[-1]
+    assert send.route == p.RouteControl.STACK_DECIDES
+    assert send.next_hop is None
+    assert send.relays is None
+    assert send.aps_ack
+
+    await app.shutdown(db=False)
+
+
 async def test_send_packet_delivery_failure(
     app: ControllerApplication, server: SyntheticZiggurat
 ) -> None:

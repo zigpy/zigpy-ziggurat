@@ -940,10 +940,16 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 relays = None
 
                 # Within the network startup period, provide route hints to the
-                # stack to reduce routing congestion
-                if isinstance(device, zigpy.device.ZigbeeDevice) and (
-                    self._start_time is None
-                    or datetime.now(UTC) - self._start_time < ROUTE_HINT_DURATION
+                # stack to reduce routing congestion. zigpy asks for route discovery
+                # when it retries, and the hint may be the path that just failed: the
+                # stack uses a hint in place of discovery, so leave it out.
+                if (
+                    isinstance(device, zigpy.device.ZigbeeDevice)
+                    and t.TransmitOptions.FORCE_ROUTE_DISCOVERY not in packet.tx_options
+                    and (
+                        self._start_time is None
+                        or datetime.now(UTC) - self._start_time < ROUTE_HINT_DURATION
+                    )
                 ):
                     maybe_relays = self.build_source_route_to(device)
 
