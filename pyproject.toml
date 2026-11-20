@@ -25,6 +25,9 @@ ziggurat = "zigpy_ziggurat.zigbee.application:ControllerApplication"
 [tool.setuptools.packages.find]
 exclude = ["tests", "tests.*"]
 
+[tool.setuptools.package-data]
+zigpy_ziggurat = ["py.typed"]
+
 [dependency-groups]
 testing = [
     "mypy>=2.1.0",
