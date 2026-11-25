@@ -108,6 +108,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         super().__init__(config)
         self._api: ZigguratApi | None = None
         self._start_time: datetime | None = None
+        self._read_running_network = False
 
     async def connect(self) -> None:
         # The device path is either the WebSocket URL of a ziggurat server or the
@@ -148,6 +149,12 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
     async def start_network(self) -> None:
         await self.load_network_info()
+        # Rewriting the network stops it until `StartNetwork`, and an interrupted
+        # write is recovered from the backup: record the running network just read
+        # first, since it may have moved on while no client was connected to be
+        # notified
+        if self._read_running_network:
+            self._add_backup(self.backups.from_network_state())
         await self.write_network_info(
             network_info=self.state.network_info, node_info=self.state.node_info
         )
@@ -202,6 +209,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
     async def load_network_info(self, *, load_devices: bool = False) -> None:
         assert self._api is not None
+        self._read_running_network = False
 
         # Shown as the coordinator's firmware version (e.g. by Home Assistant). The
         # stack, not the backup, is what is running, so it applies to both paths below.
@@ -221,6 +229,44 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             return
 
         state = info.state
+
+        # The server outlives its clients: one that stopped between `Configure` and
+        # `StartNetwork` may have left the tables only partly loaded. Reading them back
+        # would replace the complete backup of that network, so the latest backup is
+        # used if it is that network, never going below the counters `Configure` gave
+        # the server. Any other network (an interrupted `form_network` or
+        # `restore_backup`) is read back as before.
+        latest_backup = self.backups.most_recent_backup()
+        if (
+            not info.started
+            and latest_backup is not None
+            and latest_backup.network_info.network_key.key == state.network_key
+            and latest_backup.network_info.tc_link_key.key == state.tc_link_key
+            and latest_backup.network_info.extended_pan_id == state.extended_pan_id
+            and latest_backup.network_info.pan_id == state.pan_id
+            and latest_backup.network_info.channel == state.channel
+            and latest_backup.network_info.nwk_update_id == state.nwk_update_id
+            and latest_backup.node_info.ieee == state.ieee_address
+            and latest_backup.node_info.nwk == state.nwk_address
+        ):
+            _LOGGER.debug("The server's network was never started, using the backup")
+            self._get_network_settings()
+
+            network_info = self.state.network_info
+            self.state.network_info = network_info.replace(
+                network_key=network_info.network_key.replace(
+                    tx_counter=max(
+                        network_info.network_key.tx_counter,
+                        state.network_key_tx_counter,
+                    )
+                ),
+                tc_link_key=network_info.tc_link_key.replace(
+                    tx_counter=max(
+                        network_info.tc_link_key.tx_counter, state.aps_frame_counter
+                    )
+                ),
+            )
+            return
 
         key_table: list[zigpy.state.Key] = []
         async for key_entry in self._api.request_stream(p.ScanKeyTable()):
@@ -301,6 +347,33 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             nwk_addresses=nwk_addresses,
             stack_specific=stack_specific,
         )
+        self._read_running_network = bool(info.started)
+
+    def _add_backup(self, backup: zigpy.backups.NetworkBackup) -> None:
+        """`BackupManager.add_backup`, but saving the new backup before deleting the
+        ones it supersedes. zigpy deletes them first, in a database write of its own:
+        a client stopped right after it, while `start_network` has the network
+        stopped, would leave no backup to recover the network from."""
+        previous = list(self.backups.backups)
+        self.backups.add_backup(backup, suppress_event=True)
+        if not any(b is backup for b in self.backups.backups):
+            return
+
+        # zigpy removes a backup from the database by its `backup_time`, so one
+        # sharing the new backup's (the new backup itself, if it was already
+        # there) is removed first, as zigpy does, or the new backup would go with it
+        superseded = [
+            old
+            for old in previous
+            if old is backup or not any(b is old for b in self.backups.backups)
+        ]
+        for old in superseded:
+            if old.backup_time == backup.backup_time:
+                self.backups.listener_event("network_backup_removed", old)
+        self.backups.listener_event("network_backup_created", backup)
+        for old in superseded:
+            if old.backup_time != backup.backup_time:
+                self.backups.listener_event("network_backup_removed", old)
 
     def _get_network_settings(self) -> None:
         try:
@@ -550,7 +623,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         # `start_network` to find
         self.state.network_info = network_info
         self.state.node_info = node_info
-        self.backups.add_backup(
+        self._add_backup(
             zigpy.backups.NetworkBackup(network_info=network_info, node_info=node_info)
         )
 
@@ -779,7 +852,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 self.state.network_info.network_key.tx_counter = (
                     notification.frame_counter
                 )
-                self.backups.add_backup(self.backups.from_network_state())
+                self._add_backup(self.backups.from_network_state())
             case p.ApsFrameCounter():
                 _LOGGER.debug(
                     "APS frame counter updated to %d", notification.frame_counter
@@ -787,7 +860,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 self.state.network_info.tc_link_key.tx_counter = (
                     notification.frame_counter
                 )
-                self.backups.add_backup(self.backups.from_network_state())
+                self._add_backup(self.backups.from_network_state())
             case p.RouteRecord():
                 self.handle_relays(
                     nwk=notification.destination, relays=list(notification.relays)
@@ -823,7 +896,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                     for k in self.state.network_info.key_table
                     if k.partner_ieee != key.partner_ieee
                 ] + [key]
-                self.backups.add_backup(
+                self._add_backup(
                     zigpy.backups.NetworkBackup(
                         network_info=self.state.network_info,
                         node_info=self.state.node_info,
