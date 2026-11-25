@@ -3,6 +3,7 @@ against the synthetic binary websocket server."""
 
 import asyncio
 from datetime import timedelta
+import json
 import logging
 import os
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Any
 from aiohttp import web
 from aiospinel import Status
 import pytest
+import zigpy.backups
 import zigpy.config
 import zigpy.device
 import zigpy.endpoint
@@ -459,7 +461,15 @@ async def test_load_network_info_tables(
                     "next_hop": t.NWK(0x1234),
                     "path_cost": 3,
                 }
-            ]
+            ],
+            # The stack's own view of each child's capability
+            "children": {
+                str(DEVICE_IEEE): {
+                    "rx_on_when_idle": False,
+                    "device_type": "END_DEVICE",
+                },
+                str(child_ieee): {"rx_on_when_idle": True, "device_type": "ROUTER"},
+            },
         }
     }
 
@@ -628,6 +638,127 @@ async def test_write_network_info_restores_children_capability(
         (p.ChildDeviceType.UNKNOWN, 0),
         (p.ChildDeviceType.UNKNOWN, 0),
     ]
+
+
+async def test_restart_keeps_stack_child_capability(
+    connected_app: ControllerApplication, server: SyntheticZiggurat
+) -> None:
+    """A child zigpy has no node descriptor for keeps the capability the stack
+    reported for it, both across a client restart and across a server restart that
+    restores the network from the backup. A node descriptor still takes precedence."""
+    app = connected_app
+
+    def child(n: int, rx_on_when_idle: int) -> p.ChildEntry:
+        return p.ChildEntry(
+            ieee=t.EUI64([n] * 8),
+            nwk=t.NWK(0x1000 + n),
+            rx_on_when_idle=t.uint1_t(rx_on_when_idle),
+            device_type=p.ChildDeviceType.END_DEVICE,
+            reserved=t.uint5_t(0),
+        )
+
+    # Never interviewed: an end device with its receiver on, and a sleepy one
+    rx_on, sleepy = child(1, 1), child(2, 0)
+    # The stack has it as rx-on, but its node descriptor says it is sleepy
+    described = child(3, 1)
+    device = app.add_device(described.ieee, described.nwk)
+    device.node_desc = zdo_t.NodeDescriptor(
+        logical_type=zdo_t.LogicalType.EndDevice,
+        mac_capability_flags=zdo_t.NodeDescriptor.MACCapabilityFlags(0x80),
+    )
+
+    server.children = [rx_on, sleepy, described]
+    server.address_cache = [
+        p.AddressEntry(ieee=entry.ieee, nwk=entry.nwk) for entry in server.children
+    ]
+    expected = [
+        (rx_on.ieee, p.ChildDeviceType.END_DEVICE, 1),
+        (sleepy.ieee, p.ChildDeviceType.END_DEVICE, 0),
+        (described.ieee, p.ChildDeviceType.END_DEVICE, 0),
+    ]
+
+    # The client restarts against a running server, which is reconfigured from the
+    # network info it reports
+    await app.start_network()
+    (load,) = server.sent(p.LoadChildren)
+    assert [
+        (entry.ieee, entry.device_type, entry.rx_on_when_idle) for entry in load.entries
+    ] == expected
+
+    # The server restarts too: the network comes back from zigpy's database, so the
+    # capabilities have to survive the backup's JSON round trip
+    backup = zigpy.backups.NetworkBackup.from_dict(
+        json.loads(json.dumps(app.backups[-1].as_dict()))
+    )
+    app.backups.backups = [backup]
+
+    async def not_configured(request: p.Request, request_id: int) -> None:
+        raise StatusError(p.Status.NOT_CONFIGURED)
+
+    server.handlers[p.RequestCommand.GET_NETWORK_INFO] = not_configured
+    await app.start_network()
+    _, load = server.sent(p.LoadChildren)
+    assert [
+        (entry.ieee, entry.device_type, entry.rx_on_when_idle) for entry in load.entries
+    ] == expected
+
+
+@pytest.mark.parametrize(
+    "stack_specific",
+    [
+        {"ziggurat": None},
+        {"ziggurat": []},
+        {"ziggurat": {"children": None}},
+        {"ziggurat": {"children": []}},
+        {"ziggurat": {"children": {"01:01:01:01:01:01:01:01": "x"}}},
+        {"ziggurat": {"children": {"01:01:01:01:01:01:01:01": {"rx_on_when_idle": 1}}}},
+        {
+            "ziggurat": {
+                "children": {
+                    "01:01:01:01:01:01:01:01": {
+                        "device_type": "INVALID",
+                        "rx_on_when_idle": True,
+                    }
+                }
+            }
+        },
+        {
+            "ziggurat": {
+                "children": {
+                    "01:01:01:01:01:01:01:01": {
+                        "device_type": "END_DEVICE",
+                        "rx_on_when_idle": "yes",
+                    }
+                }
+            }
+        },
+    ],
+)
+async def test_write_network_info_ignores_malformed_child_capabilities(
+    connected_app: ControllerApplication,
+    server: SyntheticZiggurat,
+    stack_specific: dict[str, Any],
+) -> None:
+    """The stored capabilities are only a hint: malformed ones never stop the network
+    from starting, the child is restored as sleepy as if there were none."""
+    app = connected_app
+    await app.load_network_info()
+
+    ieee = t.EUI64([1] * 8)
+    await app.write_network_info(
+        network_info=app.state.network_info.replace(
+            children=[ieee],
+            nwk_addresses={ieee: t.NWK(0x1001)},
+            stack_specific=stack_specific,
+        ),
+        node_info=app.state.node_info,
+    )
+
+    (load,) = server.sent(p.LoadChildren)
+    assert [(entry.device_type, entry.rx_on_when_idle) for entry in load.entries] == [
+        (p.ChildDeviceType.UNKNOWN, 0)
+    ]
+    assert server.sent(p.StartNetwork)
 
 
 async def test_permit_ncp(
