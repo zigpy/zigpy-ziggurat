@@ -424,6 +424,119 @@ async def test_request_stream(
     assert [(r.channel, r.rssi) for r in results] == [(15, -85), (20, -85)]
 
 
+async def test_request_stream_timeout_resets_on_update(
+    api: RecordingApi,
+    transport: SyntheticBinaryTransport,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The timeout restarts with every update, so a long stream is not cut off."""
+    monkeypatch.setattr(api_module, "REQUEST_TIMEOUT", 0.2)
+    tasks: list[asyncio.Task[None]] = []
+
+    async def slow_scan(request: p.Request, request_id: int) -> None:
+        async def reply() -> None:
+            for channel in (15, 20, 25, 26):
+                await asyncio.sleep(0.1)
+                transport.event(
+                    p.RequestCommand.ENERGY_SCAN,
+                    request_id,
+                    p.EnergyResult(channel=t.uint8_t(channel), rssi=t.int8s(-85)),
+                )
+            await asyncio.sleep(0.1)
+            transport.ok(request.command, request_id)
+
+        tasks.append(asyncio.create_task(reply()))
+
+    transport.handlers[p.RequestCommand.ENERGY_SCAN] = slow_scan
+
+    # The whole scan takes longer than the timeout, but no gap does
+    results = [
+        cast(p.EnergyResult, item)
+        async for item in api.request_stream(
+            p.EnergyScan(
+                channels=_Bytes([15, 20, 25, 26]),
+                duration_per_channel_ms=t.uint16_t(100),
+            )
+        )
+    ]
+    await asyncio.gather(*tasks)
+
+    assert [r.channel for r in results] == [15, 20, 25, 26]
+
+
+async def test_request_stream_timeout(
+    api: RecordingApi,
+    transport: SyntheticBinaryTransport,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream that goes silent times out and forgets its pending response."""
+    monkeypatch.setattr(api_module, "REQUEST_TIMEOUT", 0.01)
+
+    async def one_event_then_silence(request: p.Request, request_id: int) -> None:
+        transport.event(
+            p.RequestCommand.ENERGY_SCAN,
+            request_id,
+            p.EnergyResult(channel=t.uint8_t(15), rssi=t.int8s(-85)),
+        )
+
+    transport.handlers[p.RequestCommand.ENERGY_SCAN] = one_event_then_silence
+    request = p.EnergyScan(
+        channels=_Bytes([15, 20]), duration_per_channel_ms=t.uint16_t(10)
+    )
+
+    async def slow_silent(request: p.Request, request_id: int) -> None:
+        async def reply() -> None:
+            await asyncio.sleep(0.05)
+            transport.ok(request.command, request_id)
+
+        replies.append(asyncio.create_task(reply()))
+
+    replies: list[asyncio.Task[None]] = []
+
+    results = []
+    with pytest.raises(TimeoutError, match="No update from EnergyScan"):
+        async for item in api.request_stream(request):
+            results.append(item)
+
+    assert len(results) == 1
+    assert api._pending == {}
+
+    # A stream that may be silent for long never times out
+    monkeypatch.setattr(api_module, "REQUEST_TIMEOUT", 0.001)
+    transport.handlers[p.RequestCommand.ENERGY_SCAN] = slow_silent
+    assert [
+        i async for i in api.request_stream(request, timeout=api_module.NO_TIMEOUT)
+    ] == []
+
+    # An explicit timeout replaces the default
+    monkeypatch.setattr(api_module, "REQUEST_TIMEOUT", 0.001)
+    transport.handlers[p.RequestCommand.ENERGY_SCAN] = transport._energy_scan
+    assert len([i async for i in api.request_stream(request, timeout=1)]) == 2
+    await asyncio.gather(*replies)
+
+
+async def test_request_stream_send_timeout(
+    api: RecordingApi,
+    transport: SyntheticBinaryTransport,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream request the transport cannot write times out."""
+    monkeypatch.setattr(api_module, "REQUEST_TIMEOUT", 0.01)
+
+    async def stuck_write(request: p.Request, request_id: int) -> None:
+        await asyncio.sleep(10)
+
+    transport.handlers[p.RequestCommand.ENERGY_SCAN] = stuck_write
+
+    with pytest.raises(TimeoutError, match="Could not send EnergyScan"):
+        async for _ in api.request_stream(
+            p.EnergyScan(channels=_Bytes([15]), duration_per_channel_ms=t.uint16_t(10))
+        ):
+            pass
+
+    assert api._pending == {}
+
+
 async def test_notifications(
     api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:
@@ -583,6 +696,75 @@ async def test_timed_out_request_failed_late(
 
     await api.disconnect()
     await asyncio.sleep(0)
+
+
+async def test_request_timeout(
+    api: RecordingApi,
+    transport: SyntheticBinaryTransport,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unanswered request times out and forgets its pending response."""
+    monkeypatch.setattr(api_module, "REQUEST_TIMEOUT", 0.01)
+
+    async def withhold(request: p.Request, request_id: int) -> None:
+        return None
+
+    transport.handlers[p.RequestCommand.GET_FIRMWARE_INFO] = withhold
+
+    with pytest.raises(TimeoutError, match="No response to GetFirmwareInfo"):
+        await api.request(p.GetFirmwareInfo())
+
+    assert api._pending == {}
+
+    # A late response is ignored, and the API keeps working
+    transport.ok(
+        p.RequestCommand.GET_FIRMWARE_INFO,
+        transport.request_ids[-1],
+        p.FirmwareInfo(
+            protocol_version=t.uint8_t(1), version=t.LongCharacterString("late")
+        ),
+    )
+    assert await api.request(p.Shutdown()) is None
+
+
+async def test_request_timeout_override(
+    api: RecordingApi,
+    transport: SyntheticBinaryTransport,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request given its own timeout outlives the default one."""
+    monkeypatch.setattr(api_module, "REQUEST_TIMEOUT", 0.01)
+    replies: list[asyncio.Task[None]] = []
+
+    async def slow_ok(request: p.Request, request_id: int) -> None:
+        async def reply() -> None:
+            await asyncio.sleep(0.05)
+            transport.ok(request.command, request_id)
+
+        replies.append(asyncio.create_task(reply()))
+
+    transport.handlers[p.RequestCommand.START_NETWORK] = slow_ok
+
+    assert await api.request(p.StartNetwork(), timeout=1) is None
+    await asyncio.gather(*replies)
+
+
+async def test_request_transport_timeout(
+    api: RecordingApi, transport: SyntheticBinaryTransport
+) -> None:
+    """A transport's own write timeout propagates unchanged, before the deadline."""
+    transport_timeout = TimeoutError("Spinel write timed out")
+
+    async def write_times_out(request: p.Request, request_id: int) -> None:
+        raise transport_timeout
+
+    transport.handlers[p.RequestCommand.GET_FIRMWARE_INFO] = write_times_out
+
+    with pytest.raises(TimeoutError) as exc_info:
+        await api.request(p.GetFirmwareInfo())
+
+    assert exc_info.value is transport_timeout
+    assert api._pending == {}
 
 
 async def test_confirmed_send_delivery_failure(
