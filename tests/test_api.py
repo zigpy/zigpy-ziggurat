@@ -318,6 +318,33 @@ async def test_cancel_on_timeout(
     assert cancels[0].request_id == send_ids[0]
 
 
+async def test_gpdf_confirm_timeout_includes_lifetime(
+    api: RecordingApi,
+    transport: SyntheticBinaryTransport,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A GPDF confirmed after `CONFIRM_TIMEOUT` but within its lifetime succeeds."""
+    monkeypatch.setattr(api_module, "CONFIRM_TIMEOUT", 0.01)
+
+    async def confirm_late(request: p.Request, request_id: int) -> None:
+        transport.ok(request.command, request_id)
+        asyncio.get_running_loop().call_later(0.05, transport.send_confirm, request_id)
+
+    transport.handlers[p.RequestCommand.SEND_GPDF] = confirm_late
+
+    await api.request_confirmed(
+        p.SendGpdf.build(
+            target=None,
+            command_id=0xFE,
+            payload=b"\x00",
+            channel=15,
+            lifetime=timedelta(milliseconds=200),
+        )
+    )
+
+    assert transport.sent(p.CancelRequest) == []
+
+
 async def test_cancel_skipped_while_closing(
     api: RecordingApi, transport: SyntheticBinaryTransport
 ) -> None:
