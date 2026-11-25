@@ -131,7 +131,7 @@ class ZigguratApi:
             self._pending.pop(request_id, None)
 
     async def request_confirmed(
-        self, send: p.SendUnicast | p.SendBroadcast | p.SendGroupcast
+        self, send: p.SendUnicast | p.SendBroadcast | p.SendGroupcast | p.SendGpdf
     ) -> None:
         """Send and await the terminal confirmation."""
 
@@ -149,11 +149,16 @@ class ZigguratApi:
         if isinstance(send, p.SendUnicast) and send.aps_ack:
             self._awaiting_aps_ack.add(request_id)
 
+        # Ziggurat holds a GPDF until its GPD listens, up to its lifetime
+        timeout: float = CONFIRM_TIMEOUT
+        if isinstance(send, p.SendGpdf):
+            timeout += send.lifetime_ms / 1000
+
         _LOGGER.debug("Sending request with confirmation (id=%d): %r", request_id, send)
 
         assert self._transport is not None
         try:
-            async with asyncio.timeout(CONFIRM_TIMEOUT):
+            async with asyncio.timeout(timeout):
                 await self._transport.send_frame(p.encode_request(send, request_id))
                 await pending.response  # accepted / rejected
                 result = await confirm
