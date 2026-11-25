@@ -41,6 +41,7 @@ from zigpy_ziggurat.zigbee.application import (
     ZigguratCoordinator,
     map_rssi_to_energy,
 )
+from zigpy_ziggurat.zigbee.wire import GpdfTargetKind
 
 
 class RecordingApplication(ControllerApplication):
@@ -1128,26 +1129,26 @@ async def test_send_packet_confirm_failure(
     [
         (
             zgp.types.SrcID(0x12345678),
-            p.wire.GpdfTargetKind.SRC_ID,
+            GpdfTargetKind.SRC_ID,
             0x12345678,
             None,
             None,
         ),
         (
             (DEVICE_IEEE, 0x01),
-            p.wire.GpdfTargetKind.IEEE,
+            GpdfTargetKind.IEEE,
             None,
             DEVICE_IEEE,
             0x01,
         ),
-        (None, p.wire.GpdfTargetKind.MAINTENANCE, None, None, None),
+        (None, GpdfTargetKind.MAINTENANCE, None, None, None),
     ],
 )
 async def test_send_gpdf(
     app: ControllerApplication,
     server: SyntheticZiggurat,
     target: zgp.types.SrcID | tuple[t.EUI64, int] | None,
-    kind: p.wire.GpdfTargetKind,
+    kind: GpdfTargetKind,
     src_id: int | None,
     gpd_ieee: t.EUI64 | None,
     endpoint: int | None,
