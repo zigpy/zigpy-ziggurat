@@ -914,7 +914,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         # Ziggurat holds the GPDF until its GPD sends a GPDF with RxAfterTx, then sends
         # it in the GPD's receive window
         assert self._api is not None
-        _, status = await self._api.request_confirmed(
+        await self._api.request_confirmed(
             p.SendGpdf.build(
                 target=target,
                 command_id=command_id,
@@ -923,9 +923,6 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 lifetime=lifetime,
             )
         )
-
-        if status != p.SendStatus.SUCCESS:
-            raise DeliveryError(f"GPDF not sent: {status.name}")
 
     async def send_packet(self, packet: t.ZigbeePacket) -> None:
         dst = packet.dst
